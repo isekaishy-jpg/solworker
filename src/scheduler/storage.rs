@@ -6,9 +6,13 @@ use std::sync::Arc;
 #[path = "../../tests/unit/storage.rs"]
 mod tests;
 
+// Reuse is opportunistic: bounded searches keep pinned handles and cold bursts
+// from making every checkout walk the admission-sized cache under its lock.
+const REUSE_PROBES: usize = 8;
+
 /// Retains at most `limit` allocations. Only exclusive allocations can be reset:
-/// even a weak accessor prevents reuse. Busy entries are inspected once per
-/// checkout, with a rotating start to avoid repeatedly favoring one slot.
+/// even a weak accessor prevents reuse. Each checkout inspects at most
+/// `REUSE_PROBES` entries, rotating across calls, then allocates on a miss.
 pub(crate) struct ArcPool<T> {
     entries: Vec<Arc<T>>,
     limit: usize,
@@ -38,7 +42,7 @@ impl<T> ArcPool<T> {
         reset: impl FnOnce(&mut T),
         reusable: impl Fn(&T) -> bool,
     ) -> Arc<T> {
-        for _ in 0..self.entries.len() {
+        for _ in 0..self.entries.len().min(REUSE_PROBES) {
             let index = self.cursor;
             self.cursor = (index + 1) % self.entries.len();
             if let Some(value) = Arc::get_mut(&mut self.entries[index])
@@ -59,10 +63,13 @@ impl<T> ArcPool<T> {
 
 /// Empty prerequisite buffers retain at most the configured edge capacity in
 /// total. Entries are cleared outside scheduler locks before returning here.
+/// Checked-out reused buffers have at most twice the requested capacity, so
+/// small live edge counts cannot accumulate arbitrarily oversized buffers.
 pub(crate) struct BufferPool<T> {
     entries: Vec<Vec<T>>,
     capacity: usize,
     limit: usize,
+    cursor: usize,
 }
 
 impl<T> BufferPool<T> {
@@ -71,6 +78,7 @@ impl<T> BufferPool<T> {
             entries: Vec::new(),
             capacity: 0,
             limit,
+            cursor: 0,
         }
     }
 
@@ -78,17 +86,23 @@ impl<T> BufferPool<T> {
         if minimum == 0 {
             return Vec::new();
         }
-        if let Some(index) = self
-            .entries
-            .iter()
-            .position(|entry| entry.capacity() >= minimum)
-        {
-            let entry = self.entries.swap_remove(index);
-            self.capacity -= entry.capacity();
-            entry
-        } else {
-            Vec::with_capacity(minimum)
+        let maximum = minimum.saturating_mul(2);
+        for _ in 0..self.entries.len().min(REUSE_PROBES) {
+            let index = self.cursor;
+            self.cursor = (index + 1) % self.entries.len();
+            if (minimum..=maximum).contains(&self.entries[index].capacity()) {
+                let entry = self.entries.swap_remove(index);
+                self.capacity -= entry.capacity();
+                // Revisit the swapped-in entry on the next checkout.
+                self.cursor = if self.entries.is_empty() {
+                    0
+                } else {
+                    index % self.entries.len()
+                };
+                return entry;
+            }
         }
+        Vec::with_capacity(minimum)
     }
 
     pub(crate) fn release(&mut self, entry: Vec<T>) {

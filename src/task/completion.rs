@@ -203,6 +203,29 @@ impl SWCompletion {
         Ok(demand.bind_consumer(lease, self))
     }
 
+    /// Retains descendant consumer interest through an existing discovery
+    /// permit, including after the set is sealed or runtime roots close.
+    /// Completion, consumer cancellation, or dropping the demand detaches this
+    /// interest without cancelling the producer. A cancelled/foreign permit
+    /// returns `Closed`; other demand errors match [`Self::demand`]. Failed
+    /// attachment retains no consumer lease.
+    pub fn demand_from(
+        &self,
+        permit: &crate::scheduler::SWDiscoveryPermit,
+        priority: crate::scheduler::SWPriority,
+    ) -> Result<crate::scheduler::SWDemand, crate::scheduler::SWDemandError> {
+        let producer = self
+            .signal
+            .producer
+            .get()
+            .ok_or(crate::scheduler::SWDemandError::Closed)?;
+        let lease = permit
+            .try_child_lease(producer.runtime)
+            .map_err(|_| crate::scheduler::SWDemandError::Closed)?;
+        let demand = self.demand(priority)?;
+        Ok(demand.bind_consumer(lease, self))
+    }
+
     pub fn status(&self) -> Option<SWTaskStatus> {
         self.signal.lock().status
     }

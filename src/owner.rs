@@ -496,6 +496,33 @@ impl<O> SWOwner<O> {
         self.on_ready_with_lease(completion, phase, callback, Some(lease), None)
     }
 
+    /// Attaches a descendant subscription using ordinary delivery capacity,
+    /// including after the consumer set is sealed or runtime roots close.
+    /// Ready outcomes still deliver through the owner pump. Set cancellation
+    /// suppresses only this consumer's unclaimed callback; rejection returns
+    /// the uninvoked callback without retaining a consumer lease.
+    pub fn on_ready_from<F>(
+        &mut self,
+        permit: &SWDiscoveryPermit,
+        completion: &SWCompletion,
+        phase: SWPhase,
+        callback: F,
+    ) -> Result<(SWDelivery, SWDeliveryControl), SWOwnerRejected<F>>
+    where
+        F: FnOnce(&mut O, SWTaskStatus) + 'static,
+    {
+        let lease = match permit.try_child_lease(self.transport.runtime_identity()) {
+            Ok(lease) => lease,
+            Err(_) => {
+                return Err(SWOwnerRejected {
+                    reason: SWOwnerError::Closed,
+                    callback,
+                });
+            }
+        };
+        self.on_ready_with_lease(completion, phase, callback, Some(lease), None)
+    }
+
     /// Subscribes to an existing outcome using reserved delivery capacity.
     /// Pending and already-ready outcomes both notify through the owner pump;
     /// no CPU job is created. Rejection returns the uninvoked callback and

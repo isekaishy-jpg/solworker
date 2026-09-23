@@ -4,8 +4,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use solworker::{
-    SWCost, SWDeliveryStatus, SWDemandError, SWDiscoveryError, SWExecutionClass, SWLimits,
-    SWOutcome, SWOwnedLimits, SWOwnerError, SWPhase, SWPriority, SWPumpBudget, SWRuntime,
+    SWCost, SWDeliveryStatus, SWDemandError, SWDiscoveryError, SWExecutionClass, SWExternalOptions,
+    SWLimits, SWOutcome, SWOwnedLimits, SWOwnerError, SWPhase, SWPriority, SWPumpBudget, SWRuntime,
     SWRuntimeConfig, SWShared, SWSpawnError, SWSpawnOptions, SWStageOptions, SWTaskStatus,
     SWWorkerConfig,
 };
@@ -379,5 +379,187 @@ fn reserved_subscriptions_reuse_ready_and_pending_results_through_consumer_clean
         drop(reserve);
         assert_eq!(runtime.capacity_usage().unwrap().required.deliveries, 0);
         runtime.shutdown().unwrap();
+    }
+}
+
+#[test]
+fn descendant_consumers_attach_after_root_closure_without_reservations() {
+    for ready in [false, true] {
+        for cancel in [false, true] {
+            let mut runtime = runtime();
+            let mut foreign_runtime = self::runtime();
+            let foreign_set = foreign_runtime
+                .work_set(NonZeroUsize::new(1).unwrap())
+                .unwrap();
+            let foreign_permit = foreign_set.discovery().unwrap();
+            let set = runtime.work_set(NonZeroUsize::new(1).unwrap()).unwrap();
+            let permit = set.discovery().unwrap();
+            let phase = SWPhase(13);
+            let mut owner = runtime
+                .owner(Vec::<u32>::new(), NonZeroUsize::new(1).unwrap())
+                .unwrap();
+            owner.set_phase(phase).unwrap();
+            let (producer, task, _) = runtime
+                .external::<u32>(SWExternalOptions::default())
+                .unwrap();
+            let shared = task.into_shared();
+            let completion = shared.completion();
+            let producer = if ready {
+                producer.complete(42).unwrap();
+                None
+            } else {
+                Some(producer)
+            };
+            runtime.begin_shutdown();
+            assert!(set.progress().sealed);
+            assert!(matches!(
+                completion.demand_in(&set, SWPriority::new(0)),
+                Err(SWDemandError::Closed)
+            ));
+            assert_eq!(
+                owner
+                    .on_ready_in(&set, &completion, phase, |_, _| {})
+                    .err()
+                    .unwrap()
+                    .reason,
+                SWOwnerError::Closed
+            );
+            assert!(matches!(
+                completion.demand_from(&foreign_permit, SWPriority::new(0)),
+                Err(SWDemandError::Closed)
+            ));
+            assert_eq!(
+                owner
+                    .on_ready_from(&foreign_permit, &completion, phase, |_, _| {})
+                    .err()
+                    .unwrap()
+                    .reason,
+                SWOwnerError::Closed
+            );
+            assert_eq!(foreign_set.progress().active_work, 0);
+
+            let demand = if ready {
+                assert!(matches!(
+                    completion.demand_from(&permit, SWPriority::new(0)),
+                    Err(SWDemandError::Gone)
+                ));
+                None
+            } else {
+                assert!(matches!(
+                    completion.demand_from(&permit, SWPriority::new(9)),
+                    Err(SWDemandError::UnknownPriority)
+                ));
+                assert_eq!(set.progress().active_work, 0);
+                let occupied: Vec<_> = (0..8)
+                    .map(|_| completion.demand(SWPriority::new(1)).unwrap())
+                    .collect();
+                assert!(matches!(
+                    completion.demand_from(&permit, SWPriority::new(0)),
+                    Err(SWDemandError::Full)
+                ));
+                assert_eq!(set.progress().active_work, 0);
+                drop(occupied);
+                let demand = completion.demand_from(&permit, SWPriority::new(0)).unwrap();
+                assert_eq!(set.progress().active_work, 1);
+                drop(demand);
+                assert_eq!(set.progress().active_work, 0);
+                Some(completion.demand_from(&permit, SWPriority::new(0)).unwrap())
+            };
+            assert_eq!(set.progress().active_work, usize::from(!ready));
+            let captured = shared.clone();
+            let (delivery, _) = owner
+                .on_ready_from(&permit, &completion, phase, move |values, status| {
+                    assert_eq!(status, SWTaskStatus::Succeeded);
+                    let outcome = captured.try_result().unwrap();
+                    let SWOutcome::Success(value) = &*outcome else {
+                        panic!("producer did not succeed");
+                    };
+                    values.push(**value);
+                })
+                .unwrap();
+            assert!(
+                owner.state().is_empty(),
+                "ready subscriptions must remain deferred"
+            );
+            let before = set.progress().active_work;
+            let rejected = owner
+                .on_ready_from(&permit, &completion, phase, |values, _| values.push(7))
+                .err()
+                .unwrap();
+            assert_eq!(rejected.reason, SWOwnerError::Full);
+            assert_eq!(set.progress().active_work, before);
+            let mut scratch = Vec::new();
+            (rejected.callback)(&mut scratch, SWTaskStatus::Succeeded);
+            assert_eq!(scratch, [7]);
+
+            if cancel {
+                set.cancel();
+                if let Some(demand) = &demand {
+                    assert_eq!(demand.promote(), Err(SWDemandError::Gone));
+                }
+                assert!(matches!(
+                    completion.demand_from(&permit, SWPriority::new(0)),
+                    Err(SWDemandError::Closed)
+                ));
+                assert_eq!(
+                    owner
+                        .on_ready_from(&permit, &completion, phase, |_, _| {})
+                        .err()
+                        .unwrap()
+                        .reason,
+                    SWOwnerError::Closed
+                );
+            }
+            assert!(
+                !set.is_drained(),
+                "owner-local cleanup is still outstanding"
+            );
+            if let Some(producer) = producer {
+                assert_eq!(
+                    shared.status(),
+                    None,
+                    "consumer cancellation must not cancel the producer"
+                );
+                producer.complete(42).unwrap();
+            }
+            assert_eq!(set.progress().active_work, 1);
+            let report = owner.pump(phase, SWPumpBudget::new(1)).unwrap();
+            assert_eq!(
+                (report.invoked, report.suppressed),
+                if cancel { (0, 1) } else { (1, 0) }
+            );
+            assert_eq!(
+                delivery.status(),
+                if cancel {
+                    SWDeliveryStatus::Suppressed
+                } else {
+                    SWDeliveryStatus::Published
+                }
+            );
+            assert_eq!(
+                owner.state().as_slice(),
+                if cancel { &[][..] } else { &[42][..] }
+            );
+            assert_eq!(set.progress().active_work, 0);
+            assert!(!set.is_drained(), "discovery remains live until released");
+            assert_eq!(shared.status(), Some(SWTaskStatus::Succeeded));
+            drop(demand);
+            owner.close();
+            assert_eq!(
+                owner
+                    .on_ready_from(&permit, &completion, phase, |_, _| {})
+                    .err()
+                    .unwrap()
+                    .reason,
+                SWOwnerError::Closed
+            );
+            assert_eq!(set.progress().active_work, 0);
+            drop(permit);
+            assert!(set.is_drained());
+            runtime.shutdown().unwrap();
+            drop(foreign_permit);
+            foreign_set.seal();
+            foreign_runtime.shutdown().unwrap();
+        }
     }
 }
