@@ -116,6 +116,12 @@ impl ThreadPoolBuilder {
         }
     }
 
+    /// Sets the maximum number of concurrent foreground job slots. Zero makes
+    /// all foreground invocations use their serial fallback.
+    pub fn max_jobs(self, max_jobs: usize) -> Self {
+        Self { max_jobs, ..self }
+    }
+
     /// Sets a custom function for spawning threads.
     pub fn spawn_handler<F>(self, spawn: F) -> Self
     where
@@ -241,6 +247,22 @@ impl ThreadPool {
         })
     }
 
+    /// Runs within this pool, reusing an existing context on a worker or in
+    /// a nested invocation. A different active pool cannot be installed here.
+    pub fn with_pool_context<R>(&self, f: impl FnOnce() -> R) -> R {
+        if LOCAL_POOL.get().is_null() {
+            self.install(f)
+        } else {
+            abort_on_panic(|| {
+                assert!(
+                    self.is_local_pool(),
+                    "cannot enter a different pool recursively"
+                );
+                f()
+            })
+        }
+    }
+
     /// Spawns an asynchronous task on the global thread pool.
     /// The returned handle can be used to obtain the result.
     pub fn spawn_owned<T: 'static + Send>(
@@ -363,6 +385,65 @@ impl ThreadPool {
         RB: Send,
     {
         self.join_all((oper_a, oper_b))
+    }
+
+    /// Publishes one transferable branch, runs `owner` on the invoking thread,
+    /// and joins the worker branch before returning. Both closures must contain
+    /// their own panic boundary: micropool aborts on an escaping panic.
+    pub fn join_with_owner<W, O, RW, RO>(&self, worker: W, owner: O) -> (RW, RO)
+    where
+        W: FnOnce() -> RW + Send,
+        RW: Send,
+        O: FnOnce() -> RO,
+    {
+        struct WorkerCell<W, R> {
+            function: UnsafeCell<Option<W>>,
+            result: UnsafeCell<MaybeUninit<R>>,
+        }
+
+        impl<W, R> WorkerCell<W, R>
+        where
+            W: FnOnce() -> R,
+        {
+            fn run(&self) {
+                // SAFETY: the only advertised unit is claimed exclusively.
+                // Its claimant is the only reader and writer of these fields.
+                let function = unsafe { (*self.function.get()).take().unwrap_unchecked() };
+                let result = function();
+                // SAFETY: the result is written once before completion release.
+                unsafe { (*self.result.get()).write(result) };
+            }
+
+            unsafe fn take_result(&self) -> R {
+                // SAFETY: the caller has observed completion with acquire.
+                unsafe { (*self.result.get()).assume_init_read() }
+            }
+        }
+
+        // A single unit is claimed exactly once before either field is accessed.
+        // The foreground completion counter orders its write before caller read.
+        unsafe impl<W: Send, R: Send> Sync for WorkerCell<W, R> {}
+
+        let cell = WorkerCell {
+            function: UnsafeCell::new(Some(worker)),
+            result: UnsafeCell::new(MaybeUninit::uninit()),
+        };
+        let owner_result = self.state.invoke_with_owner(|| cell.run(), owner);
+        // SAFETY: invoke_with_owner returns after the sole unit completes
+        // and acquires its result publication.
+        (unsafe { cell.take_result() }, owner_result)
+    }
+
+    /// Invokes each borrowed index once and joins all invocations. Counts that
+    /// cannot fit the foreground scheduler's signed counter run serially.
+    pub fn invoke_indexed(&self, count: usize, f: impl Fn(usize) + Sync) {
+        if count > i64::MAX as usize {
+            for index in 0..count {
+                f(index);
+            }
+        } else {
+            self.state.invoke(f, count);
+        }
     }
 
     /// Takes multiple closures and *potentially* runs them in parallel. It
@@ -590,6 +671,8 @@ pub(crate) struct ThreadPoolState {
     /// Threads waiting for work will spin for at least this many cycles before
     /// sleeping.
     idle_spin_cycles: usize,
+    /// Exact foreground capacity; the bitset storage rounds up to 64 bits.
+    max_jobs: usize,
     /// Records jobs that are active and have available units remaining.
     global_advertise_mask: AtomicBits,
     /// Shared information about scheduled jobs. Threads reserve slots in this
@@ -618,6 +701,7 @@ impl ThreadPoolState {
         Self {
             global_advertise_mask,
             idle_spin_cycles: builder.idle_spin_cycles,
+            max_jobs: builder.max_jobs,
             jobs: repeat_with(JobSlot::default)
                 .take(running_jobs.len())
                 .collect(),
@@ -672,6 +756,73 @@ impl ThreadPoolState {
             1 => f(0),
             _ => self.invoke_parallel_job(f, times),
         }
+    }
+
+    /// Advertises one worker unit before executing the owner continuation.
+    /// The continuation remains on this thread and may borrow non-Send state.
+    fn invoke_with_owner<R>(&self, worker: impl Fn() + Sync, owner: impl FnOnce() -> R) -> R {
+        if let Some(index) = self.reserve_job_slot() {
+            // SAFETY: this caller exclusively reserved the slot. The helper
+            // waits for the only published unit before either stack value dies.
+            let result = unsafe { self.invoke_with_owner_at_slot(worker, owner, index) };
+            // SAFETY: the descriptor and all workers have settled above.
+            unsafe { self.release_job_slot(index) };
+            result
+        } else {
+            // Saturation cannot wait for another slot, especially when nested.
+            let result = owner();
+            worker();
+            result
+        }
+    }
+
+    /// # Safety
+    ///
+    /// `index` must be exclusively reserved for this invocation.
+    unsafe fn invoke_with_owner_at_slot<R>(
+        &self,
+        worker: impl Fn() + Sync,
+        owner: impl FnOnce() -> R,
+        index: usize,
+    ) -> R {
+        with_local_advertise_mask(self.global_advertise_mask.len(), |search_mask| {
+            let func = Self::create_job_func(move |_| worker());
+            let slot = &self.jobs[index];
+            let advertise_masks = [&self.global_advertise_mask, search_mask];
+            let descriptor = JobDescriptor {
+                clear_masks: &advertise_masks,
+                func: &func,
+                incomplete_units: AtomicI64::new(1),
+                search_mask,
+            };
+
+            // SAFETY: the reserved slot is still invisible to other threads.
+            unsafe { *slot.descriptor.get() = &descriptor as *const _ as *const _ };
+            for mask in &advertise_masks {
+                mask.set(index, true, Ordering::Relaxed);
+            }
+            // Release publishes the descriptor and both masks. All work units,
+            // including the sole one here, remain claimable by workers.
+            slot.available_units.store(1, Ordering::Release);
+            self.on_change.notify();
+
+            let owner_result = owner();
+            let mut listener = self.on_change.listen();
+            let mut spin_before_sleep = true;
+            while descriptor.incomplete_units.load(Ordering::Acquire) > 0 {
+                if self.help_one_job(search_mask, false) {
+                    spin_before_sleep = true;
+                } else {
+                    let spin_cycles = if spin_before_sleep {
+                        self.idle_spin_cycles
+                    } else {
+                        0
+                    };
+                    spin_before_sleep = !listener.spin_wait(spin_cycles);
+                }
+            }
+            owner_result
+        })
     }
 
     /// Schedules a task to be run on the pool.
@@ -926,7 +1077,11 @@ impl ThreadPoolState {
     /// a `false` entry and replaces it with `true`. Returns [`None`] if all
     /// job slots were taken.
     fn reserve_job_slot(&self) -> Option<usize> {
-        for index in self.running_jobs.iter_zeroes() {
+        for index in self
+            .running_jobs
+            .iter_zeroes()
+            .take_while(|&index| index < self.max_jobs)
+        {
             if !self.running_jobs.set(index, true, Ordering::Relaxed) {
                 // Now that the job slot is reserved, we need to
                 // guarantee that any previous operations using the same slot have finished.

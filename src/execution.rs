@@ -1,8 +1,12 @@
-//! Execution lanes and caller participation.
-//!
-//! A lane selects dedicated worker capacity. Scoped work and retained groups
-//! share execution-context rules but have different lifetime boundaries.
+//! Runtime-associated lanes and caller participation.
 
-mod context;
-mod group;
+pub(crate) mod context;
+pub(crate) mod group;
+mod owned;
 mod scope;
+
+pub use context::SWExecutionError;
+pub use group::SWGroup;
+pub use scope::{SWBatchRejected, SWBranchOutcome, SWJoinRejected, SWLane, SWPanic};
+
+pub(crate) use context::ContextGuard;

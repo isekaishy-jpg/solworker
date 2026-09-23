@@ -138,7 +138,7 @@ fn requested_worker_priority_is_applied_or_reported() {
     #[cfg(windows)]
     {
         let mut runtime = result.unwrap();
-        runtime.shutdown();
+        runtime.shutdown().unwrap();
     }
     #[cfg(not(windows))]
     assert!(matches!(
@@ -193,7 +193,7 @@ fn build_prepares_distinct_workers_in_every_class_before_returning() {
     let threads: HashSet<_> = observed.iter().map(|(_, _, id)| *id).collect();
     assert_eq!(threads.len(), 5);
     drop(observed);
-    runtime.shutdown();
+    runtime.shutdown().unwrap();
     assert_eq!(runtime.state(), SWRuntimeState::Stopped);
 }
 
@@ -266,16 +266,16 @@ fn terminal_lifecycle_calls_are_idempotent() {
         })
         .build()
         .unwrap();
-    stopped.shutdown();
+    stopped.shutdown().unwrap();
     assert_eq!(exited.load(Ordering::SeqCst), 3);
-    stopped.shutdown();
+    stopped.shutdown().unwrap();
     stopped.abandon();
     assert_eq!(stopped.state(), SWRuntimeState::Stopped);
 
     let mut abandoned = SWRuntime::builder(config([1, 1, 1], 3)).build().unwrap();
     abandoned.abandon();
     abandoned.abandon();
-    abandoned.shutdown();
+    abandoned.shutdown().unwrap();
     assert_eq!(abandoned.state(), SWRuntimeState::Abandoned);
 }
 
@@ -305,7 +305,7 @@ fn shutdown_stops_every_class_before_joining_worker_cleanup() {
         .unwrap();
     let (done_tx, done_rx) = mpsc::channel();
     let host = thread::spawn(move || {
-        runtime.shutdown();
+        runtime.shutdown().unwrap();
         done_tx.send(runtime.state()).unwrap();
     });
 

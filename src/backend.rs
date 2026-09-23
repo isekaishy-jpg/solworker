@@ -11,3 +11,7 @@ pub(crate) use micropool::MicropoolBackend;
 #[cfg(test)]
 #[path = "../tests/unit/backend.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "../tests/unit/scoped_backend.rs"]
+mod scoped_tests;

@@ -11,9 +11,12 @@ use std::sync::Arc;
 use std::thread;
 
 use crate::backend::MicropoolBackend;
+use crate::execution::{SWLane, context};
 use crate::platform::{SWWorkerSetupError, apply_worker_priority};
+use crate::scheduler::{OwnedScheduler, SWOwnedLimits};
 use config::{SWExecutionClass, SWRuntimeConfig};
-use lifecycle::{Startup, StartupGuard};
+use lifecycle::{BackendOwner, Startup, StartupGuard};
+pub(crate) use lifecycle::{OwnedAdmission, RuntimeControl};
 
 type WorkerSetup = dyn Fn(SWExecutionClass, usize) -> io::Result<()> + Send + Sync;
 
@@ -84,6 +87,7 @@ impl Error for SWBuildError {
 pub struct SWRuntimeBuilder {
     config: SWRuntimeConfig,
     setup: Option<Arc<WorkerSetup>>,
+    owned_limits: Option<SWOwnedLimits>,
 }
 
 impl SWRuntimeBuilder {
@@ -91,7 +95,15 @@ impl SWRuntimeBuilder {
         Self {
             config,
             setup: None,
+            owned_limits: None,
         }
+    }
+
+    /// Enables owned jobs with explicit host-supplied admission capacities.
+    /// Without this option the runtime provides scoped execution only.
+    pub fn with_owned_limits(mut self, limits: SWOwnedLimits) -> Self {
+        self.owned_limits = Some(limits);
+        self
     }
 
     /// Installs a hook called once on each worker, after platform setup and
@@ -202,10 +214,18 @@ impl SWRuntimeBuilder {
         if !startup.start_when_ready(expected) {
             return Err(startup.take_error());
         }
+        let backend = Arc::new(BackendOwner::new(guard.commit()));
+        let control = Arc::new(RuntimeControl::new(&backend));
+        let owned = self.owned_limits.map(|limits| {
+            let scheduler = OwnedScheduler::new(Arc::downgrade(&control), limits);
+            control.install_owned(&scheduler);
+            scheduler
+        });
         Ok(SWRuntime {
             config: self.config,
-            pools: guard.commit(),
-            state: SWRuntimeState::Running,
+            backend: Some(backend),
+            control,
+            owned,
         })
     }
 }
@@ -214,18 +234,34 @@ impl SWRuntimeBuilder {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SWRuntimeState {
     Running,
+    Closing,
     Stopped,
     Abandoned,
 }
 
-/// Owns dedicated Low, Mid, and High pools. No work-submission API is exposed
-/// by this foundation yet. Dropping a runtime requests stop and detaches its
-/// workers; use [`Self::shutdown`] to wait for worker termination.
+/// Owns dedicated Low, Mid, and High pools. Dropping a runtime closes new
+/// invocations and requests worker stop without joining. Active borrowed calls
+/// retain the pools and settle before returning; use [`Self::shutdown`] to wait.
 pub struct SWRuntime {
     config: SWRuntimeConfig,
-    pools: Vec<MicropoolBackend>,
-    state: SWRuntimeState,
+    backend: Option<Arc<BackendOwner>>,
+    control: Arc<RuntimeControl>,
+    owned: Option<Arc<OwnedScheduler>>,
 }
+
+/// Terminal shutdown cannot block from within a participating invocation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SWShutdownError {
+    ExecutionContext,
+}
+
+impl fmt::Display for SWShutdownError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("shutdown cannot join from an execution context")
+    }
+}
+
+impl Error for SWShutdownError {}
 
 impl SWRuntime {
     pub fn builder(config: SWRuntimeConfig) -> SWRuntimeBuilder {
@@ -237,37 +273,60 @@ impl SWRuntime {
     }
 
     pub fn state(&self) -> SWRuntimeState {
-        self.state
+        self.control.phase()
+    }
+
+    /// Returns a reusable class handle. A handle remains closed after this
+    /// runtime shuts down or is abandoned; it does not retain worker ownership.
+    pub fn lane(&self, class: SWExecutionClass) -> SWLane {
+        SWLane::new(Arc::clone(&self.control), class)
     }
 
     /// Stops and joins all workers. May block, including on thread-local
-    /// destructors. Call from the host outside worker execution. The current
-    /// foundation exposes no submissions, so its executors are quiescent.
+    /// destructors. Closes new root invocations and waits for existing scopes
+    /// and owned jobs, including their accepted dependencies and descendants.
+    /// Scoped nesting stays on one lane; owned descendants may target another.
+    /// A participating caller or worker
+    /// receives an error before closure, avoiding self-wait and cross-pool cycles.
     /// Repeating this after either terminal operation has no effect.
-    pub fn shutdown(&mut self) {
-        if self.state != SWRuntimeState::Running {
-            return;
+    pub fn shutdown(&mut self) -> Result<(), SWShutdownError> {
+        if context::current().is_some() {
+            return Err(SWShutdownError::ExecutionContext);
         }
-        // Worker-local cleanup may depend on another class's worker exiting.
-        // Wake every pool before any join can block on that cleanup.
-        for pool in &self.pools {
-            pool.begin_stop();
+        if self.state() != SWRuntimeState::Running {
+            return Ok(());
         }
-        for pool in self.pools.drain(..) {
-            pool.stop_and_join();
+        self.control.close_and_wait();
+        if let Some(backend) = self.backend.take() {
+            // Lanes hold weak backend references; each active lease releases
+            // its strong reference before publishing its departure.
+            let backend = Arc::try_unwrap(backend).unwrap_or_else(|_| {
+                panic!("quiescent runtime still has a backend execution owner")
+            });
+            backend.join();
         }
-        self.state = SWRuntimeState::Stopped;
+        self.control.set_phase(SWRuntimeState::Stopped);
+        Ok(())
     }
 
-    /// Requests stop without joining. Worker termination may occur after this
-    /// returns. This cannot subsequently be upgraded to joining shutdown.
+    /// Suppresses unclaimed owned jobs and requests stop without joining.
+    /// Their transferable captures are cleaned up on the abandoning caller;
+    /// cleanup can take time. Claimed jobs and worker termination may finish
+    /// after this returns. This cannot be upgraded to joining shutdown.
     pub fn abandon(&mut self) {
-        if self.state != SWRuntimeState::Running {
+        if matches!(
+            self.state(),
+            SWRuntimeState::Stopped | SWRuntimeState::Abandoned
+        ) {
             return;
         }
-        self.state = SWRuntimeState::Abandoned;
-        for pool in self.pools.drain(..) {
-            pool.stop_and_detach();
+        self.control.set_phase(SWRuntimeState::Abandoned);
+        if let Some(owned) = &self.owned {
+            owned.abandon();
+        }
+        if let Some(backend) = self.backend.take() {
+            backend.begin_stop();
+            drop(backend);
         }
     }
 }
