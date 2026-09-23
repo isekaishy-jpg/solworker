@@ -17,6 +17,49 @@ fn new_runtime() -> SWRuntime {
 
 struct CloseOnDrop(solworker::SWOwnerControl);
 
+struct HostilePanic;
+
+impl Drop for HostilePanic {
+    fn drop(&mut self) {
+        std::panic::panic_any(HostilePanic);
+    }
+}
+
+#[test]
+fn capture_cleanup_panic_settles_faults_and_continues_cancel_or_close() {
+    for close in [false, true] {
+        let mut runtime = new_runtime();
+        let mut owner = runtime.owner((), NonZeroUsize::new(2).unwrap()).unwrap();
+        let phase = SWPhase(1);
+        owner.set_phase(phase).unwrap();
+        let capture = HostilePanic;
+        let (delivery, cancel) = owner.try_post(phase, move |_| drop(capture)).unwrap();
+        let (following, _) = owner
+            .try_post(phase, |_| panic!("must be suppressed"))
+            .unwrap();
+        if close {
+            owner.close();
+        } else {
+            cancel.cancel();
+            assert_eq!(
+                owner.pump(phase, SWPumpBudget::new(2)).unwrap().suppressed,
+                2
+            );
+        }
+        assert_eq!(delivery.status(), SWDeliveryStatus::Panicked);
+        assert_eq!(following.status(), SWDeliveryStatus::Suppressed);
+        if !close {
+            owner.recover().unwrap();
+            // Both entitlements returned, even with old status observers alive.
+            owner.try_post(phase, |_| {}).unwrap();
+            owner.try_post(phase, |_| {}).unwrap();
+            assert_eq!(owner.pump(phase, SWPumpBudget::new(2)).unwrap().invoked, 2);
+        }
+        owner.close();
+        runtime.shutdown().unwrap();
+    }
+}
+
 impl Drop for CloseOnDrop {
     fn drop(&mut self) {
         self.0.request_close();
@@ -279,7 +322,7 @@ fn immediate_ready_panic_faults_routes_until_cleanup_and_recovery() {
     let ready = SWShared::ready(5usize);
     let result: SWReadyAccess<(), _> = owner.with_ready(&ready, phase, |state, _| {
         *state += 1;
-        panic!("immediate callback");
+        std::panic::panic_any(HostilePanic);
     });
     assert!(matches!(result, SWReadyAccess::Panicked));
     assert_eq!(*owner.state(), 1);

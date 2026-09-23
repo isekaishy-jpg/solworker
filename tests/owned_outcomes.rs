@@ -5,9 +5,130 @@ use std::thread;
 use std::time::Duration;
 
 use solworker::{
-    SWExecutionClass, SWOutcome, SWOwnedLimits, SWRuntime, SWRuntimeConfig, SWSpawnError,
-    SWSpawnOptions, SWTask, SWTaskStatus, SWWaitError, SWWorkerConfig,
+    SWDependencyPolicy, SWExecutionClass, SWOutcome, SWOwnedLimits, SWRuntime, SWRuntimeConfig,
+    SWSpawnError, SWSpawnOptions, SWTask, SWTaskStatus, SWWaitError, SWWorkerConfig,
 };
+
+#[test]
+fn sealed_group_dependencies_cover_early_late_failure_and_cross_class_activation() {
+    const TIMEOUT: Duration = Duration::from_secs(5);
+    // One contract, four member outcomes: success, typed failure, panic, cancel.
+    for variant in 0..4 {
+        let config = SWRuntimeConfig::new(3, [SWWorkerConfig::new(1); 3]).unwrap();
+        let limits = SWOwnedLimits::new(12, 12, [8; 3], [2; 3]).unwrap();
+        let mut runtime = SWRuntime::builder(config)
+            .with_owned_limits(limits)
+            .build()
+            .unwrap();
+        let low = runtime.lane(SWExecutionClass::Low);
+        let high = runtime.lane(SWExecutionClass::High);
+        let group = low.group().unwrap();
+        let completion = group.completion();
+        let count = Arc::new(AtomicUsize::new(0));
+        let ran = Arc::clone(&count);
+        let (dependent, _) = high
+            .try_spawn_after(
+                SWSpawnOptions::default(),
+                std::slice::from_ref(&completion),
+                SWDependencyPolicy::SuccessOnly,
+                move || {
+                    ran.fetch_add(1, Ordering::SeqCst);
+                },
+            )
+            .unwrap();
+        // A directly self-dependent member must reject before changing membership.
+        assert_eq!(
+            low.try_spawn_after_in(
+                &group,
+                SWSpawnOptions::default(),
+                std::slice::from_ref(&completion),
+                SWDependencyPolicy::OutcomeAware,
+                || (),
+            )
+            .err()
+            .unwrap()
+            .reason,
+            SWSpawnError::InvalidGroup
+        );
+
+        let (release_tx, release_rx) = mpsc::channel();
+        let (gate, _) = high
+            .try_spawn(SWSpawnOptions::default(), move || {
+                release_rx.recv_timeout(TIMEOUT).unwrap();
+            })
+            .unwrap();
+        let (member, cancel) = low
+            .try_spawn_after_fallible_in(
+                &group,
+                SWSpawnOptions::default(),
+                &[gate.completion()],
+                SWDependencyPolicy::SuccessOnly,
+                move || -> Result<(), &'static str> {
+                    match variant {
+                        1 => Err("failed"),
+                        2 => panic!("member panic"),
+                        _ => Ok(()),
+                    }
+                },
+            )
+            .unwrap();
+        let observed = completion.clone();
+        let (aware, _) = high
+            .try_spawn_after(
+                SWSpawnOptions::default(),
+                std::slice::from_ref(&completion),
+                SWDependencyPolicy::OutcomeAware,
+                move || observed.status().unwrap(),
+            )
+            .unwrap();
+        if variant == 3 {
+            cancel.cancel();
+        }
+        assert_eq!(completion.status(), None); // Even a cancelled member cannot seal the wave.
+        assert_eq!(dependent.status(), None);
+        group.seal();
+        group.seal(); // Publication is once-only.
+        release_tx.send(()).unwrap();
+        let expected = if variant == 0 {
+            SWTaskStatus::Succeeded
+        } else {
+            SWTaskStatus::PrerequisiteFailed
+        };
+        assert_eq!(completion.wait_timeout(TIMEOUT).unwrap(), Some(expected));
+        group.wait_helping().unwrap();
+        assert!(member.status().is_some());
+        assert_eq!(
+            dependent.completion().wait_timeout(TIMEOUT).unwrap(),
+            Some(expected)
+        );
+        let mut aware = aware;
+        assert_eq!(
+            aware.completion().wait_timeout(TIMEOUT).unwrap(),
+            Some(SWTaskStatus::Succeeded)
+        );
+        assert_eq!(aware.try_take(), Some(SWOutcome::Success(expected)));
+        assert_eq!(count.load(Ordering::SeqCst), usize::from(variant == 0));
+
+        let (late, _) = high
+            .try_spawn_after(
+                SWSpawnOptions::default(),
+                &[completion],
+                SWDependencyPolicy::OutcomeAware,
+                || 7,
+            )
+            .unwrap();
+        assert_eq!(
+            late.completion().wait_timeout(TIMEOUT).unwrap(),
+            Some(SWTaskStatus::Succeeded)
+        );
+        let empty = low.group().unwrap();
+        let empty_done = empty.completion();
+        assert_eq!(empty_done.status(), None);
+        empty.seal();
+        assert_eq!(empty_done.status(), Some(SWTaskStatus::Succeeded));
+        runtime.shutdown().unwrap();
+    }
+}
 
 #[test]
 fn ready_unique_result_moves_once_and_completion_survives_take() {

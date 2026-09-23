@@ -672,7 +672,9 @@ impl<O> SWOwner<O> {
         self.active = false;
         let access = match outcome {
             Ok(value) => SWReadyAccess::Ready(value),
-            Err(_) => {
+            Err(payload) => {
+                let _guard = OwnerCallbackGuard::enter();
+                crate::cleanup::discard_panic(payload);
                 self.fault();
                 SWReadyAccess::Panicked
             }
@@ -781,11 +783,8 @@ impl<O> SWOwner<O> {
         // The synchronized claim is the cutoff, including runtime abandonment.
         // Rechecking transport closure here would retract an accepted claim.
         if claimed == ClaimResult::Suppress {
-            {
-                let _guard = OwnerCallbackGuard::enter();
-                drop(entry);
-            }
-            notification.settle(SWDeliveryStatus::Suppressed);
+            let status = self.discard_entry(entry);
+            notification.settle(status);
             drop(work_set);
             report.suppressed += 1;
             // Local destructors may request teardown just like callbacks.
@@ -803,7 +802,9 @@ impl<O> SWOwner<O> {
                 notification.settle(SWDeliveryStatus::Published);
                 report.invoked += 1;
             }
-            Err(_) => {
+            Err(payload) => {
+                let _guard = OwnerCallbackGuard::enter();
+                crate::cleanup::discard_panic(payload);
                 notification.settle(SWDeliveryStatus::Panicked);
                 report.suppressed += 1;
                 self.fault();
@@ -842,21 +843,36 @@ impl<O> SWOwner<O> {
         while let Some(notification) = self.pending.pop_front() {
             let id = notification.id();
             notification.claim();
-            let work_set = if let Some(mut entry) = self.callbacks.remove(&id) {
+            let (work_set, status) = if let Some(mut entry) = self.callbacks.remove(&id) {
                 let work_set = entry.work_set.take();
-                let _guard = OwnerCallbackGuard::enter();
-                drop(entry);
-                work_set
+                let status = self.discard_entry(entry);
+                (work_set, status)
             } else {
-                None
+                (None, SWDeliveryStatus::Suppressed)
             };
-            notification.settle(SWDeliveryStatus::Suppressed);
+            notification.settle(status);
             drop(work_set);
+        }
+    }
+
+    /// Contain capture-destruction panics so callers can settle notification and
+    /// work-set accounting afterward and continue cleaning the remaining routes.
+    fn discard_entry(&mut self, entry: LocalDelivery<O>) -> SWDeliveryStatus {
+        let _guard = OwnerCallbackGuard::enter();
+        match catch_unwind(AssertUnwindSafe(|| drop(entry))) {
+            Ok(()) => SWDeliveryStatus::Suppressed,
+            Err(payload) => {
+                crate::cleanup::discard_panic(payload);
+                self.fault();
+                SWDeliveryStatus::Panicked
+            }
         }
     }
 
     /// Rejects new registrations and suppresses unclaimed callbacks. Local
     /// cleanup finishes before runtime owner registration is released.
+    /// Capture-destruction panics fault the owner and settle that delivery as
+    /// Panicked; cleanup continues for the remaining entries.
     pub fn close(&mut self) {
         self.closed = true;
         let transferred = self.inbox.close_and_take();

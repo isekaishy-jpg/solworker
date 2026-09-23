@@ -335,15 +335,17 @@ fn visible_outcome_retains_admission_until_dependency_cleanup_settles() {
         .unwrap();
     let lane = runtime.lane(SWExecutionClass::Mid);
     let group = lane.group().unwrap();
+    let predecessor_group = lane.group().unwrap();
     let (start_tx, start_rx) = mpsc::channel();
     let (run_tx, run_rx) = mpsc::channel();
     let (predecessor, _) = lane
-        .try_spawn_fallible(SWSpawnOptions::default(), move || {
+        .try_spawn_fallible_in(&predecessor_group, SWSpawnOptions::default(), move || {
             start_tx.send(()).unwrap();
             run_rx.recv_timeout(TIMEOUT).unwrap();
             Err::<usize, &'static str>("failed")
         })
         .unwrap();
+    predecessor_group.seal();
     start_rx.recv_timeout(TIMEOUT).unwrap();
     let (drop_tx, drop_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
@@ -368,8 +370,10 @@ fn visible_outcome_retains_admission_until_dependency_cleanup_settles() {
     drop_rx.recv_timeout(TIMEOUT).unwrap();
 
     assert_eq!(predecessor.status(), Some(SWTaskStatus::ApplicationFailed));
+    assert_eq!(predecessor_group.completion().status(), None);
     assert_eq!(successor.status(), None);
     assert!(!group.is_complete());
+    assert_eq!(group.completion().status(), None);
     assert_eq!(
         lane.try_spawn(SWSpawnOptions::default(), || 3usize)
             .err()
@@ -384,6 +388,15 @@ fn visible_outcome_retains_admission_until_dependency_cleanup_settles() {
         Some(SWTaskStatus::PrerequisiteFailed)
     );
     group.wait_helping().unwrap();
+    predecessor_group.wait_helping().unwrap();
+    assert_eq!(
+        predecessor_group.completion().status(),
+        Some(SWTaskStatus::PrerequisiteFailed)
+    );
+    assert_eq!(
+        group.completion().status(),
+        Some(SWTaskStatus::PrerequisiteFailed)
+    );
     runtime.shutdown().unwrap();
 }
 

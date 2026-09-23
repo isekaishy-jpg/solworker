@@ -8,10 +8,15 @@
 //! acknowledgement of physical storage release.
 //! Explicit root closure lets hosts service accepted work before joining;
 //! passive progress snapshots and deadline-based wakes report remaining work.
+//!
+//! Runtime-discarded panic payloads are destroyed inside containment. If that
+//! destruction panics, its new payload is deliberately retained to avoid an
+//! unbounded disposal/unwind chain. Caller-owned panic payloads stay caller-owned.
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
 mod backend;
+mod cleanup;
 mod execution;
 mod external;
 mod owner;

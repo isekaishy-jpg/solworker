@@ -52,7 +52,7 @@ struct SignalState {
     next_subscriber: u64,
 }
 
-struct Signal {
+pub(crate) struct Signal {
     state: Mutex<SignalState>,
     changed: Condvar,
     producer: OnceLock<ProducerIdentity>,
@@ -65,7 +65,7 @@ struct ProducerIdentity {
 }
 
 impl Signal {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             state: Mutex::new(SignalState {
                 status: None,
@@ -77,11 +77,26 @@ impl Signal {
         }
     }
 
+    pub(crate) fn reset(&mut self) {
+        let state = self
+            .state
+            .get_mut()
+            .unwrap_or_else(|error| error.into_inner());
+        debug_assert!(state.subscribers.is_empty());
+        state.status = None;
+        state.next_subscriber = 1;
+        self.producer.take();
+    }
+
     fn lock(&self) -> MutexGuard<'_, SignalState> {
         self.state.lock().unwrap_or_else(|error| error.into_inner())
     }
 
     fn publish(&self, status: SWTaskStatus) {
+        self.publish_notifying(status, || {});
+    }
+
+    fn publish_notifying(&self, status: SWTaskStatus, notify: impl FnOnce()) {
         let subscribers = {
             let mut state = self.lock();
             debug_assert!(state.status.is_none(), "completion published twice");
@@ -89,13 +104,18 @@ impl Signal {
             self.changed.notify_all();
             std::mem::take(&mut state.subscribers)
         };
+        // Wake the group's separate helping predicate after status is visible,
+        // before arbitrary downstream activation or cleanup can block/unwind.
+        notify();
         // Activation never runs under the result or status lock.
         let mut first_panic = None;
         for (_, subscriber) in subscribers {
-            if let Err(payload) = catch_unwind(AssertUnwindSafe(|| subscriber(status)))
-                && first_panic.is_none()
-            {
-                first_panic = Some(payload);
+            if let Err(payload) = catch_unwind(AssertUnwindSafe(|| subscriber(status))) {
+                if first_panic.is_none() {
+                    first_panic = Some(payload);
+                } else {
+                    crate::cleanup::discard_panic(payload);
+                }
             }
         }
         if let Some(payload) = first_panic {
@@ -104,9 +124,10 @@ impl Signal {
     }
 }
 
-/// A status-only prerequisite. Readiness means the invocation and its captures
-/// have settled and its outcome is available, but registered successor edges
-/// may still be activating. Group/runtime settlement includes that bookkeeping.
+/// A status-only prerequisite. Task readiness means the invocation and its
+/// captures have settled and its outcome is available, but successor edges may
+/// still be activating. A group token instead includes its sealed members'
+/// settlement bookkeeping. Neither token includes its own downstream work.
 /// Cloning observes the same completion; dropping an observer does not request
 /// cancellation.
 #[derive(Clone)]
@@ -115,6 +136,28 @@ pub struct SWCompletion {
 }
 
 impl SWCompletion {
+    pub(crate) fn pending() -> Self {
+        Self {
+            signal: Arc::new(Signal::new()),
+        }
+    }
+
+    pub(crate) fn reset(&mut self) {
+        if let Some(signal) = Arc::get_mut(&mut self.signal) {
+            signal.reset();
+        } else {
+            *self = Self::pending();
+        }
+    }
+
+    pub(crate) fn publish_notifying(&self, status: SWTaskStatus, notify: impl FnOnce()) {
+        self.signal.publish_notifying(status, notify);
+    }
+
+    pub(crate) fn same_signal(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.signal, &other.signal)
+    }
+
     pub(crate) fn producer_identity(&self) -> Option<(u64, u64)> {
         self.signal
             .producer
@@ -164,9 +207,9 @@ impl SWCompletion {
         self.signal.lock().status
     }
 
-    /// Waits for the task outcome without executing jobs or servicing
+    /// Waits for the represented outcome without executing jobs or servicing
     /// owner/provider callbacks. This can return while successor activation is
-    /// still in progress; wait on the group for all accepted work to settle.
+    /// still in progress. Group tokens include their members' settlement.
     pub fn wait(&self) -> Result<SWTaskStatus, SWWaitError> {
         if context::passive_wait_forbidden() {
             return Err(SWWaitError::ExecutionContext);
@@ -339,9 +382,13 @@ impl<T: Send + 'static> SWTask<T> {
     }
 
     pub(crate) fn pending_pair() -> (Self, CompletionSink<T>) {
+        Self::pending_with_signal(Arc::new(Signal::new()))
+    }
+
+    pub(crate) fn pending_with_signal(signal: Arc<Signal>) -> (Self, CompletionSink<T>) {
         let cell = Arc::new(ResultCell {
             outcome: Mutex::new(ResultStorage::Unique(None)),
-            signal: Arc::new(Signal::new()),
+            signal,
         });
         (
             Self {

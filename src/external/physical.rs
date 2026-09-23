@@ -1,6 +1,7 @@
 //! Owned resources retained across access by an external provider or device.
 
 use super::PhysicalRetention;
+use crate::execution::context::ControlCallbackGuard;
 use crate::scheduler::SWSpawnError;
 use crate::scheduler::reservation::SWByteLease;
 use crate::task::SWRetained;
@@ -12,10 +13,30 @@ use std::sync::{Arc, Mutex};
 /// Activation is the explicit boundary after which release needs proof from the
 /// provider. `T` must be transferable because final cleanup may run on another
 /// thread after the originating runtime has gone away.
+/// Destruction rejects passive runtime waits until its retained work is released.
 pub struct SWExternalPrepared<T: Send + 'static> {
-    resource: Box<T>,
+    resource: PreparedResource<T>,
     bytes: Option<SWByteLease>,
     retention: PhysicalRetention,
+}
+
+/// First field of a prepared operation: resource cleanup precedes byte and
+/// lifetime-accounting release, including unwinding through implicit Drop.
+struct PreparedResource<T>(Option<Box<T>>);
+
+impl<T> PreparedResource<T> {
+    fn into_inner(mut self) -> Box<T> {
+        self.0.take().expect("prepared resource")
+    }
+}
+
+impl<T> Drop for PreparedResource<T> {
+    fn drop(&mut self) {
+        if let Some(resource) = self.0.take() {
+            let _guard = ControlCallbackGuard::enter();
+            drop(resource);
+        }
+    }
 }
 
 impl<T: Send + 'static> SWExternalPrepared<T> {
@@ -25,7 +46,7 @@ impl<T: Send + 'static> SWExternalPrepared<T> {
         retention: PhysicalRetention,
     ) -> Self {
         Self {
-            resource: Box::new(resource),
+            resource: PreparedResource(Some(Box::new(resource))),
             bytes,
             retention,
         }
@@ -33,12 +54,12 @@ impl<T: Send + 'static> SWExternalPrepared<T> {
 
     /// Borrows the resource while no foreign access is permitted.
     pub fn get(&self) -> &T {
-        &self.resource
+        self.resource.0.as_deref().expect("prepared resource")
     }
 
     /// Mutates the resource while no foreign access is permitted.
     pub fn get_mut(&mut self) -> &mut T {
-        &mut self.resource
+        self.resource.0.as_deref_mut().expect("prepared resource")
     }
 
     /// Transfers a resource that was never activated into ordinary retained
@@ -49,7 +70,7 @@ impl<T: Send + 'static> SWExternalPrepared<T> {
             bytes,
             retention,
         } = self;
-        let retained = SWRetained::new(*resource, bytes);
+        let retained = SWRetained::new(*resource.into_inner(), bytes);
         drop(retention);
         retained
     }
@@ -66,7 +87,7 @@ impl<T: Send + 'static> SWExternalPrepared<T> {
 
         let inner = Arc::new(PhysicalCapsule {
             state: Mutex::new(PhysicalState {
-                resource: Some(self.resource),
+                resource: Some(self.resource.into_inner()),
                 bytes: self.bytes,
                 retention: Some(Arc::new(self.retention)),
                 anchor: None,
@@ -154,6 +175,8 @@ impl<T: Send + 'static> SWExternalAccess<T> {
     }
 
     /// Destroys the resource after physical release has been proved.
+    /// Destruction participates in runtime cleanup: passive waits and terminal
+    /// joins are rejected. A destructor panic propagates after accounting settles.
     ///
     /// # Safety
     ///
@@ -161,6 +184,7 @@ impl<T: Send + 'static> SWExternalAccess<T> {
     /// destructor must be legal on this thread; thread-affine destruction belongs
     /// in a provider-owned service instead.
     pub unsafe fn release(mut self) {
+        let _guard = ControlCallbackGuard::enter();
         let inner = self.inner.take().expect("active external ticket");
         let (resource, bytes, retention, anchor) = inner.take_release();
         // A user destructor can panic. Finish the accounting transition only

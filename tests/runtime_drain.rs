@@ -89,8 +89,10 @@ fn closing_seals_roots_but_keeps_discovery_and_prepared_access_alive() {
     let retained = unsafe { active.acknowledge_release() };
     drop(retained);
     drop(permit);
-    assert!(set.is_drained());
+    // The child's visible outcome can precede its work-set retirement. The
+    // runtime drain, not result readiness, supplies the settlement barrier.
     finish_shutdown(&mut runtime);
+    assert!(set.is_drained());
     assert_eq!(runtime.state(), SWRuntimeState::Stopped);
 
     let mut replacement = self::runtime();

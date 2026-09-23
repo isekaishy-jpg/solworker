@@ -15,6 +15,9 @@ pub type SWSpawnResult<T, F> = Result<(SWTask<T>, SWProducerControl), SWSpawnRej
 /// including a wrapper whose job is running. Zero edges disables dependent
 /// submissions. Saturated caller execution can exceed only the runnable
 /// limit; it still needs record and edge credits.
+/// Internal reuse caches retain at most `records` job, group, and completion
+/// allocations each, plus `edges` slots of detached subscription buffers.
+/// Outstanding handles prevent reuse; retained payloads keep their own lifetime.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SWOwnedLimits {
     pub(crate) records: usize,

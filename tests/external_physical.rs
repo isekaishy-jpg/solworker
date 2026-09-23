@@ -27,6 +27,72 @@ fn runtime() -> SWRuntime {
 }
 
 #[test]
+fn physical_destruction_is_guarded_and_settles_accounting_even_on_unwind() {
+    type Observation = (
+        usize,
+        Result<solworker::SWTaskStatus, solworker::SWWaitError>,
+    );
+    struct Probe {
+        set: solworker::SWWorkSet,
+        observation: Arc<std::sync::Mutex<Option<Observation>>>,
+        panic: bool,
+    }
+    impl Drop for Probe {
+        fn drop(&mut self) {
+            let active = self.set.progress().active_work;
+            let wait = solworker::SWTask::ready(()).completion().wait();
+            *self.observation.lock().unwrap() = Some((active, wait));
+            if self.panic {
+                panic!("physical resource destructor");
+            }
+        }
+    }
+    for active in [false, true] {
+        for panic in [false, true] {
+            let mut runtime = runtime();
+            let set = runtime.work_set(NonZeroUsize::new(1).unwrap()).unwrap();
+            let observation = Arc::new(std::sync::Mutex::new(None));
+            let prepared = runtime
+                .prepare_external(
+                    Probe {
+                        set: set.clone(),
+                        observation: Arc::clone(&observation),
+                        panic,
+                    },
+                    SWExternalAccessOptions {
+                        work_set: Some(&set),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            set.seal();
+            let cleanup = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if active {
+                    // No foreign accessor was exposed; this thread may destroy T.
+                    unsafe { prepared.activate().unwrap().release() };
+                } else {
+                    drop(prepared);
+                }
+            }));
+            assert_eq!(cleanup.is_err(), panic);
+            assert_eq!(
+                observation.lock().unwrap().take(),
+                Some((1, Err(solworker::SWWaitError::ExecutionContext)))
+            );
+            assert!(set.is_drained());
+            assert_eq!(runtime.external_progress().active, 0);
+            assert_eq!(runtime.external_progress().prepared, 0);
+            // The participation guard must also unwind correctly.
+            assert_eq!(
+                solworker::SWTask::ready(()).completion().wait(),
+                Ok(solworker::SWTaskStatus::Succeeded)
+            );
+            runtime.shutdown().unwrap();
+        }
+    }
+}
+
+#[test]
 fn acknowledged_release_transfers_resource_after_physical_count_ends() {
     let mut runtime = runtime();
     let dropped = Arc::new(AtomicUsize::new(0));

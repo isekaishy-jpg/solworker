@@ -9,6 +9,7 @@ mod admission;
 mod demand;
 mod ready;
 pub(crate) mod reservation;
+mod storage;
 pub(crate) mod work_set;
 
 use std::cell::RefCell;
@@ -25,7 +26,8 @@ use crate::external::producer::{
 use crate::runtime::config::SWExecutionClass;
 use crate::runtime::{ExternalAdmission, OwnedAdmission, RuntimeControl};
 use crate::task::{
-    CompletionSink, SWCompletion, SWOutcome, SWProducerControl, SWTask, SWTaskStatus, Subscription,
+    CompletionSink, SWCompletion, SWOutcome, SWProducerControl, SWTask, SWTaskStatus, Signal,
+    Subscription,
 };
 
 pub use admission::{
@@ -39,6 +41,7 @@ use reservation::SWReservationPool;
 pub use reservation::{
     SWByteLease, SWCapacityUsage, SWCost, SWLimitError, SWLimits, SWReservation, SWReservationError,
 };
+use storage::{ArcPool, BufferPool};
 use work_set::WorkSetLease;
 pub use work_set::{SWDiscoveryError, SWDiscoveryPermit, SWWorkSet, SWWorkSetProgress};
 
@@ -176,6 +179,7 @@ enum Stage {
 
 struct Record {
     job: Arc<Job>,
+    completion: Option<SWCompletion>,
     class: SWExecutionClass,
     group: Option<Arc<GroupInner>>,
     pending: usize,
@@ -222,6 +226,10 @@ struct State {
     abandoned: bool,
     demand: DemandState,
     provider_callbacks: usize,
+    jobs: ArcPool<Job>,
+    groups: ArcPool<GroupInner>,
+    signals: ArcPool<Signal>,
+    subscriptions: BufferPool<Subscription>,
 }
 
 /// Publish wake changes after releasing the scheduler lock. Read-only snapshots
@@ -399,7 +407,8 @@ impl OwnedScheduler {
         }
         let id = state.next_id;
         state.next_id = id.checked_add(1).expect("owned record identity exhausted");
-        let (task, sink) = SWTask::pending_pair();
+        let signal = state.signals.acquire(Signal::new, Signal::reset);
+        let (task, sink) = SWTask::pending_with_signal(signal);
         task.set_producer(control.identity(), id, Arc::downgrade(self));
         let core = Arc::new(ExternalCore::new(sink, bytes));
         if state.demand.enabled() {
@@ -483,7 +492,7 @@ impl OwnedScheduler {
             drop((settle, capacity, work_set, admission));
         }
         if let Err(payload) = publication {
-            let _ = catch_unwind(AssertUnwindSafe(|| drop(payload)));
+            crate::cleanup::discard_panic(payload);
         }
     }
 
@@ -649,7 +658,7 @@ impl OwnedScheduler {
                 provider(snapshot);
                 drop(provider);
             })) {
-                let _ = catch_unwind(AssertUnwindSafe(|| drop(payload)));
+                crate::cleanup::discard_panic(payload);
             }
         }
     }
@@ -687,6 +696,10 @@ impl OwnedScheduler {
                 abandoned: false,
                 demand: DemandState::new(priorities, demand_leases),
                 provider_callbacks: 0,
+                jobs: ArcPool::new(limits.records),
+                groups: ArcPool::new(limits.records),
+                signals: ArcPool::new(limits.records),
+                subscriptions: BufferPool::new(limits.edges),
             }),
         })
     }
@@ -755,10 +768,15 @@ impl OwnedScheduler {
         }
         let id = state.next_group;
         state.next_group = id.checked_add(1).expect("group identity exhausted");
+        let inner = state.groups.acquire_where(
+            || GroupInner::new(id, class),
+            |group| group.reset(id, class),
+            GroupInner::is_complete,
+        );
         drop(state);
         drop(admission);
         Ok(SWGroup::new(
-            Arc::new(GroupInner::new(id, class)),
+            inner,
             Arc::downgrade(self),
             control.identity(),
         ))
@@ -895,6 +913,9 @@ impl OwnedScheduler {
             if group.runtime != control.identity()
                 || group.inner.class != class
                 || !Weak::ptr_eq(&group.scheduler, &Arc::downgrade(self))
+                || prerequisites
+                    .iter()
+                    .any(|input| input.same_signal(&group.completion()))
             {
                 return Err(reject(SWSpawnError::InvalidGroup, payload));
             }
@@ -914,14 +935,16 @@ impl OwnedScheduler {
                 current.runtime != control.identity() || current.class != class
             })
         {
+            drop(state);
             if let Some(group) = &group_inner {
-                group.finish();
+                group.finish(None);
             }
             return Err(reject(SWSpawnError::InvalidContext, payload));
         }
         if saturated && !inline && !extras.reserved {
+            drop(state);
             if let Some(group) = &group_inner {
-                group.finish();
+                group.finish(None);
             }
             return Err(reject(SWSpawnError::Full, payload));
         }
@@ -949,15 +972,17 @@ impl OwnedScheduler {
                 })
             };
             if let Some(reason) = rejection {
+                drop(state);
                 if let Some(group) = &group_inner {
-                    group.finish();
+                    group.finish(None);
                 }
                 return Err(reject(reason, payload));
             }
         }
         let id = state.next_id;
         state.next_id = id.checked_add(1).expect("owned record identity exhausted");
-        let (task, sink) = SWTask::pending_pair();
+        let signal = state.signals.acquire(Signal::new, Signal::reset);
+        let (task, sink) = SWTask::pending_with_signal(signal);
         task.set_producer(control.identity(), id, Arc::downgrade(self));
         if state.demand.enabled() {
             let parents = prerequisites
@@ -980,11 +1005,23 @@ impl OwnedScheduler {
             ticket.bind(task.completion());
         }
         let envelope = make_envelope(payload, run, application_failed, sink);
-        let job = Arc::new(Job {
-            id,
-            scheduler: Arc::downgrade(self),
-            envelope: Mutex::new(Some(envelope)),
-        });
+        let job = state.jobs.acquire(
+            || Job {
+                id: 0,
+                scheduler: Weak::new(),
+                envelope: Mutex::new(None),
+            },
+            |job| {
+                job.id = id;
+                job.scheduler = Arc::downgrade(self);
+                let storage = job
+                    .envelope
+                    .get_mut()
+                    .unwrap_or_else(|error| error.into_inner());
+                debug_assert!(storage.is_none());
+                *storage = Some(envelope);
+            },
+        );
         let stage = if !prerequisites.is_empty() {
             Stage::Waiting
         } else if saturated && !inline {
@@ -994,10 +1031,12 @@ impl OwnedScheduler {
         };
         state.edges += prerequisites.len();
         let set_registration = extras.work_set.clone();
+        let subscriptions = state.subscriptions.acquire(prerequisites.len());
         state.records.insert(
             id,
             Record {
                 job: Arc::clone(&job),
+                completion: group_inner.as_ref().map(|_| task.completion()),
                 class,
                 group: group_inner,
                 pending: prerequisites.len(),
@@ -1006,7 +1045,7 @@ impl OwnedScheduler {
                 stage,
                 eligibility: options.eligibility,
                 edges: prerequisites.len(),
-                subscriptions: Vec::with_capacity(prerequisites.len()),
+                subscriptions,
                 attaching: !prerequisites.is_empty(),
                 deferred_finish: None,
                 admission,
@@ -1307,7 +1346,7 @@ impl OwnedScheduler {
         let finish = match catch_unwind(AssertUnwindSafe(|| envelope(decision))) {
             Ok(finish) => finish,
             Err(payload) => {
-                let _ = catch_unwind(AssertUnwindSafe(|| drop(payload)));
+                crate::cleanup::discard_panic(payload);
                 Box::new(|| {})
             }
         };
@@ -1322,7 +1361,7 @@ impl OwnedScheduler {
 
     fn finish_record(self: &Arc<Self>, id: u64, finish: Finish) {
         let _context = self.cleanup_context(id);
-        let subscriptions = {
+        let mut subscriptions = {
             let mut state = self.lock_mut();
             let Some(record) = state.records.get_mut(&id) else {
                 return;
@@ -1333,9 +1372,10 @@ impl OwnedScheduler {
             }
             std::mem::take(&mut record.subscriptions)
         };
-        drop(subscriptions);
+        subscriptions.clear();
+        self.lock_mut().subscriptions.release(subscriptions);
         if let Err(payload) = catch_unwind(AssertUnwindSafe(finish)) {
-            let _ = catch_unwind(AssertUnwindSafe(|| drop(payload)));
+            crate::cleanup::discard_panic(payload);
         }
         // A terminal publication can activate another edge, which can itself
         // publish a terminal outcome. Drain those callbacks without recursing,
@@ -1356,10 +1396,18 @@ impl OwnedScheduler {
         drop(provider);
         // Strong settlement follows capacity return, not just result readiness.
         drop(record.capacity);
+        drop(record.work_set);
         if let Some(group) = record.group {
-            group.finish();
+            let status = record
+                .completion
+                .expect("group member retains its completion")
+                .status()
+                .expect("settled member has an outcome");
+            group.finish(Some(status));
         }
-        drop((record.work_set, record.admission));
+        // Keep runtime closure accounted through group-trigger publication,
+        // including inline executions with no backend wrapper retaining a lease.
+        drop(record.admission);
         self.dispatch();
     }
 
@@ -1503,7 +1551,7 @@ where
                     (SWOutcome::Success(value), failed)
                 }
                 Err(panic) => {
-                    drop(panic);
+                    crate::cleanup::discard_panic(panic);
                     (SWOutcome::Panicked, false)
                 }
             },

@@ -252,7 +252,7 @@ impl SWRuntimeBuilder {
                                 // Release other workers even if a panic payload
                                 // itself has a panicking destructor.
                                 worker_startup.fail(SWBuildError::SetupPanicked { class, worker });
-                                drop(payload);
+                                crate::cleanup::discard_panic(payload);
                             }
                         }
                     }),

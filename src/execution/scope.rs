@@ -271,7 +271,9 @@ fn run_chunks(
                         Some(payload)
                     }
                 };
-                drop(loser);
+                if let Some(payload) = loser {
+                    crate::cleanup::discard_panic(payload);
+                }
             }
         });
     });
