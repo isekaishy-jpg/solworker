@@ -1,0 +1,15 @@
+# Generated build, test, profiling and local research artifacts.
+/target/
+__pycache__/
+*.py[cod]
+
+# Private documentation and repository guidance.
+/docs/
+/README*
+/readme*
+/rust-style.md
+
+# Private developer/research tooling and its own tests/configuration.
+/tools/
+/tests/tooling/
+/.cargo/config.toml
