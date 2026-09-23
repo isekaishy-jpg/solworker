@@ -9,6 +9,7 @@ use std::io;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::thread;
+use std::time::{Duration, Instant};
 
 use crate::backend::MicropoolBackend;
 pub(crate) use crate::execution::context::OwnerCallbackGuard;
@@ -17,7 +18,9 @@ use crate::platform::{SWWorkerSetupError, apply_worker_priority};
 use crate::scheduler::{OwnedScheduler, SWOwnedLimits};
 use config::{SWExecutionClass, SWRuntimeConfig};
 use lifecycle::{BackendOwner, Startup, StartupGuard};
-pub(crate) use lifecycle::{ExternalAdmission, OwnedAdmission, OwnerRegistration, RuntimeControl};
+pub(crate) use lifecycle::{
+    ExternalAdmission, OwnedAdmission, OwnerRegistration, OwnerRootAdmission, RuntimeControl,
+};
 
 type WorkerSetup = dyn Fn(SWExecutionClass, usize) -> io::Result<()> + Send + Sync;
 
@@ -320,7 +323,8 @@ pub enum SWRuntimeState {
 
 /// Owns dedicated Low, Mid, and High pools. Dropping a runtime closes new
 /// invocations and requests worker stop without joining. Active borrowed calls
-/// retain the pools and settle before returning; use [`Self::shutdown`] to wait.
+/// retain the pools and settle before returning. [`Self::begin_shutdown`] and
+/// [`Self::try_shutdown`] let a host service owners and providers while draining.
 pub struct SWRuntime {
     config: SWRuntimeConfig,
     backend: Option<Arc<BackendOwner>>,
@@ -339,6 +343,8 @@ pub enum SWShutdownError {
     LiveWorkSets,
     /// Finish logical producers and acknowledge physical release before joining.
     LiveExternal,
+    /// Service bounded demand/control updates before attempting the join.
+    PendingControl,
 }
 
 impl fmt::Display for SWShutdownError {
@@ -350,6 +356,9 @@ impl fmt::Display for SWShutdownError {
             Self::LiveExternal => f.write_str(
                 "settle external outcomes and physical accesses before runtime shutdown",
             ),
+            Self::PendingControl => {
+                f.write_str("service pending demand updates before runtime shutdown")
+            }
         }
     }
 }
@@ -435,7 +444,9 @@ impl SWRuntime {
             let required = options
                 .reservation
                 .is_some_and(|reserve| reserve.is_required());
-            let id = self.control.reserve_physical(required)?;
+            let id = self
+                .control
+                .reserve_physical(required, work_set.is_some())?;
             let retention = crate::external::PhysicalRetention {
                 control: Arc::clone(&self.control),
                 registry: Arc::clone(&self.physical),
@@ -467,6 +478,9 @@ impl SWRuntime {
         &self,
         cost: crate::scheduler::SWCost,
     ) -> Result<crate::scheduler::SWReservation, crate::scheduler::SWReservationError> {
+        if self.state() != SWRuntimeState::Running {
+            return Err(crate::scheduler::SWReservationError::Closed);
+        }
         self.owned
             .as_ref()
             .and_then(|owned| owned.capacity.as_ref())
@@ -478,6 +492,9 @@ impl SWRuntime {
         &self,
         cost: crate::scheduler::SWCost,
     ) -> Result<crate::scheduler::SWReservation, crate::scheduler::SWReservationError> {
+        if self.state() != SWRuntimeState::Running {
+            return Err(crate::scheduler::SWReservationError::Closed);
+        }
         self.owned
             .as_ref()
             .and_then(|owned| owned.capacity.as_ref())
@@ -530,31 +547,72 @@ impl SWRuntime {
         self.control.phase()
     }
 
+    /// Passive snapshot of CPU, owner, work-set and physical blockers. The
+    /// generation can be used to await a change and then sample again.
+    pub fn progress(&self) -> crate::progress::SWProgress {
+        let wake = self.control.wake();
+        let generation = wake.generation();
+        crate::progress::SWProgress::new(
+            self.state(),
+            self.owned
+                .as_ref()
+                .map_or_else(Default::default, |owned| owned.progress()),
+            self.capacity_usage(),
+            self.control.owner_progress(),
+            self.control.work_sets_progress(),
+            self.external_progress(),
+            self.control.active_leases(),
+            wake,
+            generation,
+        )
+    }
+
     /// Returns a reusable class handle. A handle remains closed after this
     /// runtime shuts down or is abandoned; it does not retain worker ownership.
     pub fn lane(&self, class: SWExecutionClass) -> SWLane {
         SWLane::new(Arc::clone(&self.control), class)
     }
 
-    /// Stops and joins all workers. May block, including on thread-local
-    /// destructors. Closes new root invocations and waits for existing scopes
-    /// and owned jobs, including their accepted dependencies and descendants.
-    /// Scoped nesting stays on one lane; owned descendants may target another.
-    /// A participating caller or worker
-    /// receives an error before closure, avoiding self-wait and cross-pool cycles.
-    /// Live owners return `LiveOwners` before root closure; the host must pump
-    /// or suppress their callbacks and close them on their creation threads.
-    /// Live external producers or physical accesses return `LiveExternal` so
-    /// the host can continue servicing providers before attempting the join.
-    /// Repeating this after either terminal operation has no effect.
-    pub fn shutdown(&mut self) -> Result<(), SWShutdownError> {
-        if context::current().is_some() || context::owner_callback_active() {
+    /// Closes root admission and seals every work set. Accounted descendants,
+    /// owner callbacks and provider release may continue. This never waits for
+    /// worker work, owner phases or foreign completion, and may be called from
+    /// a participating callback to request closure.
+    pub fn begin_shutdown(&self) {
+        self.control.begin_shutdown();
+    }
+
+    /// Joins the workers once accepted work and host services have settled.
+    /// Returns `Ok(false)` while the host must continue owner/provider service.
+    /// A successful join returns `Ok(true)`. Abandonment cannot be upgraded
+    /// to a join and returns `Ok(false)`.
+    /// Worker termination and thread-local cleanup can still block after the
+    /// quiescence check, so a participating execution context cannot call this.
+    pub fn try_shutdown(&mut self) -> Result<bool, SWShutdownError> {
+        if context::current().is_some()
+            || context::owner_callback_active()
+            || context::control_callback_active()
+        {
             return Err(SWShutdownError::ExecutionContext);
         }
-        if self.state() != SWRuntimeState::Running {
-            return Ok(());
+        if self.state() == SWRuntimeState::Stopped {
+            return Ok(true);
         }
-        self.control.close_and_wait()?;
+        if self.state() == SWRuntimeState::Abandoned {
+            return Ok(false);
+        }
+        self.begin_shutdown();
+        // Establish that no counted ancestor can admit a new descendant before
+        // checking scheduler tails, then recheck runtime accounting. Sampling
+        // the scheduler first could miss a child created by a retiring scope.
+        if !self.control.is_quiescent()
+            || !self
+                .owned
+                .as_ref()
+                .is_none_or(|scheduler| scheduler.quiescent())
+            || !self.control.is_quiescent()
+        {
+            return Ok(false);
+        }
         if let Some(capacity) = self
             .owned
             .as_ref()
@@ -563,15 +621,58 @@ impl SWRuntime {
             capacity.close();
         }
         if let Some(backend) = self.backend.take() {
-            // Lanes hold weak backend references; each active lease releases
-            // its strong reference before publishing its departure.
             let backend = Arc::try_unwrap(backend).unwrap_or_else(|_| {
                 panic!("quiescent runtime still has a backend execution owner")
             });
             backend.join();
         }
         self.control.set_phase(SWRuntimeState::Stopped);
-        Ok(())
+        Ok(true)
+    }
+
+    /// Convenience join for workloads that need no ongoing host service. May
+    /// block on scopes, owned jobs and worker thread-local destructors. Live
+    /// owners, work sets, providers, physical accesses and demand updates return a blocker so
+    /// the host can service them; if one appears during closing, roots stay
+    /// closed and a later call can finish the join. Participating callers and
+    /// callbacks receive an error before closure. For a host-driven drain,
+    /// call [`Self::begin_shutdown`] and poll [`Self::try_shutdown`].
+    pub fn shutdown(&mut self) -> Result<(), SWShutdownError> {
+        if context::current().is_some()
+            || context::owner_callback_active()
+            || context::control_callback_active()
+        {
+            return Err(SWShutdownError::ExecutionContext);
+        }
+        if matches!(
+            self.state(),
+            SWRuntimeState::Stopped | SWRuntimeState::Abandoned
+        ) {
+            return Ok(());
+        }
+        if self.state() == SWRuntimeState::Running {
+            self.control.prepare_shutdown()?;
+        }
+        loop {
+            let wake = self.control.wake();
+            let generation = wake.generation();
+            if self.try_shutdown()? {
+                return Ok(());
+            }
+            if let Some(blocker) = self.control.shutdown_blocker() {
+                return Err(blocker);
+            }
+            if self.owned.as_ref().is_some_and(|owned| {
+                let control = owned.progress();
+                control.demand_pending || control.provider_callbacks != 0
+            }) {
+                return Err(SWShutdownError::PendingControl);
+            }
+            // A completion can publish its result before its final scheduler
+            // bookkeeping and dispatch lease settle. Wait for that counted
+            // work to leave without busy spinning or servicing host callbacks.
+            wake.wait_since(generation, Instant::now() + Duration::from_secs(1));
+        }
     }
 
     /// Suppresses unclaimed owned jobs and requests stop without joining.

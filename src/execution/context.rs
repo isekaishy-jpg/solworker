@@ -28,6 +28,7 @@ thread_local! {
     static CURRENT: Cell<Option<ExecutionContext>> = const { Cell::new(None) };
     static LIVE_OWNERS: Cell<usize> = const { Cell::new(0) };
     static OWNER_CALLBACKS: Cell<usize> = const { Cell::new(0) };
+    static CONTROL_CALLBACKS: Cell<usize> = const { Cell::new(0) };
 }
 
 pub(crate) fn register_live_owner() {
@@ -51,7 +52,38 @@ pub(crate) fn owner_callback_active() -> bool {
 
 /// Passive waiting never services an owner's phase or legal capture cleanup.
 pub(crate) fn passive_wait_forbidden() -> bool {
-    current().is_some() || owner_callback_active() || LIVE_OWNERS.with(|count| count.get() != 0)
+    current().is_some()
+        || owner_callback_active()
+        || control_callback_active()
+        || LIVE_OWNERS.with(|count| count.get() != 0)
+}
+
+pub(crate) fn control_callback_active() -> bool {
+    CONTROL_CALLBACKS.with(|count| count.get() != 0)
+}
+
+/// Provider hooks and external settlement retain accounting until they return.
+/// Reentrant passive waiting could therefore wait for the caller itself.
+pub(crate) struct ControlCallbackGuard(PhantomData<Rc<()>>);
+
+impl ControlCallbackGuard {
+    pub(crate) fn enter() -> Self {
+        CONTROL_CALLBACKS.with(|count| {
+            count.set(
+                count
+                    .get()
+                    .checked_add(1)
+                    .expect("control callback depth overflow"),
+            )
+        });
+        Self(PhantomData)
+    }
+}
+
+impl Drop for ControlCallbackGuard {
+    fn drop(&mut self) {
+        CONTROL_CALLBACKS.with(|count| count.set(count.get() - 1));
+    }
 }
 
 pub(crate) struct OwnerCallbackGuard {

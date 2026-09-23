@@ -117,9 +117,36 @@ enum Decision {
 
 struct Job {
     id: u64,
-    class: SWExecutionClass,
     scheduler: Weak<OwnedScheduler>,
     envelope: Mutex<Option<Envelope>>,
+}
+
+/// A backend wrapper occupies its handoff slot even if its logical job has
+/// already settled. Discard during stop must release the slot without running
+/// scheduler callbacks under the backend's queue lock.
+struct Handoff {
+    scheduler: Weak<OwnedScheduler>,
+    class: SWExecutionClass,
+    completed: bool,
+}
+
+impl Handoff {
+    fn run(mut self, job: Arc<Job>) {
+        job.run();
+        self.completed = true;
+    }
+}
+
+impl Drop for Handoff {
+    fn drop(&mut self) {
+        if let Some(scheduler) = self.scheduler.upgrade() {
+            scheduler.decrement_handoff(self.class);
+            let abandoned = scheduler.lock().abandoned;
+            if self.completed && !abandoned {
+                scheduler.dispatch();
+            }
+        }
+    }
 }
 
 impl Job {
@@ -194,6 +221,45 @@ struct State {
     deferred: [VecDeque<u64>; 3],
     abandoned: bool,
     demand: DemandState,
+    provider_callbacks: usize,
+}
+
+/// Publish wake changes after releasing the scheduler lock. Read-only snapshots
+/// use the plain guard and cannot wake themselves.
+struct StateMutation<'a> {
+    state: Option<MutexGuard<'a, State>>,
+    wake: &'a crate::progress::SWWake,
+}
+
+impl std::ops::Deref for StateMutation<'_> {
+    type Target = State;
+    fn deref(&self) -> &State {
+        self.state.as_deref().expect("live mutation guard")
+    }
+}
+
+impl std::ops::DerefMut for StateMutation<'_> {
+    fn deref_mut(&mut self) -> &mut State {
+        self.state.as_deref_mut().expect("live mutation guard")
+    }
+}
+
+impl Drop for StateMutation<'_> {
+    fn drop(&mut self) {
+        drop(self.state.take());
+        self.wake.notify();
+    }
+}
+
+struct ProviderCallbacks<'a> {
+    scheduler: &'a OwnedScheduler,
+    count: usize,
+}
+
+impl Drop for ProviderCallbacks<'_> {
+    fn drop(&mut self) {
+        self.scheduler.lock_mut().provider_callbacks -= self.count;
+    }
 }
 
 /// One control domain for admission, dependencies, claims and terminal cleanup.
@@ -202,6 +268,7 @@ pub(crate) struct OwnedScheduler {
     limits: SWOwnedLimits,
     state: Mutex<State>,
     pub(crate) capacity: Option<SWReservationPool>,
+    wake: Arc<crate::progress::SWWake>,
 }
 
 impl OwnedScheduler {
@@ -218,13 +285,6 @@ impl OwnedScheduler {
                 })
             };
         }
-        let admission = match control.admit_external() {
-            Ok(admission) => admission,
-            Err(crate::execution::SWExecutionError::Closed) => reject!(SWSpawnError::Closed),
-            Err(crate::execution::SWExecutionError::InvalidContext) => {
-                reject!(SWSpawnError::InvalidContext)
-            }
-        };
         if options.work_set.is_some() && options.discovery.is_some() {
             reject!(SWSpawnError::InvalidContext);
         }
@@ -238,6 +298,13 @@ impl OwnedScheduler {
             Ok(lease) => lease,
             Err(SWDiscoveryError::Full) => reject!(SWSpawnError::Full),
             Err(_) => reject!(SWSpawnError::Closed),
+        };
+        let admission = match control.admit_external(work_set.is_some()) {
+            Ok(admission) => admission,
+            Err(crate::execution::SWExecutionError::Closed) => reject!(SWSpawnError::Closed),
+            Err(crate::execution::SWExecutionError::InvalidContext) => {
+                reject!(SWSpawnError::InvalidContext)
+            }
         };
         let unaccounted_delivery = options
             .delivery
@@ -292,7 +359,7 @@ impl OwnedScheduler {
         } else {
             None
         };
-        let mut state = self.lock();
+        let mut state = self.lock_mut();
         if state.abandoned {
             reject!(SWSpawnError::Closed);
         }
@@ -381,7 +448,7 @@ impl OwnedScheduler {
     }
 
     pub(crate) fn claim_external(&self, id: u64, abandonment: bool) -> bool {
-        let mut state = self.lock();
+        let mut state = self.lock_mut();
         if state.abandoned && !abandonment {
             return false;
         }
@@ -396,9 +463,10 @@ impl OwnedScheduler {
     }
 
     pub(crate) fn finish_external(&self, id: u64, publish: impl FnOnce()) {
+        let _context = context::ControlCallbackGuard::enter();
         let publication = catch_unwind(AssertUnwindSafe(publish));
         let (record, provider) = {
-            let mut state = self.lock();
+            let mut state = self.lock_mut();
             let record = state.external.remove(&id);
             let provider = state.demand.remove(id);
             (record, provider)
@@ -527,7 +595,7 @@ impl OwnedScheduler {
         priority: SWPriority,
     ) -> Result<SWDemand, SWDemandError> {
         let lease = {
-            let mut state = self.lock();
+            let mut state = self.lock_mut();
             if state.abandoned {
                 return Err(SWDemandError::Closed);
             }
@@ -538,7 +606,7 @@ impl OwnedScheduler {
             lease,
             Arc::new(move |id, command| {
                 let scheduler = scheduler.upgrade().ok_or(SWDemandError::Closed)?;
-                scheduler.lock().demand.change(id, command)?;
+                scheduler.lock_mut().demand.change(id, command)?;
                 scheduler.service_demand(32);
                 Ok(())
             }),
@@ -549,7 +617,7 @@ impl OwnedScheduler {
 
     fn service_demand_chunk(&self, budget: usize) {
         let providers = {
-            let mut state = self.lock();
+            let mut state = self.lock_mut();
             let changes = state.demand.service(budget);
             let mut providers = Vec::new();
             for change in changes {
@@ -566,12 +634,21 @@ impl OwnedScheduler {
                     providers.push(provider);
                 }
             }
+            state.provider_callbacks += providers.len();
             providers
         };
+        let _callbacks = ProviderCallbacks {
+            scheduler: self,
+            count: providers.len(),
+        };
+        let _context = context::ControlCallbackGuard::enter();
         for (provider, snapshot) in providers {
             // Provider demand is advisory. A panicking hook cannot unwind an
             // admission or worker dispatch after the record was committed.
-            if let Err(payload) = catch_unwind(AssertUnwindSafe(|| provider(snapshot))) {
+            if let Err(payload) = catch_unwind(AssertUnwindSafe(move || {
+                provider(snapshot);
+                drop(provider);
+            })) {
                 let _ = catch_unwind(AssertUnwindSafe(|| drop(payload)));
             }
         }
@@ -590,10 +667,15 @@ impl OwnedScheduler {
         priorities: Vec<SWPriority>,
         demand_leases: usize,
     ) -> Arc<Self> {
+        let wake = control.upgrade().expect("building live runtime").wake();
+        if let Some(capacity) = &capacity {
+            capacity.set_wake(Arc::clone(&wake));
+        }
         Arc::new(Self {
             control,
             limits,
             capacity,
+            wake,
             state: Mutex::new(State {
                 records: HashMap::new(),
                 external: HashMap::new(),
@@ -604,6 +686,7 @@ impl OwnedScheduler {
                 deferred: std::array::from_fn(|_| VecDeque::new()),
                 abandoned: false,
                 demand: DemandState::new(priorities, demand_leases),
+                provider_callbacks: 0,
             }),
         })
     }
@@ -612,16 +695,61 @@ impl OwnedScheduler {
         self.state.lock().unwrap_or_else(|error| error.into_inner())
     }
 
+    fn lock_mut(&self) -> StateMutation<'_> {
+        StateMutation {
+            state: Some(self.lock()),
+            wake: &self.wake,
+        }
+    }
+
+    pub(crate) fn quiescent(&self) -> bool {
+        let state = self.lock();
+        state.records.is_empty()
+            && state.external.is_empty()
+            && state.ready.handed_off.iter().all(|count| *count == 0)
+            && !state.demand.pending_updates()
+            && state.provider_callbacks == 0
+    }
+
+    pub(crate) fn progress(&self) -> crate::progress::SWSchedulerProgress {
+        let state = self.lock();
+        let mut snapshot = crate::progress::SWSchedulerProgress {
+            handoff_wrappers: state.ready.handed_off,
+            demand_pending: state.demand.pending_updates(),
+            provider_callbacks: state.provider_callbacks,
+            records_full: state.records.len() + state.external.len() >= self.limits.records,
+            edges_full: self.limits.edges != 0 && state.edges >= self.limits.edges,
+            runnable_full: std::array::from_fn(|index| {
+                state.ready.runnable[index] >= self.limits.runnable[index]
+            }),
+            handoff_full: std::array::from_fn(|index| {
+                state.ready.handed_off[index] >= self.limits.handoff[index]
+            }),
+            ..Default::default()
+        };
+        for record in state.records.values() {
+            match record.stage {
+                Stage::Waiting => snapshot.waiting += 1,
+                Stage::DeferredReady => snapshot.deferred += 1,
+                Stage::Ready => snapshot.ready += 1,
+                Stage::Handed => snapshot.handed += 1,
+                Stage::Running => snapshot.running += 1,
+                Stage::Finalizing => snapshot.finalizing += 1,
+            }
+        }
+        snapshot
+    }
+
     pub(crate) fn group(
         self: &Arc<Self>,
         class: SWExecutionClass,
     ) -> Result<SWGroup, SWSpawnError> {
         let control = self.control.upgrade().ok_or(SWSpawnError::Closed)?;
-        let admission = control.admit_owned().map_err(|error| match error {
+        let admission = control.admit_owned(false).map_err(|error| match error {
             crate::execution::SWExecutionError::Closed => SWSpawnError::Closed,
             crate::execution::SWExecutionError::InvalidContext => SWSpawnError::InvalidContext,
         })?;
-        let mut state = self.lock();
+        let mut state = self.lock_mut();
         if state.abandoned {
             return Err(SWSpawnError::Closed);
         }
@@ -716,7 +844,7 @@ impl OwnedScheduler {
             operation,
             options,
         };
-        let admission = match control.admit_owned() {
+        let admission = match control.admit_owned(extras.work_set.is_some()) {
             Ok(admission) => admission,
             Err(crate::execution::SWExecutionError::Closed) => {
                 return Err(reject(SWSpawnError::Closed, payload));
@@ -742,7 +870,7 @@ impl OwnedScheduler {
                 Err(error) => return Err(reject(map_reservation_error(error), payload)),
             }
         }
-        let mut state = self.lock();
+        let mut state = self.lock_mut();
         if state.abandoned {
             return Err(reject(SWSpawnError::Closed, payload));
         }
@@ -854,7 +982,6 @@ impl OwnedScheduler {
         let envelope = make_envelope(payload, run, application_failed, sink);
         let job = Arc::new(Job {
             id,
-            class,
             scheduler: Arc::downgrade(self),
             envelope: Mutex::new(Some(envelope)),
         });
@@ -910,7 +1037,7 @@ impl OwnedScheduler {
                     enqueue_activation(Activation::Prerequisite(scheduler, id, status));
                 }
             }));
-            let mut state = self.lock();
+            let mut state = self.lock_mut();
             if let Some(record) = state.records.get_mut(&id) {
                 record.subscriptions.push(subscription);
             } else {
@@ -919,7 +1046,7 @@ impl OwnedScheduler {
             }
         }
         let deferred_finish = {
-            let mut state = self.lock();
+            let mut state = self.lock_mut();
             state.records.get_mut(&id).and_then(|record| {
                 record.attaching = false;
                 record.deferred_finish.take()
@@ -940,7 +1067,7 @@ impl OwnedScheduler {
         let mut suppress = false;
         let mut group = None;
         {
-            let mut state = self.lock();
+            let mut state = self.lock_mut();
             let activation = {
                 let Some(record) = state.records.get_mut(&id) else {
                     return;
@@ -987,7 +1114,7 @@ impl OwnedScheduler {
 
     fn suppress(self: &Arc<Self>, id: u64, mut status: SWTaskStatus) {
         let job = {
-            let mut state = self.lock();
+            let mut state = self.lock_mut();
             if state.abandoned {
                 status = SWTaskStatus::Abandoned;
             }
@@ -1034,7 +1161,7 @@ impl OwnedScheduler {
             return false;
         };
         let (job, class, group_id) = {
-            let mut state = self.lock();
+            let mut state = self.lock_mut();
             // A lease obtained just before abandonment is not itself a claim.
             // Serialize the actual claim with the scheduler's abandonment cut.
             if state.abandoned {
@@ -1072,16 +1199,10 @@ impl OwnedScheduler {
         // The claim obtains a temporary backend lease before running. Queued
         // records retain only admission credit and never own a backend Arc.
         self.claim_and_run(job.id, false);
-        self.release_handoff(job.class);
-    }
-
-    fn release_handoff(self: &Arc<Self>, class: SWExecutionClass) {
-        self.decrement_handoff(class);
-        self.dispatch();
     }
 
     fn decrement_handoff(&self, class: SWExecutionClass) {
-        let mut state = self.lock();
+        let mut state = self.lock_mut();
         state.ready.handed_off[class.index()] -= 1;
     }
 
@@ -1181,12 +1302,6 @@ impl OwnedScheduler {
         // Destructors and terminal callbacks remain participating CPU work,
         // so a shutdown requested from either must not join this runtime.
         let _context = self.cleanup_context(job.id);
-        {
-            let mut state = self.lock();
-            if let Some(record) = state.records.get_mut(&job.id) {
-                record.stage = Stage::Finalizing;
-            }
-        }
         // Capture cleanup executes outside the control lock. The admission
         // token stays live through result publication and group completion.
         let finish = match catch_unwind(AssertUnwindSafe(|| envelope(decision))) {
@@ -1196,13 +1311,19 @@ impl OwnedScheduler {
                 Box::new(|| {})
             }
         };
+        {
+            let mut state = self.lock_mut();
+            if let Some(record) = state.records.get_mut(&job.id) {
+                record.stage = Stage::Finalizing;
+            }
+        }
         self.finish_record(job.id, finish);
     }
 
     fn finish_record(self: &Arc<Self>, id: u64, finish: Finish) {
         let _context = self.cleanup_context(id);
         let subscriptions = {
-            let mut state = self.lock();
+            let mut state = self.lock_mut();
             let Some(record) = state.records.get_mut(&id) else {
                 return;
             };
@@ -1224,7 +1345,7 @@ impl OwnedScheduler {
 
     fn finalize_record(self: &Arc<Self>, id: u64) {
         let (record, provider) = {
-            let mut state = self.lock();
+            let mut state = self.lock_mut();
             let Some(record) = state.records.remove(&id) else {
                 return;
             };
@@ -1264,7 +1385,7 @@ impl OwnedScheduler {
 
     pub(crate) fn abandon(self: &Arc<Self>) {
         let (ids, external) = {
-            let mut state = self.lock();
+            let mut state = self.lock_mut();
             state.abandoned = true;
             let ids = state
                 .records
@@ -1295,7 +1416,7 @@ impl OwnedScheduler {
         for class in SWExecutionClass::ALL {
             loop {
                 let job = {
-                    let mut state = self.lock();
+                    let mut state = self.lock_mut();
                     if state.abandoned {
                         break;
                     }
@@ -1317,17 +1438,21 @@ impl OwnedScheduler {
                     state.ready.handed_off[class.index()] += 1;
                     job
                 };
+                let handoff = Handoff {
+                    scheduler: Arc::downgrade(self),
+                    class,
+                    completed: false,
+                };
                 let Ok(lease) = control.acquire_owned(class) else {
-                    self.decrement_handoff(class);
+                    drop(handoff);
                     self.abandon();
                     break;
                 };
                 let rejected_job = Arc::clone(&job);
-                let offered = lease.pool().try_spawn_owned(move || job.run());
+                let offered = lease.pool().try_spawn_owned(move || handoff.run(job));
                 if let Err(wrapper) = offered {
                     // Checked handoff returned the intact wrapper after stop.
                     drop(wrapper);
-                    self.decrement_handoff(class);
                     self.abandon();
                     drop(rejected_job);
                     break;

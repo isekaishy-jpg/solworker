@@ -3,7 +3,7 @@
 //! This helper accounts promised capacity. Native owned-job limits still apply
 //! to every submission; a reservation does not itself enqueue work.
 
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 /// Simultaneously live scheduler metadata, promised deliveries, and payload bytes.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -178,6 +178,7 @@ struct Ledger {
     runtime_identity: u64,
     limits: SWLimits,
     usage: Mutex<Usage>,
+    wake: OnceLock<Arc<crate::progress::SWWake>>,
 }
 
 /// Shared optional admission domain. Runtime owns this manager; callers receive
@@ -194,8 +195,13 @@ impl SWReservationPool {
                 runtime_identity,
                 limits,
                 usage: Mutex::new(Usage::default()),
+                wake: OnceLock::new(),
             }),
         }
+    }
+
+    pub(crate) fn set_wake(&self, wake: Arc<crate::progress::SWWake>) {
+        let _ = self.ledger.wake.set(wake);
     }
 
     pub(crate) fn close(&self) {
@@ -204,6 +210,7 @@ impl SWReservationPool {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .closed = true;
+        self.ledger.notify();
     }
 
     pub(crate) fn required_delivery_capacity(&self) -> usize {
@@ -264,6 +271,11 @@ pub struct SWCapacityUsage {
 }
 
 impl Ledger {
+    fn notify(&self) {
+        if let Some(wake) = self.wake.get() {
+            wake.notify();
+        }
+    }
     fn claim(
         &self,
         cost: SWCost,
@@ -328,6 +340,8 @@ impl Ledger {
         if new_pipeline && kind == Kind::Required {
             usage.pipelines += 1;
         }
+        drop(usage);
+        self.notify();
         Ok(())
     }
 
@@ -341,6 +355,8 @@ impl Ledger {
         if pipeline && kind == Kind::Required {
             usage.pipelines -= 1;
         }
+        drop(usage);
+        self.notify();
     }
 }
 
@@ -407,6 +423,7 @@ impl Drop for SWReservation {
         if let Some(parent) = &self.credits.parent {
             parent.refund(balance);
         }
+        self.pipeline.ledger.notify();
     }
 }
 
@@ -534,6 +551,7 @@ impl Drop for SWByteLease {
                 .unwrap_or_else(|e| e.into_inner())
                 .add(cost);
             self.credits.refund(cost);
+            self.ledger.notify();
         } else {
             self.ledger.release(cost, self.kind, false);
         }

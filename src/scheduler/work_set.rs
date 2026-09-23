@@ -60,6 +60,14 @@ pub(crate) struct WorkSetInner {
     permit_capacity: NonZeroUsize,
     state: Mutex<State>,
     changed: Condvar,
+    wake: Arc<crate::progress::SWWake>,
+}
+
+impl Drop for WorkSetInner {
+    fn drop(&mut self) {
+        // Dropping the last empty, open set also removes a shutdown blocker.
+        self.wake.notify();
+    }
 }
 
 impl WorkSetInner {
@@ -108,6 +116,8 @@ impl WorkSetInner {
             .expect("work set count exhausted");
         let id = state.next_id;
         state.next_id = id.checked_add(1).expect("work set identity exhausted");
+        drop(state);
+        self.wake.notify();
         Ok(WorkSetLease(Arc::new(LeaseInner {
             inner: Arc::clone(self),
             id,
@@ -122,6 +132,7 @@ impl WorkSetInner {
             self.changed.notify_all();
             std::mem::take(&mut state.cancel_hooks)
         };
+        self.wake.notify();
         for (_, hook) in hooks {
             hook();
         }
@@ -131,6 +142,8 @@ impl WorkSetInner {
         let mut state = self.lock();
         state.open = false;
         self.changed.notify_all();
+        drop(state);
+        self.wake.notify();
     }
 }
 
@@ -160,6 +173,7 @@ impl SWWorkSet {
                     cancel_hooks: HashMap::new(),
                 }),
                 changed: Condvar::new(),
+                wake: control.wake(),
             }),
         }
     }
@@ -180,6 +194,8 @@ impl SWWorkSet {
             return Err(SWDiscoveryError::Full);
         }
         state.permits += 1;
+        drop(state);
+        self.inner.wake.notify();
         Ok(SWDiscoveryPermit {
             inner: Arc::clone(&self.inner),
         })
@@ -255,6 +271,8 @@ impl SWDiscoveryPermit {
             return Err(SWDiscoveryError::Full);
         }
         state.permits += 1;
+        drop(state);
+        self.inner.wake.notify();
         Ok(Self {
             inner: Arc::clone(&self.inner),
         })
@@ -277,6 +295,8 @@ impl Drop for SWDiscoveryPermit {
         let mut state = self.inner.lock();
         state.permits -= 1;
         self.inner.changed.notify_all();
+        drop(state);
+        self.inner.wake.notify();
     }
 }
 
@@ -334,5 +354,6 @@ impl Drop for LeaseInner {
             hook
         };
         drop(hook);
+        self.inner.wake.notify();
     }
 }

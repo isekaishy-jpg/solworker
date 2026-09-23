@@ -6,6 +6,8 @@
 //! Thread-bound owners publish results through explicit host phases.
 //! External providers fulfill logical outcomes separately from unsafe adapter
 //! acknowledgement of physical storage release.
+//! Explicit root closure lets hosts service accepted work before joining;
+//! passive progress snapshots and deadline-based wakes report remaining work.
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
@@ -35,6 +37,10 @@ pub use owner::{
     SWPumpBudget, SWPumpMode, SWPumpReport, SWReadyAccess,
 };
 pub use platform::SWWorkerSetupError;
+pub use progress::{
+    SWOwnerProgress, SWProgress, SWProgressWait, SWProgressWaitError, SWSchedulerProgress,
+    SWWorkSetsProgress,
+};
 pub use runtime::config::{
     SWConfigError, SWExecutionClass, SWRuntimeConfig, SWThreadPriority, SWWorkerConfig,
 };

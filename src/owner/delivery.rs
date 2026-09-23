@@ -6,11 +6,12 @@
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
 
 use crate::owner::SWOwnerError;
+use crate::progress::{SWOwnerProgress, SWWake};
 use crate::scheduler::reservation::SWReservationPool;
 use crate::scheduler::{SWCost, SWReservation, SWReservationError};
 use crate::task::{SWCompletion, Subscription};
@@ -112,6 +113,10 @@ impl Record {
         if state.status == SWDeliveryStatus::Waiting && !state.cancelled {
             state.status = SWDeliveryStatus::Ready;
             self.notify(&mut state);
+            drop(state);
+            if let Some(transport) = self.transport.upgrade() {
+                transport.notify_progress();
+            }
         }
     }
 
@@ -131,6 +136,9 @@ impl Record {
         let subscription = state.subscription.take();
         drop(state);
         drop(subscription);
+        if let Some(transport) = self.transport.upgrade() {
+            transport.notify_progress();
+        }
         result
     }
 
@@ -168,6 +176,7 @@ pub(super) struct Transport {
     sender: Sender<NotificationMessage>,
     receiver: Receiver<NotificationMessage>,
     state: Mutex<TransportState>,
+    wake: OnceLock<Arc<SWWake>>,
 }
 
 impl Transport {
@@ -204,7 +213,44 @@ impl Transport {
                 ordinary_records: 0,
                 protected_records: 0,
             }),
+            wake: OnceLock::new(),
         })
+    }
+
+    pub(super) fn install_wake(&self, wake: Arc<SWWake>) {
+        assert!(self.wake.set(wake).is_ok(), "owner wake installed once");
+    }
+
+    fn notify_progress(&self) {
+        if let Some(wake) = self.wake.get() {
+            wake.notify();
+        }
+    }
+
+    /// Snapshot transferable records only. No local callback or capture is
+    /// inspected, and the transport lock always precedes each record lock.
+    pub(super) fn progress(&self) -> SWOwnerProgress {
+        let state = self.state.lock().unwrap();
+        let mut progress = SWOwnerProgress {
+            routes: 1,
+            ..SWOwnerProgress::default()
+        };
+        for record in state.records.values() {
+            let record_state = record.state.lock().unwrap();
+            if state.closed || record_state.cancelled {
+                progress.cleanup += 1;
+            } else {
+                match record_state.status {
+                    SWDeliveryStatus::Waiting => progress.waiting += 1,
+                    SWDeliveryStatus::Ready => progress.ready += 1,
+                    SWDeliveryStatus::Claimed => progress.claimed += 1,
+                    SWDeliveryStatus::Published
+                    | SWDeliveryStatus::Suppressed
+                    | SWDeliveryStatus::Panicked => progress.cleanup += 1,
+                }
+            }
+        }
+        progress
     }
 
     pub(super) fn reserve(self: &Arc<Self>) -> Option<Reservation> {
@@ -284,6 +330,8 @@ impl Transport {
             EndpointKind::Ordinary => state.ordinary_records += 1,
             EndpointKind::Protected => state.protected_records += 1,
         }
+        drop(state);
+        self.notify_progress();
         Some(Reservation {
             notifier: Notifier {
                 inner: Arc::new(NotifierInner {
@@ -322,6 +370,7 @@ impl Transport {
         for record in records {
             record.cancel();
         }
+        self.notify_progress();
     }
 
     pub(super) fn suppress_all(&self) {
@@ -529,6 +578,11 @@ impl Notification {
             "each notification is claimed once"
         );
         state.status = SWDeliveryStatus::Claimed;
+        drop(state);
+        drop(transport_state);
+        if let Some(transport) = transport {
+            transport.notify_progress();
+        }
         if run {
             ClaimResult::Run
         } else {
@@ -562,6 +616,8 @@ impl Notification {
                     EndpointKind::Protected => state.protected_records -= 1,
                 }
             }
+            drop(state);
+            transport.notify_progress();
         }
     }
 }

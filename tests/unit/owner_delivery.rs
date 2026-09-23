@@ -59,6 +59,8 @@ fn ready_ticket_notifies_once_and_settles_after_claim() {
 #[test]
 fn cancel_and_close_retain_owner_cleanup_entitlements() {
     let transport = Transport::new(NonZeroUsize::new(2).unwrap(), 7);
+    let wake = crate::progress::SWWake::new();
+    transport.install_wake(Arc::clone(&wake));
     let first = transport.reserve().unwrap();
     let second = transport.reserve().unwrap();
     let first_id = first.id();
@@ -77,7 +79,9 @@ fn cancel_and_close_retain_owner_cleanup_entitlements() {
     let mut ids = Vec::new();
     while let Some(notification) = transport.try_recv() {
         ids.push(notification.id());
+        let before_claim = wake.generation();
         assert_eq!(notification.claim(), ClaimResult::Suppress);
+        assert!(wake.generation() > before_claim);
         notification.settle(SWDeliveryStatus::Suppressed);
     }
     ids.sort_unstable();

@@ -203,6 +203,7 @@ impl PhysicalRetention {
     }
     pub(crate) fn mark_orphaned(&self) {
         self.registry.orphan(self.id);
+        self.control.notify_progress();
     }
 }
 
@@ -211,5 +212,6 @@ impl Drop for PhysicalRetention {
         drop(self.capacity.take());
         drop(self.work_set.take());
         self.registry.remove(self.id);
+        self.control.notify_progress();
     }
 }

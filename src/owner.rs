@@ -14,7 +14,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
-use crate::runtime::{OwnerCallbackGuard, OwnerRegistration, RuntimeControl};
+use crate::progress::SWWake;
+use crate::runtime::{
+    OwnerCallbackGuard, OwnerRegistration, OwnerRootAdmission, RuntimeControl, SWRuntimeState,
+};
 use crate::scheduler::SWReservation;
 use crate::scheduler::work_set::{SWDiscoveryPermit, SWWorkSet, WorkSetLease};
 use crate::{SWCompletion, SWExecutionError, SWOutcome, SWShared, SWTaskStatus};
@@ -83,6 +86,7 @@ pub struct SWPreparedDelivery {
 #[derive(Clone)]
 pub struct SWOwnerControl {
     close_requested: Arc<AtomicBool>,
+    wake: Arc<SWWake>,
 }
 
 impl SWOwnerControl {
@@ -91,6 +95,7 @@ impl SWOwnerControl {
     /// the owner observes the request; no unclaimed callback then publishes.
     pub fn request_close(&self) {
         self.close_requested.store(true, Ordering::Release);
+        self.wake.notify();
     }
 }
 
@@ -98,6 +103,7 @@ impl SWOwnerControl {
 /// `Rc` marker prevents moving this value to another thread even when `O: Send`.
 pub struct SWOwner<O> {
     state: O,
+    control: Arc<RuntimeControl>,
     transport: Arc<Transport>,
     inbox: Arc<Inbox<O>>,
     registration: Option<OwnerRegistration>,
@@ -122,16 +128,22 @@ impl<O> SWOwner<O> {
             .ok()
             .and_then(|scheduler| scheduler.capacity.clone());
         let transport = Transport::new_with_capacity(capacity, control.identity(), pool);
+        transport.install_wake(control.wake());
         let for_close = Arc::clone(&transport);
+        let for_progress = Arc::clone(&transport);
         let registration = control
-            .register_owner(Arc::new(move || for_close.close()))
+            .register_owner(
+                Arc::new(move || for_close.close()),
+                Arc::new(move || for_progress.progress()),
+            )
             .map_err(|error| match error {
                 SWExecutionError::Closed => SWOwnerError::Closed,
                 _ => SWOwnerError::InvalidContext,
             })?;
-        let inbox = Inbox::new(Arc::clone(&transport));
+        let inbox = Inbox::new(Arc::clone(&transport), Arc::clone(&control));
         Ok(Self {
             state,
+            control,
             transport,
             inbox,
             registration: Some(registration),
@@ -163,6 +175,7 @@ impl<O> SWOwner<O> {
     pub fn control(&self) -> SWOwnerControl {
         SWOwnerControl {
             close_requested: Arc::clone(&self.close_requested),
+            wake: self.control.wake(),
         }
     }
 
@@ -194,7 +207,10 @@ impl<O> SWOwner<O> {
         Ok(())
     }
 
-    fn accept(&self) -> Result<(), SWOwnerError> {
+    fn accept(
+        &self,
+        accounted_descendant: bool,
+    ) -> Result<Option<OwnerRootAdmission>, SWOwnerError> {
         if self.closed || self.transport.is_closed() || self.close_requested.load(Ordering::Acquire)
         {
             Err(SWOwnerError::Closed)
@@ -202,8 +218,16 @@ impl<O> SWOwner<O> {
             Err(SWOwnerError::Faulted)
         } else if self.active {
             Err(SWOwnerError::InvalidContext)
+        } else if accounted_descendant {
+            match self.control.phase() {
+                SWRuntimeState::Running | SWRuntimeState::Closing => Ok(None),
+                SWRuntimeState::Stopped | SWRuntimeState::Abandoned => Err(SWOwnerError::Closed),
+            }
         } else {
-            Ok(())
+            self.control
+                .admit_owner_root()
+                .map(Some)
+                .map_err(|_| SWOwnerError::Closed)
         }
     }
 
@@ -236,9 +260,10 @@ impl<O> SWOwner<O> {
     where
         F: FnOnce(&mut O) + 'static,
     {
-        if let Err(reason) = self.accept() {
-            return Err(SWOwnerRejected { reason, callback });
-        }
+        let _admission = match self.accept(work_set.is_some()) {
+            Ok(admission) => admission,
+            Err(reason) => return Err(SWOwnerRejected { reason, callback }),
+        };
         let reservation = if let Some(capacity) = capacity {
             match self.transport.reserve_reserved(capacity) {
                 Ok(reservation) => reservation,
@@ -549,9 +574,10 @@ impl<O> SWOwner<O> {
     where
         F: FnOnce(&mut O, SWTaskStatus) + 'static,
     {
-        if let Err(reason) = self.accept() {
-            return Err(SWOwnerRejected { reason, callback });
-        }
+        let _admission = match self.accept(work_set.is_some()) {
+            Ok(admission) => admission,
+            Err(reason) => return Err(SWOwnerRejected { reason, callback }),
+        };
         let reservation = if let Some(capacity) = capacity {
             match self.transport.reserve_reserved(capacity) {
                 Ok(reservation) => reservation,
@@ -620,9 +646,12 @@ impl<O> SWOwner<O> {
         T: Send + Sync + 'static,
         F: FnOnce(&mut O, Arc<SWOutcome<T>>) -> R,
     {
-        if let Err(reason) = self.accept() {
-            return SWReadyAccess::Rejected(SWOwnerRejected { reason, callback });
-        }
+        let _admission = match self.accept(false) {
+            Ok(admission) => admission,
+            Err(reason) => {
+                return SWReadyAccess::Rejected(SWOwnerRejected { reason, callback });
+            }
+        };
         if self.phase != Some(phase) {
             return SWReadyAccess::Rejected(SWOwnerRejected {
                 reason: SWOwnerError::WrongPhase,

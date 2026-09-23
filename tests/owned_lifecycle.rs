@@ -171,6 +171,10 @@ fn abandonment_settles_unclaimed_work_without_waiting_for_running_work() {
     let (set_queued, _) = set
         .try_spawn(&low, SWSpawnOptions::default(), || 21usize)
         .unwrap();
+    let before = runtime.progress();
+    assert_eq!(before.scheduler.running, 1);
+    assert_eq!(before.scheduler.handed, 2);
+    assert_eq!(before.scheduler.handoff_wrappers, [3, 0, 0]);
     runtime.abandon();
     let queued_status = queued.completion().wait_timeout(TIMEOUT).unwrap();
     let dropped_before_release = dropped.load(Ordering::SeqCst);
@@ -187,6 +191,18 @@ fn abandonment_settles_unclaimed_work_without_waiting_for_running_work() {
         running.completion().wait_timeout(TIMEOUT).unwrap(),
         Some(SWTaskStatus::Succeeded)
     );
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        let progress = runtime.progress();
+        if progress.scheduler.handoff_wrappers == [0; 3] && progress.active_leases == 0 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "discarded wrappers did not retire: {progress:?}"
+        );
+        progress.wait_for_change(deadline).unwrap();
+    }
     drop(runtime);
     let rejected = low
         .try_spawn(SWSpawnOptions::default(), || 23usize)

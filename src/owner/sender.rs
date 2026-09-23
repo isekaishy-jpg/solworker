@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 
 use super::delivery::{SWDelivery, SWDeliveryControl, Transport};
 use super::{SWOwnerError, SWOwnerRejected, SWPhase};
+use crate::runtime::RuntimeControl;
 
 pub(super) type SendCallback<O> = Box<dyn FnOnce(&mut O) + Send + 'static>;
 
@@ -20,13 +21,15 @@ struct InboxState<O> {
 /// Transferable callback staging; only the owner may take a callback out.
 pub(super) struct Inbox<O> {
     transport: Arc<Transport>,
+    control: Arc<RuntimeControl>,
     state: Mutex<InboxState<O>>,
 }
 
 impl<O> Inbox<O> {
-    pub(super) fn new(transport: Arc<Transport>) -> Arc<Self> {
+    pub(super) fn new(transport: Arc<Transport>, control: Arc<RuntimeControl>) -> Arc<Self> {
         Arc::new(Self {
             transport,
+            control,
             state: Mutex::new(InboxState {
                 closed: false,
                 faulted: false,
@@ -100,6 +103,15 @@ impl<O> SWOwnerSender<O> {
     where
         F: FnOnce(&mut O) + Send + 'static,
     {
+        let _admission = match self.inbox.control.admit_owner_root() {
+            Ok(admission) => admission,
+            Err(_) => {
+                return Err(SWOwnerRejected {
+                    reason: SWOwnerError::Closed,
+                    callback,
+                });
+            }
+        };
         let mut state = self.inbox.state.lock().unwrap();
         if state.closed || self.inbox.transport.is_closed() {
             return Err(SWOwnerRejected {
