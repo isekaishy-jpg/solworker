@@ -178,6 +178,7 @@ impl Drop for BackendOwner {
 struct ControlState {
     phase: SWRuntimeState,
     active: usize,
+    external: usize,
     backend: Weak<BackendOwner>,
     owner_closers: HashMap<u64, Weak<dyn Fn() + Send + Sync>>,
     next_owner: u64,
@@ -190,10 +191,14 @@ pub(crate) struct RuntimeControl {
     state: Mutex<ControlState>,
     changed: Condvar,
     owned: OnceLock<Weak<OwnedScheduler>>,
+    physical: Arc<crate::external::PhysicalRegistry>,
 }
 
 impl RuntimeControl {
-    pub(super) fn new(backend: &Arc<BackendOwner>) -> Self {
+    pub(super) fn new(
+        backend: &Arc<BackendOwner>,
+        physical: Arc<crate::external::PhysicalRegistry>,
+    ) -> Self {
         static NEXT_ID: AtomicU64 = AtomicU64::new(1);
         // IDs have no publication role; the mutex publishes runtime state.
         let id = NEXT_ID
@@ -204,6 +209,7 @@ impl RuntimeControl {
             state: Mutex::new(ControlState {
                 phase: SWRuntimeState::Running,
                 active: 0,
+                external: 0,
                 backend: Arc::downgrade(backend),
                 owner_closers: HashMap::new(),
                 next_owner: 1,
@@ -211,6 +217,7 @@ impl RuntimeControl {
             }),
             changed: Condvar::new(),
             owned: OnceLock::new(),
+            physical,
         }
     }
 
@@ -220,6 +227,53 @@ impl RuntimeControl {
 
     pub(crate) fn identity(&self) -> u64 {
         self.id
+    }
+
+    pub(crate) fn admit_external(self: &Arc<Self>) -> Result<ExternalAdmission, SWExecutionError> {
+        let mut state = self.lock();
+        if state.phase != SWRuntimeState::Running {
+            return Err(SWExecutionError::Closed);
+        }
+        state.external = state
+            .external
+            .checked_add(1)
+            .expect("external count exhausted");
+        Ok(ExternalAdmission {
+            control: Arc::clone(self),
+        })
+    }
+
+    pub(crate) fn reserve_physical(&self, required: bool) -> Result<u64, SWSpawnError> {
+        let state = self.lock();
+        if state.phase != SWRuntimeState::Running {
+            return Err(SWSpawnError::Closed);
+        }
+        self.physical.reserve(required)
+    }
+
+    pub(crate) fn activate_physical(
+        &self,
+        registry: &crate::external::PhysicalRegistry,
+        id: u64,
+        work_set: Option<&crate::scheduler::work_set::WorkSetLease>,
+    ) -> Result<(), SWSpawnError> {
+        let state = self.lock();
+        if state.phase != SWRuntimeState::Running {
+            return Err(SWSpawnError::Closed);
+        }
+        if let Some(work_set) = work_set {
+            work_set.activate_physical(registry, id)
+        } else {
+            registry.activate(id);
+            Ok(())
+        }
+    }
+
+    pub(crate) fn external_progress(&self) -> crate::external::SWExternalProgress {
+        let state = self.lock();
+        let mut progress = self.physical.progress();
+        progress.logical = state.external;
+        progress
     }
 
     pub(crate) fn work_set(
@@ -383,6 +437,9 @@ impl RuntimeControl {
         if !state.owner_closers.is_empty() {
             return Err(SWShutdownError::LiveOwners);
         }
+        if state.external != 0 || !self.physical.is_empty() {
+            return Err(SWShutdownError::LiveExternal);
+        }
         if state
             .work_sets
             .iter()
@@ -455,6 +512,18 @@ impl Drop for ExecutionLease {
 
 pub(crate) struct OwnedAdmission {
     control: Arc<RuntimeControl>,
+}
+
+pub(crate) struct ExternalAdmission {
+    control: Arc<RuntimeControl>,
+}
+
+impl Drop for ExternalAdmission {
+    fn drop(&mut self) {
+        let mut state = self.control.lock();
+        state.external -= 1;
+        self.control.changed.notify_all();
+    }
 }
 
 impl Drop for OwnedAdmission {

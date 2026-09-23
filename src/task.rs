@@ -20,6 +20,8 @@ pub use dependency::{SWThenRejected, SWThenResult};
 /// Explicit producer cancellation authority. Observing or dropping a task is
 /// never a cancellation request. Cancellation suppresses work not yet claimed;
 /// it does not forcibly stop an invocation already running.
+/// For external producers it competes for the logical outcome only; provider
+/// access and physical release remain independent responsibilities.
 #[derive(Clone)]
 pub struct SWProducerControl {
     cancel: Arc<dyn Fn() + Send + Sync + 'static>,

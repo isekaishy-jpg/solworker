@@ -169,7 +169,11 @@ impl Drop for SWDemand {
 /// Versioned aggregate sent to a provider after the scheduler lock is released.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SWDemandSnapshot {
-    pub priority: SWPriority,
+    /// Aggregate rank, or `None` when no baseline or consumer interest remains.
+    /// Absence of demand does not cancel the producer or end physical access.
+    pub priority: Option<SWPriority>,
+    /// Whether the aggregate includes active demand. Deferred interest retains
+    /// a priority with `active: false`; no interest has neither.
     pub active: bool,
     pub version: u64,
 }
@@ -292,10 +296,8 @@ impl DemandState {
         Ok(())
     }
 
-    pub(crate) fn remove(&mut self, id: u64) {
-        let Some(node) = self.nodes.remove(&id) else {
-            return;
-        };
+    pub(crate) fn remove(&mut self, id: u64) -> Option<ProviderHook> {
+        let node = self.nodes.remove(&id)?;
         self.dirty.retain(|queued| *queued != id);
         for lease in node.leases {
             self.leases.remove(&lease);
@@ -311,6 +313,7 @@ impl DemandState {
                 node.parents.retain(|parent| *parent != id);
             }
         }
+        node.provider
     }
 
     pub(crate) fn attach(&mut self, id: u64, priority: SWPriority) -> Result<u64, SWDemandError> {
@@ -437,17 +440,15 @@ impl DemandState {
                 node.published = true;
                 node.published_tie = selection.tie;
             }
-            let provider = provider.and_then(|hook| {
-                priority.map(|priority| {
-                    (
-                        hook,
-                        SWDemandSnapshot {
-                            priority,
-                            active,
-                            version,
-                        },
-                    )
-                })
+            let provider = provider.map(|hook| {
+                (
+                    hook,
+                    SWDemandSnapshot {
+                        priority,
+                        active,
+                        version,
+                    },
+                )
             });
             changed.push(DemandChange {
                 id,

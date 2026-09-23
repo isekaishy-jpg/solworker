@@ -4,6 +4,8 @@
 //! chunks, and worker/owner overlap with fallible startup and explicit shutdown.
 //! Owned jobs support bounded admission, dependencies and retained groups.
 //! Thread-bound owners publish results through explicit host phases.
+//! External providers fulfill logical outcomes separately from unsafe adapter
+//! acknowledgement of physical storage release.
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
@@ -21,6 +23,11 @@ pub use execution::{
     SWBatchRejected, SWBranchOutcome, SWDeliveryOptions, SWDeliverySpawnRejected,
     SWDeliverySpawnResult, SWExecutionError, SWGroup, SWJoinRejected, SWLane, SWPanic,
     SWStageOptions, SWStageRejected, SWStageResult, SWWorkOptions,
+};
+pub use external::{
+    SWExternalAccess, SWExternalAccessOptions, SWExternalAccessRejected,
+    SWExternalActivationRejected, SWExternalOptions, SWExternalPrepared, SWExternalProgress,
+    SWExternalRejected, SWExternalResult, SWProducer,
 };
 pub use owner::{
     SWCancelResult, SWDelivery, SWDeliveryControl, SWDeliveryStatus, SWDeliveryTicket, SWOwner,

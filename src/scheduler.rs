@@ -19,8 +19,11 @@ use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use crate::execution::ContextGuard;
 use crate::execution::context;
 use crate::execution::group::{GroupInner, SWGroup};
+use crate::external::producer::{
+    ExternalCore, SWExternalOptions, SWExternalRejected, SWExternalResult, SWProducer,
+};
 use crate::runtime::config::SWExecutionClass;
-use crate::runtime::{OwnedAdmission, RuntimeControl};
+use crate::runtime::{ExternalAdmission, OwnedAdmission, RuntimeControl};
 use crate::task::{
     CompletionSink, SWCompletion, SWOutcome, SWProducerControl, SWTask, SWTaskStatus, Subscription,
 };
@@ -163,6 +166,14 @@ struct Record {
     resource: bool,
 }
 
+struct ExternalRecord {
+    settling: bool,
+    settle: Arc<dyn Fn(SWTaskStatus) + Send + Sync>,
+    admission: ExternalAdmission,
+    work_set: Option<WorkSetLease>,
+    capacity: Option<SWReservation>,
+}
+
 pub(crate) struct SubmitRequest<'a> {
     pub(crate) control: &'a Arc<RuntimeControl>,
     pub(crate) class: SWExecutionClass,
@@ -175,6 +186,7 @@ pub(crate) struct SubmitRequest<'a> {
 
 struct State {
     records: HashMap<u64, Record>,
+    external: HashMap<u64, ExternalRecord>,
     next_id: u64,
     next_group: u64,
     edges: usize,
@@ -193,6 +205,236 @@ pub(crate) struct OwnedScheduler {
 }
 
 impl OwnedScheduler {
+    pub(crate) fn admit_external<'a, T: Send + 'static>(
+        self: &Arc<Self>,
+        control: &Arc<RuntimeControl>,
+        mut options: SWExternalOptions<'a>,
+    ) -> SWExternalResult<'a, T> {
+        macro_rules! reject {
+            ($reason:expr) => {
+                return Err(SWExternalRejected {
+                    reason: $reason,
+                    options,
+                })
+            };
+        }
+        let admission = match control.admit_external() {
+            Ok(admission) => admission,
+            Err(crate::execution::SWExecutionError::Closed) => reject!(SWSpawnError::Closed),
+            Err(crate::execution::SWExecutionError::InvalidContext) => {
+                reject!(SWSpawnError::InvalidContext)
+            }
+        };
+        if options.work_set.is_some() && options.discovery.is_some() {
+            reject!(SWSpawnError::InvalidContext);
+        }
+        let work_set = match (options.work_set, options.discovery) {
+            (Some(set), _) => Some(set.try_root_lease(control.identity())),
+            (_, Some(permit)) => Some(permit.try_child_lease(control.identity())),
+            _ => None,
+        }
+        .transpose();
+        let work_set = match work_set {
+            Ok(lease) => lease,
+            Err(SWDiscoveryError::Full) => reject!(SWSpawnError::Full),
+            Err(_) => reject!(SWSpawnError::Closed),
+        };
+        let unaccounted_delivery = options
+            .delivery
+            .as_ref()
+            .is_some_and(|ticket| !ticket.is_accounted());
+        let cost = SWCost::new(
+            options.cost.records.max(1),
+            options.cost.edges,
+            options
+                .cost
+                .deliveries
+                .max(usize::from(options.delivery.is_some()))
+                - usize::from(
+                    options
+                        .delivery
+                        .as_ref()
+                        .is_some_and(|ticket| ticket.is_accounted()),
+                ),
+            options.cost.bytes,
+        );
+        if options.retained_bytes > cost.bytes {
+            reject!(SWSpawnError::TooLarge);
+        }
+        let capacity = if let Some(reservation) = options.reservation {
+            if reservation.runtime_identity() != control.identity() {
+                reject!(SWSpawnError::InvalidReservation);
+            }
+            match reservation.stage(cost) {
+                Ok(charge) => Some(charge),
+                Err(error) => reject!(map_reservation_error(error)),
+            }
+        } else if let Some(pool) = &self.capacity {
+            match pool.try_reserve_ordinary(cost) {
+                Ok(charge) => Some(charge),
+                Err(error) => reject!(map_reservation_error(error)),
+            }
+        } else {
+            if cost.bytes != 0 {
+                reject!(SWSpawnError::Disabled);
+            }
+            None
+        };
+        let bytes = if options.retained_bytes != 0 {
+            match capacity
+                .as_ref()
+                .expect("retained bytes require capacity")
+                .retain_bytes(options.retained_bytes)
+            {
+                Ok(bytes) => Some(bytes),
+                Err(error) => reject!(map_reservation_error(error)),
+            }
+        } else {
+            None
+        };
+        let mut state = self.lock();
+        if state.abandoned {
+            reject!(SWSpawnError::Closed);
+        }
+        if options
+            .priority
+            .is_some_and(|rank| !state.demand.contains(rank))
+            || (options.provider_demand.is_some() && !state.demand.enabled())
+        {
+            reject!(SWSpawnError::InvalidPriority);
+        }
+        if state.records.len() + state.external.len() >= self.limits.records {
+            reject!(SWSpawnError::Full);
+        }
+        let delivery_capacity = if unaccounted_delivery {
+            capacity.as_ref().map(|capacity| {
+                capacity
+                    .stage(SWCost::new(0, 0, 1, 0))
+                    .expect("external stage reserved promised delivery")
+            })
+        } else {
+            None
+        };
+        if let Some(ticket) = options.delivery.as_mut() {
+            let rejection = if ticket.runtime_identity() != control.identity() {
+                Some(SWSpawnError::InvalidDelivery)
+            } else {
+                ticket.try_commit().err().map(|error| match error {
+                    crate::owner::TicketCommitError::Closed => SWSpawnError::Closed,
+                    crate::owner::TicketCommitError::AlreadyCommitted => {
+                        SWSpawnError::InvalidDelivery
+                    }
+                })
+            };
+            if let Some(reason) = rejection {
+                reject!(reason);
+            }
+        }
+        let id = state.next_id;
+        state.next_id = id.checked_add(1).expect("owned record identity exhausted");
+        let (task, sink) = SWTask::pending_pair();
+        task.set_producer(control.identity(), id, Arc::downgrade(self));
+        let core = Arc::new(ExternalCore::new(sink, bytes));
+        if state.demand.enabled() {
+            state
+                .demand
+                .register(id, options.priority, &[], options.provider_demand.take())
+                .expect("external rank validated before commitment");
+        }
+        let bound_ticket = options.delivery.take().inspect(|ticket| {
+            if let Some(charge) = delivery_capacity {
+                ticket.attach_capacity(charge);
+            }
+        });
+        let set_registration = work_set.clone();
+        let finalizer_core = Arc::clone(&core);
+        state.external.insert(
+            id,
+            ExternalRecord {
+                settling: false,
+                settle: Arc::new(move |status| finalizer_core.publish_status(status)),
+                admission,
+                work_set,
+                capacity,
+            },
+        );
+        drop(state);
+        if let Some(ticket) = bound_ticket {
+            ticket.bind(task.completion());
+        }
+        let weak = Arc::downgrade(self);
+        let producer_control = SWProducerControl::new(Box::new(move || {
+            if let Some(scheduler) = weak.upgrade() {
+                scheduler.settle_external(id, SWTaskStatus::Cancelled);
+            }
+        }));
+        if let Some(registration) = set_registration {
+            registration.register_producer(producer_control.clone());
+        }
+        let producer = SWProducer {
+            scheduler: Arc::downgrade(self),
+            id,
+            core,
+        };
+        self.service_demand(32);
+        Ok((producer, task, producer_control))
+    }
+
+    pub(crate) fn claim_external(&self, id: u64, abandonment: bool) -> bool {
+        let mut state = self.lock();
+        if state.abandoned && !abandonment {
+            return false;
+        }
+        let Some(record) = state.external.get_mut(&id) else {
+            return false;
+        };
+        if record.settling {
+            return false;
+        }
+        record.settling = true;
+        true
+    }
+
+    pub(crate) fn finish_external(&self, id: u64, publish: impl FnOnce()) {
+        let publication = catch_unwind(AssertUnwindSafe(publish));
+        let (record, provider) = {
+            let mut state = self.lock();
+            let record = state.external.remove(&id);
+            let provider = state.demand.remove(id);
+            (record, provider)
+        };
+        drop(provider);
+        if let Some(record) = record {
+            let ExternalRecord {
+                admission,
+                work_set,
+                capacity,
+                settle,
+                ..
+            } = record;
+            drop((settle, capacity, work_set, admission));
+        }
+        if let Err(payload) = publication {
+            let _ = catch_unwind(AssertUnwindSafe(|| drop(payload)));
+        }
+    }
+
+    pub(crate) fn settle_external(&self, id: u64, status: SWTaskStatus) {
+        if !self.claim_external(id, status == SWTaskStatus::Abandoned) {
+            return;
+        }
+        let settle = {
+            let state = self.lock();
+            state
+                .external
+                .get(&id)
+                .map(|record| Arc::clone(&record.settle))
+        };
+        if let Some(settle) = settle {
+            self.finish_external(id, move || settle(status));
+        }
+    }
+
     fn push_ready(state: &mut State, class: SWExecutionClass, id: u64) {
         if state.records.get(&id).is_some_and(|record| record.resource) {
             let selection = state
@@ -327,7 +569,11 @@ impl OwnedScheduler {
             providers
         };
         for (provider, snapshot) in providers {
-            provider(snapshot);
+            // Provider demand is advisory. A panicking hook cannot unwind an
+            // admission or worker dispatch after the record was committed.
+            if let Err(payload) = catch_unwind(AssertUnwindSafe(|| provider(snapshot))) {
+                let _ = catch_unwind(AssertUnwindSafe(|| drop(payload)));
+            }
         }
     }
 
@@ -350,6 +596,7 @@ impl OwnedScheduler {
             capacity,
             state: Mutex::new(State {
                 records: HashMap::new(),
+                external: HashMap::new(),
                 next_id: 1,
                 next_group: 1,
                 edges: 0,
@@ -508,7 +755,7 @@ impl OwnedScheduler {
         if prerequisites.len() > self.limits.edges {
             return Err(reject(SWSpawnError::TooLarge, payload));
         }
-        if state.records.len() >= self.limits.records
+        if state.records.len() + state.external.len() >= self.limits.records
             || state
                 .edges
                 .checked_add(prerequisites.len())
@@ -976,15 +1223,16 @@ impl OwnedScheduler {
     }
 
     fn finalize_record(self: &Arc<Self>, id: u64) {
-        let record = {
+        let (record, provider) = {
             let mut state = self.lock();
             let Some(record) = state.records.remove(&id) else {
                 return;
             };
             state.edges -= record.edges;
-            state.demand.remove(id);
-            record
+            let provider = state.demand.remove(id);
+            (record, provider)
         };
+        drop(provider);
         // Strong settlement follows capacity return, not just result readiness.
         drop(record.capacity);
         if let Some(group) = record.group {
@@ -1015,18 +1263,23 @@ impl OwnedScheduler {
     }
 
     pub(crate) fn abandon(self: &Arc<Self>) {
-        let ids = {
+        let (ids, external) = {
             let mut state = self.lock();
             state.abandoned = true;
-            state
+            let ids = state
                 .records
                 .iter()
                 .filter(|(_, record)| record.stage != Stage::Running)
                 .map(|(id, _)| *id)
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            let external = state.external.keys().copied().collect::<Vec<_>>();
+            (ids, external)
         };
         for id in ids {
             self.suppress(id, SWTaskStatus::Abandoned);
+        }
+        for id in external {
+            self.settle_external(id, SWTaskStatus::Abandoned);
         }
     }
 
@@ -1084,7 +1337,7 @@ impl OwnedScheduler {
     }
 }
 
-fn map_reservation_error(error: SWReservationError) -> SWSpawnError {
+pub(crate) fn map_reservation_error(error: SWReservationError) -> SWSpawnError {
     match error {
         SWReservationError::Full | SWReservationError::InsufficientCredits => SWSpawnError::Full,
         SWReservationError::TooLarge => SWSpawnError::TooLarge,

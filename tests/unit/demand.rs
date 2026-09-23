@@ -35,7 +35,9 @@ fn propagation_is_budgeted_and_detaches_settled_prerequisites() {
     let urgent = SWPriority::new(0);
     let normal = SWPriority::new(5);
     let mut state = DemandState::new(vec![urgent, normal], 2);
-    state.register(1, None, &[], None).unwrap();
+    state
+        .register(1, None, &[], Some(Arc::new(|_| {})))
+        .unwrap();
     state.register(2, None, &[1], None).unwrap();
     state.register(3, Some(normal), &[2], None).unwrap();
     state.service(8);
@@ -46,8 +48,16 @@ fn propagation_is_budgeted_and_detaches_settled_prerequisites() {
     state.service(8);
     assert_eq!(state.selection(1).unwrap().priority, Some(urgent));
     state.remove(2);
-    state.service(8);
+    let changes = state.service(8);
     assert_eq!(state.selection(1).unwrap().priority, None);
+    let (_, snapshot) = changes
+        .into_iter()
+        .find(|change| change.id == 1)
+        .unwrap()
+        .provider
+        .unwrap();
+    assert_eq!(snapshot.priority, None);
+    assert!(!snapshot.active);
     state.change(lease, DemandCommand::Detach).unwrap();
 }
 
@@ -88,6 +98,6 @@ fn provider_snapshots_are_returned_without_invoking_the_hook() {
     let mut changes = state.service(1);
     assert_eq!(calls.load(Ordering::SeqCst), 0);
     let (_, snapshot) = changes.pop().unwrap().provider.unwrap();
-    assert_eq!(snapshot.priority, rank);
+    assert_eq!(snapshot.priority, Some(rank));
     assert!(snapshot.active);
 }

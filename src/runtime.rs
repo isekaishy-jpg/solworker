@@ -17,7 +17,7 @@ use crate::platform::{SWWorkerSetupError, apply_worker_priority};
 use crate::scheduler::{OwnedScheduler, SWOwnedLimits};
 use config::{SWExecutionClass, SWRuntimeConfig};
 use lifecycle::{BackendOwner, Startup, StartupGuard};
-pub(crate) use lifecycle::{OwnedAdmission, OwnerRegistration, RuntimeControl};
+pub(crate) use lifecycle::{ExternalAdmission, OwnedAdmission, OwnerRegistration, RuntimeControl};
 
 type WorkerSetup = dyn Fn(SWExecutionClass, usize) -> io::Result<()> + Send + Sync;
 
@@ -100,6 +100,7 @@ pub struct SWRuntimeBuilder {
     capacity_limits: Option<crate::scheduler::SWLimits>,
     demand_priorities: Vec<crate::scheduler::SWPriority>,
     demand_leases: usize,
+    external_capacity: Option<std::num::NonZeroUsize>,
 }
 
 impl SWRuntimeBuilder {
@@ -111,6 +112,7 @@ impl SWRuntimeBuilder {
             capacity_limits: None,
             demand_priorities: Vec::new(),
             demand_leases: 0,
+            external_capacity: None,
         }
     }
 
@@ -118,6 +120,15 @@ impl SWRuntimeBuilder {
     /// Without this option the runtime provides scoped execution only.
     pub fn with_owned_limits(mut self, limits: SWOwnedLimits) -> Self {
         self.owned_limits = Some(limits);
+        self
+    }
+
+    /// Enables physical provider-access registration. This bounds ordinary
+    /// accesses independently of CPU jobs. With capacity policy enabled,
+    /// required accesses use additional protected slots bounded by that policy's
+    /// required record allowance, as well as their reserved record credits.
+    pub fn with_external_capacity(mut self, capacity: std::num::NonZeroUsize) -> Self {
+        self.external_capacity = Some(capacity);
         self
     }
 
@@ -262,7 +273,12 @@ impl SWRuntimeBuilder {
             return Err(startup.take_error());
         }
         let backend = Arc::new(BackendOwner::new(guard.commit()));
-        let control = Arc::new(RuntimeControl::new(&backend));
+        let physical = crate::external::PhysicalRegistry::new(
+            self.external_capacity,
+            self.capacity_limits
+                .map_or(0, |limits| limits.required_allowance.records),
+        );
+        let control = Arc::new(RuntimeControl::new(&backend, Arc::clone(&physical)));
         let owned = self.owned_limits.map(|mut limits| {
             let capacity = self.capacity_limits.map(|policy| {
                 limits.records = limits
@@ -288,6 +304,7 @@ impl SWRuntimeBuilder {
             backend: Some(backend),
             control,
             owned,
+            physical,
         })
     }
 }
@@ -309,6 +326,7 @@ pub struct SWRuntime {
     backend: Option<Arc<BackendOwner>>,
     control: Arc<RuntimeControl>,
     owned: Option<Arc<OwnedScheduler>>,
+    physical: Arc<crate::external::PhysicalRegistry>,
 }
 
 /// Terminal shutdown cannot block from within a participating invocation.
@@ -319,6 +337,8 @@ pub enum SWShutdownError {
     LiveOwners,
     /// Seal or cancel work sets and finish discovery/local cleanup before joining.
     LiveWorkSets,
+    /// Finish logical producers and acknowledge physical release before joining.
+    LiveExternal,
 }
 
 impl fmt::Display for SWShutdownError {
@@ -327,6 +347,9 @@ impl fmt::Display for SWShutdownError {
             Self::ExecutionContext => f.write_str("shutdown cannot join from an execution context"),
             Self::LiveOwners => f.write_str("close and clean live owners before runtime shutdown"),
             Self::LiveWorkSets => f.write_str("seal and drain work sets before runtime shutdown"),
+            Self::LiveExternal => f.write_str(
+                "settle external outcomes and physical accesses before runtime shutdown",
+            ),
         }
     }
 }
@@ -334,6 +357,111 @@ impl fmt::Display for SWShutdownError {
 impl Error for SWShutdownError {}
 
 impl SWRuntime {
+    /// Admits a provider-owned logical result without occupying a CPU worker.
+    /// Provider submission occurs only after successful admission. Dropping the
+    /// producer abandons its logical result, never a separate physical access.
+    pub fn external<'a, T: Send + 'static>(
+        &self,
+        options: crate::external::SWExternalOptions<'a>,
+    ) -> crate::external::SWExternalResult<'a, T> {
+        match self.control.owned_scheduler() {
+            Ok(scheduler) => scheduler.admit_external(&self.control, options),
+            Err(reason) => Err(crate::external::SWExternalRejected { reason, options }),
+        }
+    }
+
+    /// Reserves storage before foreign access starts. The prepared value is safe
+    /// to reclaim; activation separately commits access against closure and set
+    /// cancellation. No I/O, GPU submission or foreign code runs in admission.
+    pub fn prepare_external<'a, T: Send + 'static>(
+        &self,
+        resource: T,
+        options: crate::external::SWExternalAccessOptions<'a>,
+    ) -> Result<
+        crate::external::SWExternalPrepared<T>,
+        crate::external::SWExternalAccessRejected<'a, T>,
+    > {
+        let prepared = (|| {
+            use crate::scheduler::{SWCost, SWSpawnError};
+            if (options.work_set.is_some() && options.discovery.is_some())
+                || options.cost.edges != 0
+                || options.cost.deliveries != 0
+            {
+                return Err(SWSpawnError::InvalidContext);
+            }
+            let work_set = match (options.work_set, options.discovery) {
+                (Some(set), _) => Some(set.try_root_lease(self.control.identity())),
+                (_, Some(permit)) => Some(permit.try_child_lease(self.control.identity())),
+                _ => None,
+            }
+            .transpose()
+            .map_err(|_| SWSpawnError::Closed)?;
+            let cost = SWCost::new(options.cost.records.max(1), 0, 0, options.cost.bytes);
+            let capacity = if let Some(reserve) = options.reservation {
+                if reserve.runtime_identity() != self.control.identity() {
+                    return Err(SWSpawnError::InvalidReservation);
+                }
+                Some(
+                    reserve
+                        .stage(cost)
+                        .map_err(crate::scheduler::map_reservation_error)?,
+                )
+            } else if let Some(pool) = self
+                .owned
+                .as_ref()
+                .and_then(|owned| owned.capacity.as_ref())
+            {
+                Some(
+                    pool.try_reserve_ordinary(cost)
+                        .map_err(crate::scheduler::map_reservation_error)?,
+                )
+            } else {
+                if cost.bytes != 0 {
+                    return Err(SWSpawnError::Disabled);
+                }
+                None
+            };
+            let bytes = if cost.bytes == 0 {
+                None
+            } else {
+                Some(
+                    capacity
+                        .as_ref()
+                        .expect("charged bytes require capacity")
+                        .retain_bytes(cost.bytes)
+                        .map_err(crate::scheduler::map_reservation_error)?,
+                )
+            };
+            let required = options
+                .reservation
+                .is_some_and(|reserve| reserve.is_required());
+            let id = self.control.reserve_physical(required)?;
+            let retention = crate::external::PhysicalRetention {
+                control: Arc::clone(&self.control),
+                registry: Arc::clone(&self.physical),
+                id,
+                work_set,
+                capacity,
+            };
+            Ok((bytes, retention))
+        })();
+        match prepared {
+            Ok((bytes, retention)) => Ok(crate::external::SWExternalPrepared::new(
+                resource, bytes, retention,
+            )),
+            Err(reason) => Err(crate::external::SWExternalAccessRejected {
+                reason,
+                resource,
+                options,
+            }),
+        }
+    }
+
+    /// Snapshot only; does not poll providers or infer device completion.
+    pub fn external_progress(&self) -> crate::external::SWExternalProgress {
+        self.control.external_progress()
+    }
+
     /// Reserves a required pipeline without borrowing the ordinary allowance.
     pub fn reserve_required(
         &self,
@@ -416,6 +544,8 @@ impl SWRuntime {
     /// receives an error before closure, avoiding self-wait and cross-pool cycles.
     /// Live owners return `LiveOwners` before root closure; the host must pump
     /// or suppress their callbacks and close them on their creation threads.
+    /// Live external producers or physical accesses return `LiveExternal` so
+    /// the host can continue servicing providers before attempting the join.
     /// Repeating this after either terminal operation has no effect.
     pub fn shutdown(&mut self) -> Result<(), SWShutdownError> {
         if context::current().is_some() || context::owner_callback_active() {

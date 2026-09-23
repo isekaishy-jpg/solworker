@@ -291,6 +291,21 @@ struct LeaseInner {
 }
 
 impl WorkSetLease {
+    pub(crate) fn activate_physical(
+        &self,
+        registry: &crate::external::PhysicalRegistry,
+        id: u64,
+    ) -> Result<(), crate::scheduler::SWSpawnError> {
+        let state = self.0.inner.lock();
+        if state.cancelled {
+            return Err(crate::scheduler::SWSpawnError::Closed);
+        }
+        // The registry transition invokes no provider or user code. Activation
+        // and set cancellation share this lock; existing active accesses retain
+        // their independent lease even after cancellation.
+        registry.activate(id);
+        Ok(())
+    }
     pub(crate) fn register_producer(&self, producer: SWProducerControl) {
         self.register_cancel(Box::new(move || producer.cancel()));
     }
