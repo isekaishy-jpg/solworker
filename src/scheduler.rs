@@ -222,6 +222,21 @@ impl OwnedScheduler {
         P: Send + 'static,
         T: Send + 'static,
     {
+        self.submit_payload_delivering(request, payload, run, application_failed, &mut None)
+    }
+
+    pub(crate) fn submit_payload_delivering<P, T>(
+        self: &Arc<Self>,
+        request: SubmitRequest<'_>,
+        payload: P,
+        run: fn(P) -> T,
+        application_failed: fn(&T) -> bool,
+        delivery: &mut Option<crate::owner::SWDeliveryTicket>,
+    ) -> SWSpawnResult<T, P>
+    where
+        P: Send + 'static,
+        T: Send + 'static,
+    {
         let SubmitRequest {
             control,
             class,
@@ -294,9 +309,33 @@ impl OwnedScheduler {
             }
             return Err(reject(SWSpawnError::Full, payload));
         }
+        if let Some(ticket) = delivery.as_mut() {
+            let rejection = if ticket.runtime_identity() != control.identity() {
+                Some(SWSpawnError::InvalidDelivery)
+            } else {
+                ticket.try_commit().err().map(|error| match error {
+                    crate::owner::TicketCommitError::Closed => SWSpawnError::Closed,
+                    crate::owner::TicketCommitError::AlreadyCommitted => {
+                        SWSpawnError::InvalidDelivery
+                    }
+                })
+            };
+            if let Some(reason) = rejection {
+                if let Some(group) = &group_inner {
+                    group.finish();
+                }
+                return Err(reject(reason, payload));
+            }
+        }
         let id = state.next_id;
         state.next_id = id.checked_add(1).expect("owned record identity exhausted");
         let (task, sink) = SWTask::pending_pair();
+        if let Some(ticket) = delivery.take() {
+            // This new result cannot complete before the record is published.
+            // Binding registers an internal notifier, never a user callback.
+            // The delivery entitlement was committed before exposing CPU work.
+            ticket.bind(task.completion());
+        }
         let envelope = make_envelope(payload, run, application_failed, sink);
         let job = Arc::new(Job {
             id,

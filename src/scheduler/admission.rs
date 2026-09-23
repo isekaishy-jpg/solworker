@@ -90,6 +90,8 @@ pub enum SWSpawnError {
     Disabled,
     InvalidContext,
     InvalidGroup,
+    /// The promised delivery belongs to another runtime or was already used.
+    InvalidDelivery,
     Consumed,
 }
 

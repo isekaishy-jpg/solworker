@@ -38,7 +38,7 @@ impl SWTaskStatus {
     }
 }
 
-/// Passive waiting is unavailable while this thread participates in CPU work.
+/// Passive waiting is unavailable during CPU work or on a live owner thread.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SWWaitError {
     ExecutionContext,
@@ -115,7 +115,7 @@ impl SWCompletion {
     /// owner/provider callbacks. This can return while successor activation is
     /// still in progress; wait on the group for all accepted work to settle.
     pub fn wait(&self) -> Result<SWTaskStatus, SWWaitError> {
-        if context::current().is_some() {
+        if context::passive_wait_forbidden() {
             return Err(SWWaitError::ExecutionContext);
         }
         let mut state = self.signal.lock();
@@ -134,7 +134,7 @@ impl SWCompletion {
     /// A timeout only ends observation; it never cancels the producer. A ready
     /// status has the same task-level boundary as [`Self::wait`].
     pub fn wait_timeout(&self, timeout: Duration) -> Result<Option<SWTaskStatus>, SWWaitError> {
-        if context::current().is_some() {
+        if context::passive_wait_forbidden() {
             return Err(SWWaitError::ExecutionContext);
         }
         let state = self.signal.lock();

@@ -11,12 +11,13 @@ use std::sync::Arc;
 use std::thread;
 
 use crate::backend::MicropoolBackend;
+pub(crate) use crate::execution::context::OwnerCallbackGuard;
 use crate::execution::{SWLane, context};
 use crate::platform::{SWWorkerSetupError, apply_worker_priority};
 use crate::scheduler::{OwnedScheduler, SWOwnedLimits};
 use config::{SWExecutionClass, SWRuntimeConfig};
 use lifecycle::{BackendOwner, Startup, StartupGuard};
-pub(crate) use lifecycle::{OwnedAdmission, RuntimeControl};
+pub(crate) use lifecycle::{OwnedAdmission, OwnerRegistration, RuntimeControl};
 
 type WorkerSetup = dyn Fn(SWExecutionClass, usize) -> io::Result<()> + Send + Sync;
 
@@ -253,17 +254,32 @@ pub struct SWRuntime {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SWShutdownError {
     ExecutionContext,
+    /// Close and clean registered owners on their own threads before joining.
+    LiveOwners,
 }
 
 impl fmt::Display for SWShutdownError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("shutdown cannot join from an execution context")
+        match self {
+            Self::ExecutionContext => f.write_str("shutdown cannot join from an execution context"),
+            Self::LiveOwners => f.write_str("close and clean live owners before runtime shutdown"),
+        }
     }
 }
 
 impl Error for SWShutdownError {}
 
 impl SWRuntime {
+    /// Registers thread-bound state and bounded deferred delivery on this host
+    /// thread. Close/clean owners before joining the runtime. O need not be Send.
+    pub fn owner<O>(
+        &self,
+        state: O,
+        capacity: std::num::NonZeroUsize,
+    ) -> Result<crate::owner::SWOwner<O>, crate::owner::SWOwnerError> {
+        crate::owner::SWOwner::new(Arc::clone(&self.control), state, capacity)
+    }
+
     pub fn builder(config: SWRuntimeConfig) -> SWRuntimeBuilder {
         SWRuntimeBuilder::new(config)
     }
@@ -288,15 +304,17 @@ impl SWRuntime {
     /// Scoped nesting stays on one lane; owned descendants may target another.
     /// A participating caller or worker
     /// receives an error before closure, avoiding self-wait and cross-pool cycles.
+    /// Live owners return `LiveOwners` before root closure; the host must pump
+    /// or suppress their callbacks and close them on their creation threads.
     /// Repeating this after either terminal operation has no effect.
     pub fn shutdown(&mut self) -> Result<(), SWShutdownError> {
-        if context::current().is_some() {
+        if context::current().is_some() || context::owner_callback_active() {
             return Err(SWShutdownError::ExecutionContext);
         }
         if self.state() != SWRuntimeState::Running {
             return Ok(());
         }
-        self.control.close_and_wait();
+        self.control.close_and_wait()?;
         if let Some(backend) = self.backend.take() {
             // Lanes hold weak backend references; each active lease releases
             // its strong reference before publishing its departure.
@@ -321,6 +339,7 @@ impl SWRuntime {
             return;
         }
         self.control.set_phase(SWRuntimeState::Abandoned);
+        self.control.close_owner_routes();
         if let Some(owned) = &self.owned {
             owned.abandon();
         }

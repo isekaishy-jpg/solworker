@@ -26,6 +26,58 @@ pub(crate) struct ExecutionContext {
 
 thread_local! {
     static CURRENT: Cell<Option<ExecutionContext>> = const { Cell::new(None) };
+    static LIVE_OWNERS: Cell<usize> = const { Cell::new(0) };
+    static OWNER_CALLBACKS: Cell<usize> = const { Cell::new(0) };
+}
+
+pub(crate) fn register_live_owner() {
+    LIVE_OWNERS.with(|count| {
+        count.set(
+            count
+                .get()
+                .checked_add(1)
+                .expect("live owner count overflow"),
+        )
+    });
+}
+
+pub(crate) fn unregister_live_owner() {
+    LIVE_OWNERS.with(|count| count.set(count.get().checked_sub(1).expect("registered owner")));
+}
+
+pub(crate) fn owner_callback_active() -> bool {
+    OWNER_CALLBACKS.with(|count| count.get() != 0)
+}
+
+/// Passive waiting never services an owner's phase or legal capture cleanup.
+pub(crate) fn passive_wait_forbidden() -> bool {
+    current().is_some() || owner_callback_active() || LIVE_OWNERS.with(|count| count.get() != 0)
+}
+
+pub(crate) struct OwnerCallbackGuard {
+    not_send: PhantomData<Rc<()>>,
+}
+
+impl OwnerCallbackGuard {
+    pub(crate) fn enter() -> Self {
+        OWNER_CALLBACKS.with(|count| {
+            count.set(
+                count
+                    .get()
+                    .checked_add(1)
+                    .expect("owner callback depth overflow"),
+            )
+        });
+        Self {
+            not_send: PhantomData,
+        }
+    }
+}
+
+impl Drop for OwnerCallbackGuard {
+    fn drop(&mut self) {
+        OWNER_CALLBACKS.with(|count| count.set(count.get() - 1));
+    }
 }
 
 pub(crate) fn current() -> Option<ExecutionContext> {

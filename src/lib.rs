@@ -3,7 +3,7 @@
 //! Three independently configured worker pools support borrowed joins, indexed
 //! chunks, and worker/owner overlap with fallible startup and explicit shutdown.
 //! Owned jobs support bounded admission, dependencies and retained groups.
-//! Owner-thread delivery is not available yet.
+//! Thread-bound owners publish results through explicit host phases.
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
@@ -18,7 +18,13 @@ mod scheduler;
 mod task;
 
 pub use execution::{
-    SWBatchRejected, SWBranchOutcome, SWExecutionError, SWGroup, SWJoinRejected, SWLane, SWPanic,
+    SWBatchRejected, SWBranchOutcome, SWDeliveryOptions, SWDeliverySpawnRejected,
+    SWDeliverySpawnResult, SWExecutionError, SWGroup, SWJoinRejected, SWLane, SWPanic,
+};
+pub use owner::{
+    SWCancelResult, SWDelivery, SWDeliveryControl, SWDeliveryStatus, SWDeliveryTicket, SWOwner,
+    SWOwnerControl, SWOwnerError, SWOwnerRejected, SWOwnerSender, SWPhase, SWPreparedDelivery,
+    SWPumpBudget, SWPumpMode, SWPumpReport, SWReadyAccess,
 };
 pub use platform::SWWorkerSetupError;
 pub use runtime::config::{

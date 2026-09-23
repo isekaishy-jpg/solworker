@@ -1,12 +1,15 @@
 //! Shared startup gate and rollback ownership.
 
+use std::collections::HashMap;
+use std::marker::PhantomData;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, Weak};
 
-use super::{SWBuildError, SWRuntimeState};
+use super::{SWBuildError, SWRuntimeState, SWShutdownError};
 use crate::SWExecutionClass;
 use crate::backend::MicropoolBackend;
-use crate::execution::context::{SWExecutionError, current};
+use crate::execution::context::{self, SWExecutionError, current};
 use crate::scheduler::{OwnedScheduler, SWSpawnError};
 
 #[cfg(test)]
@@ -176,6 +179,8 @@ struct ControlState {
     phase: SWRuntimeState,
     active: usize,
     backend: Weak<BackendOwner>,
+    owner_closers: HashMap<u64, Weak<dyn Fn() + Send + Sync>>,
+    next_owner: u64,
 }
 
 /// Lanes retain admission state, but cannot keep an idle executor alive.
@@ -199,6 +204,8 @@ impl RuntimeControl {
                 phase: SWRuntimeState::Running,
                 active: 0,
                 backend: Arc::downgrade(backend),
+                owner_closers: HashMap::new(),
+                next_owner: 1,
             }),
             changed: Condvar::new(),
             owned: OnceLock::new(),
@@ -211,6 +218,44 @@ impl RuntimeControl {
 
     pub(crate) fn identity(&self) -> u64 {
         self.id
+    }
+
+    /// The closer contains only transferable transport bookkeeping, never O
+    /// or local callbacks. Registration and runtime closure share this lock.
+    pub(crate) fn register_owner(
+        self: &Arc<Self>,
+        closer: Arc<dyn Fn() + Send + Sync>,
+    ) -> Result<OwnerRegistration, SWExecutionError> {
+        if current().is_some() || context::owner_callback_active() {
+            return Err(SWExecutionError::InvalidContext);
+        }
+        let mut state = self.lock();
+        if state.phase != SWRuntimeState::Running {
+            return Err(SWExecutionError::Closed);
+        }
+        let id = state.next_owner;
+        state.next_owner = id.checked_add(1).expect("owner identity exhausted");
+        state.owner_closers.insert(id, Arc::downgrade(&closer));
+        drop(state);
+        context::register_live_owner();
+        Ok(OwnerRegistration {
+            control: Arc::clone(self),
+            id,
+            _closer: closer,
+            not_send: PhantomData,
+        })
+    }
+
+    pub(super) fn close_owner_routes(&self) {
+        let closers = self
+            .lock()
+            .owner_closers
+            .values()
+            .filter_map(Weak::upgrade)
+            .collect::<Vec<_>>();
+        for close in closers {
+            close();
+        }
     }
 
     pub(super) fn install_owned(&self, scheduler: &Arc<OwnedScheduler>) {
@@ -305,8 +350,11 @@ impl RuntimeControl {
         })
     }
 
-    pub(super) fn close_and_wait(&self) {
+    pub(super) fn close_and_wait(&self) -> Result<(), SWShutdownError> {
         let mut state = self.lock();
+        if !state.owner_closers.is_empty() {
+            return Err(SWShutdownError::LiveOwners);
+        }
         state.phase = SWRuntimeState::Closing;
         while state.active != 0 {
             state = self
@@ -314,10 +362,27 @@ impl RuntimeControl {
                 .wait(state)
                 .unwrap_or_else(|error| error.into_inner());
         }
+        Ok(())
     }
 
     pub(super) fn set_phase(&self, phase: SWRuntimeState) {
         self.lock().phase = phase;
+    }
+}
+
+/// Owner-local registration survives until every local callback is cleaned.
+/// It retains control state but never backend ownership.
+pub(crate) struct OwnerRegistration {
+    control: Arc<RuntimeControl>,
+    id: u64,
+    _closer: Arc<dyn Fn() + Send + Sync>,
+    not_send: PhantomData<Rc<()>>,
+}
+
+impl Drop for OwnerRegistration {
+    fn drop(&mut self) {
+        self.control.lock().owner_closers.remove(&self.id);
+        context::unregister_live_owner();
     }
 }
 
