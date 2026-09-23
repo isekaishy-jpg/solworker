@@ -11,11 +11,11 @@ pub use retained::SWRetained;
 use std::sync::Arc;
 
 pub(crate) use completion::CompletionSink;
-pub(crate) use completion::Signal;
 pub(crate) use completion::Subscription;
 pub use completion::{
     SWCompletion, SWOutcome, SWOutcomeRef, SWShared, SWTask, SWTaskStatus, SWWaitError,
 };
+pub(crate) use completion::{Signal, SignalLease};
 pub use dependency::{SWThenRejected, SWThenResult};
 
 /// Explicit producer cancellation authority. Observing or dropping a task is

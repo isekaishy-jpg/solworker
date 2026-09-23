@@ -1,119 +1,130 @@
 //! Bounded retention of control allocations, never of reusable public identities.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+
+use crate::execution::group::GroupInner;
+use crate::runtime::config::SWExecutionClass;
+use crate::task::{Signal, SignalLease};
 
 #[cfg(test)]
 #[path = "../../tests/unit/storage.rs"]
 mod tests;
 
-// Reuse is opportunistic: bounded searches keep pinned handles and cold bursts
-// from making every checkout walk the admission-sized cache under its lock.
-const REUSE_PROBES: usize = 8;
+mod jobs;
+pub(super) use jobs::{Job, JobHandle, JobPool};
+mod buffers;
+pub(crate) use buffers::BufferPool;
 
-/// Retains at most `limit` allocations. Only exclusive allocations can be reset:
-/// even a weak accessor prevents reuse. Each checkout inspects at most
-/// `REUSE_PROBES` entries, rotating across calls, then allocates on a miss.
-pub(crate) struct ArcPool<T> {
-    entries: Vec<Arc<T>>,
+/// Only sealed waves enter this list. A wave may still have running members;
+/// checkout checks its terminal boundary and every retained accessor.
+pub(crate) struct GroupRetirement {
+    entries: Mutex<Vec<Arc<GroupInner>>>,
     limit: usize,
-    cursor: usize,
 }
 
-impl<T> ArcPool<T> {
+impl GroupRetirement {
+    pub(crate) fn retire(&self, group: Arc<GroupInner>) {
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if entries.len() < self.limit {
+            entries.push(group);
+        }
+    }
+}
+
+pub(crate) struct GroupPool {
+    retired: Arc<GroupRetirement>,
+}
+
+impl GroupPool {
     pub(crate) fn new(limit: usize) -> Self {
         Self {
-            entries: Vec::new(),
-            limit,
-            cursor: 0,
+            retired: Arc::new(GroupRetirement {
+                entries: Mutex::new(Vec::new()),
+                limit,
+            }),
         }
     }
 
-    pub(crate) fn acquire(
-        &mut self,
-        create: impl FnOnce() -> T,
-        reset: impl FnOnce(&mut T),
-    ) -> Arc<T> {
-        self.acquire_where(create, reset, |_| true)
-    }
-
-    pub(crate) fn acquire_where(
-        &mut self,
-        create: impl FnOnce() -> T,
-        reset: impl FnOnce(&mut T),
-        reusable: impl Fn(&T) -> bool,
-    ) -> Arc<T> {
-        for _ in 0..self.entries.len().min(REUSE_PROBES) {
-            let index = self.cursor;
-            self.cursor = (index + 1) % self.entries.len();
-            if let Some(value) = Arc::get_mut(&mut self.entries[index])
-                && reusable(value)
+    pub(crate) fn acquire(&mut self, id: u64, class: SWExecutionClass) -> Arc<GroupInner> {
+        let mut entries = self
+            .retired
+            .entries
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        for index in 0..entries.len() {
+            if let Some(group) = Arc::get_mut(&mut entries[index])
+                && group.is_complete()
             {
-                reset(value);
-                return Arc::clone(&self.entries[index]);
+                group.reset(id, class);
+                return entries.swap_remove(index);
             }
         }
-        let mut value = Arc::new(create());
-        reset(Arc::get_mut(&mut value).expect("new control allocation is exclusive"));
-        if self.entries.len() < self.limit {
-            self.entries.push(Arc::clone(&value));
-        }
-        value
+        drop(entries);
+        let mut group = Arc::new(GroupInner::new(id, class));
+        Arc::get_mut(&mut group)
+            .expect("new group allocation is exclusive")
+            .set_retirement(Arc::downgrade(&self.retired));
+        group
     }
 }
 
-/// Empty prerequisite buffers retain at most the configured edge capacity in
-/// total. Entries are cleared outside scheduler locks before returning here.
-/// Checked-out reused buffers have at most twice the requested capacity, so
-/// small live edge counts cannot accumulate arbitrarily oversized buffers.
-pub(crate) struct BufferPool<T> {
-    entries: Vec<Vec<T>>,
-    capacity: usize,
+/// Signals enter this cache only when their final strong owner is released.
+/// No live result cell is examined during acquisition.
+pub(crate) struct SignalRetirement {
+    entries: Mutex<Vec<Arc<Signal>>>,
     limit: usize,
-    cursor: usize,
 }
 
-impl<T> BufferPool<T> {
+impl SignalRetirement {
+    pub(crate) fn retire_if_last(&self, mut signal: Arc<Signal>) {
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        // Serializing the actual nonfinal decrement is necessary: two final
+        // leases dropping concurrently must not both observe the other lease.
+        if Arc::strong_count(&signal) > 1 {
+            drop(signal);
+            return;
+        }
+        if Arc::get_mut(&mut signal).is_some() && signal.is_reusable() && entries.len() < self.limit
+        {
+            entries.push(signal);
+            return;
+        }
+        drop(entries);
+        drop(signal);
+    }
+}
+
+pub(crate) struct SignalPool {
+    retired: Arc<SignalRetirement>,
+}
+
+impl SignalPool {
     pub(crate) fn new(limit: usize) -> Self {
         Self {
-            entries: Vec::new(),
-            capacity: 0,
-            limit,
-            cursor: 0,
+            retired: Arc::new(SignalRetirement {
+                entries: Mutex::new(Vec::new()),
+                limit,
+            }),
         }
     }
 
-    pub(crate) fn acquire(&mut self, minimum: usize) -> Vec<T> {
-        if minimum == 0 {
-            return Vec::new();
-        }
-        let maximum = minimum.saturating_mul(2);
-        for _ in 0..self.entries.len().min(REUSE_PROBES) {
-            let index = self.cursor;
-            self.cursor = (index + 1) % self.entries.len();
-            if (minimum..=maximum).contains(&self.entries[index].capacity()) {
-                let entry = self.entries.swap_remove(index);
-                self.capacity -= entry.capacity();
-                // Revisit the swapped-in entry on the next checkout.
-                self.cursor = if self.entries.is_empty() {
-                    0
-                } else {
-                    index % self.entries.len()
-                };
-                return entry;
-            }
-        }
-        Vec::with_capacity(minimum)
-    }
-
-    pub(crate) fn release(&mut self, entry: Vec<T>) {
-        assert!(
-            entry.is_empty(),
-            "only detached subscription storage can recycle"
-        );
-        let capacity = entry.capacity();
-        if capacity != 0 && capacity <= self.limit - self.capacity {
-            self.capacity += capacity;
-            self.entries.push(entry);
-        }
+    pub(crate) fn acquire(&mut self) -> SignalLease {
+        let mut signal = self
+            .retired
+            .entries
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .pop()
+            .unwrap_or_else(|| Arc::new(Signal::new()));
+        Arc::get_mut(&mut signal)
+            .expect("retired signal is exclusive")
+            .reset();
+        SignalLease::pooled(signal, Arc::downgrade(&self.retired))
     }
 }

@@ -9,7 +9,7 @@ mod admission;
 mod demand;
 mod ready;
 pub(crate) mod reservation;
-mod storage;
+pub(crate) mod storage;
 pub(crate) mod work_set;
 
 use std::cell::RefCell;
@@ -26,8 +26,7 @@ use crate::external::producer::{
 use crate::runtime::config::SWExecutionClass;
 use crate::runtime::{ExternalAdmission, OwnedAdmission, RuntimeControl};
 use crate::task::{
-    CompletionSink, SWCompletion, SWOutcome, SWProducerControl, SWTask, SWTaskStatus, Signal,
-    Subscription,
+    CompletionSink, SWCompletion, SWOutcome, SWProducerControl, SWTask, SWTaskStatus, Subscription,
 };
 
 pub use admission::{
@@ -41,7 +40,7 @@ use reservation::SWReservationPool;
 pub use reservation::{
     SWByteLease, SWCapacityUsage, SWCost, SWLimitError, SWLimits, SWReservation, SWReservationError,
 };
-use storage::{ArcPool, BufferPool};
+use storage::{BufferPool, GroupPool, Job, JobHandle, JobPool, SignalPool};
 use work_set::WorkSetLease;
 pub use work_set::{SWDiscoveryError, SWDiscoveryPermit, SWWorkSet, SWWorkSetProgress};
 
@@ -118,12 +117,6 @@ enum Decision {
     Suppress(SWTaskStatus),
 }
 
-struct Job {
-    id: u64,
-    scheduler: Weak<OwnedScheduler>,
-    envelope: Mutex<Option<Envelope>>,
-}
-
 /// A backend wrapper occupies its handoff slot even if its logical job has
 /// already settled. Discard during stop must release the slot without running
 /// scheduler callbacks under the backend's queue lock.
@@ -134,7 +127,7 @@ struct Handoff {
 }
 
 impl Handoff {
-    fn run(mut self, job: Arc<Job>) {
+    fn run(mut self, job: JobHandle) {
         job.run();
         self.completed = true;
     }
@@ -152,21 +145,6 @@ impl Drop for Handoff {
     }
 }
 
-impl Job {
-    fn take_envelope(&self) -> Option<Envelope> {
-        self.envelope
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .take()
-    }
-
-    fn run(self: &Arc<Self>) {
-        if let Some(scheduler) = self.scheduler.upgrade() {
-            scheduler.run_job(self);
-        }
-    }
-}
-
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum Stage {
     Waiting,
@@ -178,7 +156,7 @@ enum Stage {
 }
 
 struct Record {
-    job: Arc<Job>,
+    job: JobHandle,
     completion: Option<SWCompletion>,
     class: SWExecutionClass,
     group: Option<Arc<GroupInner>>,
@@ -226,9 +204,9 @@ struct State {
     abandoned: bool,
     demand: DemandState,
     provider_callbacks: usize,
-    jobs: ArcPool<Job>,
-    groups: ArcPool<GroupInner>,
-    signals: ArcPool<Signal>,
+    jobs: JobPool,
+    groups: GroupPool,
+    signals: SignalPool,
     subscriptions: BufferPool<Subscription>,
 }
 
@@ -407,7 +385,7 @@ impl OwnedScheduler {
         }
         let id = state.next_id;
         state.next_id = id.checked_add(1).expect("owned record identity exhausted");
-        let signal = state.signals.acquire(Signal::new, Signal::reset);
+        let signal = state.signals.acquire();
         let (task, sink) = SWTask::pending_with_signal(signal);
         task.set_producer(control.identity(), id, Arc::downgrade(self));
         let core = Arc::new(ExternalCore::new(sink, bytes));
@@ -696,9 +674,9 @@ impl OwnedScheduler {
                 abandoned: false,
                 demand: DemandState::new(priorities, demand_leases),
                 provider_callbacks: 0,
-                jobs: ArcPool::new(limits.records),
-                groups: ArcPool::new(limits.records),
-                signals: ArcPool::new(limits.records),
+                jobs: JobPool::new(limits.records),
+                groups: GroupPool::new(limits.records),
+                signals: SignalPool::new(limits.records),
                 subscriptions: BufferPool::new(limits.edges),
             }),
         })
@@ -768,11 +746,7 @@ impl OwnedScheduler {
         }
         let id = state.next_group;
         state.next_group = id.checked_add(1).expect("group identity exhausted");
-        let inner = state.groups.acquire_where(
-            || GroupInner::new(id, class),
-            |group| group.reset(id, class),
-            GroupInner::is_complete,
-        );
+        let inner = state.groups.acquire(id, class);
         drop(state);
         drop(admission);
         Ok(SWGroup::new(
@@ -981,7 +955,7 @@ impl OwnedScheduler {
         }
         let id = state.next_id;
         state.next_id = id.checked_add(1).expect("owned record identity exhausted");
-        let signal = state.signals.acquire(Signal::new, Signal::reset);
+        let signal = state.signals.acquire();
         let (task, sink) = SWTask::pending_with_signal(signal);
         task.set_producer(control.identity(), id, Arc::downgrade(self));
         if state.demand.enabled() {
@@ -1005,23 +979,7 @@ impl OwnedScheduler {
             ticket.bind(task.completion());
         }
         let envelope = make_envelope(payload, run, application_failed, sink);
-        let job = state.jobs.acquire(
-            || Job {
-                id: 0,
-                scheduler: Weak::new(),
-                envelope: Mutex::new(None),
-            },
-            |job| {
-                job.id = id;
-                job.scheduler = Arc::downgrade(self);
-                let storage = job
-                    .envelope
-                    .get_mut()
-                    .unwrap_or_else(|error| error.into_inner());
-                debug_assert!(storage.is_none());
-                *storage = Some(envelope);
-            },
-        );
+        let job = state.jobs.acquire(id, Arc::downgrade(self), envelope);
         let stage = if !prerequisites.is_empty() {
             Stage::Waiting
         } else if saturated && !inline {
@@ -1035,7 +993,7 @@ impl OwnedScheduler {
         state.records.insert(
             id,
             Record {
-                job: Arc::clone(&job),
+                job: job.clone(),
                 completion: group_inner.as_ref().map(|_| task.completion()),
                 class,
                 group: group_inner,
@@ -1168,7 +1126,7 @@ impl OwnedScheduler {
             };
             record.stage = Stage::Finalizing;
             let class = record.class;
-            let job = Arc::clone(&record.job);
+            let job = record.job.clone();
             match stage {
                 Stage::Ready => state.ready.remove(class, id),
                 Stage::DeferredReady => {
@@ -1218,7 +1176,7 @@ impl OwnedScheduler {
             let was_ready = record.stage == Stage::Ready;
             record.stage = Stage::Running;
             let class = record.class;
-            let job = Arc::clone(&record.job);
+            let job = record.job.clone();
             let group_id = record.group.as_ref().map(|group| group.id);
             // Dispatch already unlinked handed-off jobs. Only an inline or
             // helper claim of a still-ready job needs to scan/remove it here.
@@ -1234,10 +1192,10 @@ impl OwnedScheduler {
         true
     }
 
-    fn run_job(self: &Arc<Self>, job: &Arc<Job>) {
+    fn run_job(self: &Arc<Self>, job: &Job) {
         // The claim obtains a temporary backend lease before running. Queued
         // records retain only admission credit and never own a backend Arc.
-        self.claim_and_run(job.id, false);
+        self.claim_and_run(job.id(), false);
     }
 
     fn decrement_handoff(&self, class: SWExecutionClass) {
@@ -1333,14 +1291,14 @@ impl OwnedScheduler {
         }
     }
 
-    fn settle(self: &Arc<Self>, job: Arc<Job>, decision: Decision) {
+    fn settle(self: &Arc<Self>, job: JobHandle, decision: Decision) {
         let Some(envelope) = job.take_envelope() else {
             return;
         };
         // Cancellation and abandonment may be initiated by a host caller.
         // Destructors and terminal callbacks remain participating CPU work,
         // so a shutdown requested from either must not join this runtime.
-        let _context = self.cleanup_context(job.id);
+        let _context = self.cleanup_context(job.id());
         // Capture cleanup executes outside the control lock. The admission
         // token stays live through result publication and group completion.
         let finish = match catch_unwind(AssertUnwindSafe(|| envelope(decision))) {
@@ -1352,11 +1310,11 @@ impl OwnedScheduler {
         };
         {
             let mut state = self.lock_mut();
-            if let Some(record) = state.records.get_mut(&job.id) {
+            if let Some(record) = state.records.get_mut(&job.id()) {
                 record.stage = Stage::Finalizing;
             }
         }
-        self.finish_record(job.id, finish);
+        self.finish_record(job.id(), finish);
     }
 
     fn finish_record(self: &Arc<Self>, id: u64, finish: Finish) {
@@ -1482,7 +1440,7 @@ impl OwnedScheduler {
                         continue;
                     }
                     record.stage = Stage::Handed;
-                    let job = Arc::clone(&record.job);
+                    let job = record.job.clone();
                     state.ready.handed_off[class.index()] += 1;
                     job
                 };
@@ -1496,7 +1454,7 @@ impl OwnedScheduler {
                     self.abandon();
                     break;
                 };
-                let rejected_job = Arc::clone(&job);
+                let rejected_job = job.clone();
                 let offered = lease.pool().try_spawn_owned(move || handoff.run(job));
                 if let Err(wrapper) = offered {
                     // Checked handoff returned the intact wrapper after stop.

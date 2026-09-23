@@ -1,5 +1,6 @@
 //! Retained, classed batches and exact-group helping.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 
 use crate::execution::context::{SWExecutionError, current};
@@ -17,6 +18,8 @@ pub(crate) struct GroupInner {
     state: Mutex<GroupState>,
     changed: Condvar,
     completion: SWCompletion,
+    public_handles: AtomicUsize,
+    retirement: Weak<crate::scheduler::storage::GroupRetirement>,
 }
 
 struct GroupState {
@@ -41,12 +44,22 @@ impl GroupInner {
             }),
             changed: Condvar::new(),
             completion: SWCompletion::pending(),
+            public_handles: AtomicUsize::new(1),
+            retirement: Weak::new(),
         }
+    }
+
+    pub(crate) fn set_retirement(
+        &mut self,
+        retirement: Weak<crate::scheduler::storage::GroupRetirement>,
+    ) {
+        self.retirement = retirement;
     }
 
     pub(crate) fn reset(&mut self, id: u64, class: SWExecutionClass) {
         self.id = id;
         self.class = class;
+        *self.public_handles.get_mut() = 1;
         let state = self
             .state
             .get_mut()
@@ -94,6 +107,20 @@ impl GroupInner {
 
     pub(crate) fn is_complete(&self) -> bool {
         self.completion.status().is_some()
+    }
+
+    fn release_public(group: &Arc<Self>) {
+        if group.public_handles.fetch_sub(1, Ordering::AcqRel) != 1 {
+            return;
+        }
+        let sealed = group
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .sealed;
+        if sealed && let Some(retirement) = group.retirement.upgrade() {
+            retirement.retire(Arc::clone(group));
+        }
     }
 
     fn seal(&self) {
@@ -153,11 +180,27 @@ impl GroupInner {
 }
 
 /// A retained wave of owned jobs in one execution class.
-#[derive(Clone)]
 pub struct SWGroup {
     pub(crate) inner: Arc<GroupInner>,
     pub(crate) scheduler: Weak<OwnedScheduler>,
     pub(crate) runtime: u64,
+}
+
+impl Clone for SWGroup {
+    fn clone(&self) -> Self {
+        self.inner.public_handles.fetch_add(1, Ordering::Relaxed);
+        Self {
+            inner: Arc::clone(&self.inner),
+            scheduler: self.scheduler.clone(),
+            runtime: self.runtime,
+        }
+    }
+}
+
+impl Drop for SWGroup {
+    fn drop(&mut self) {
+        GroupInner::release_public(&self.inner);
+    }
 }
 
 impl SWGroup {

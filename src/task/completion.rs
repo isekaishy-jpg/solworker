@@ -8,6 +8,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, Weak};
 use std::time::Duration;
 
 use crate::execution::context;
+use crate::scheduler::storage::SignalRetirement;
 
 /// A completed owned invocation. Application errors remain in a successful
 /// returned `Result<T, E>`; they are never erased into a runtime failure.
@@ -88,6 +89,11 @@ impl Signal {
         self.producer.take();
     }
 
+    pub(crate) fn is_reusable(&self) -> bool {
+        let state = self.lock();
+        state.status.is_some() && state.subscribers.is_empty()
+    }
+
     fn lock(&self) -> MutexGuard<'_, SignalState> {
         self.state.lock().unwrap_or_else(|error| error.into_inner())
     }
@@ -124,6 +130,63 @@ impl Signal {
     }
 }
 
+/// A signal returns to its scheduler cache after its last owning observation
+/// ends. Weak subscriptions pin the identity and prevent reuse.
+pub(crate) struct SignalLease {
+    signal: Option<Arc<Signal>>,
+    retirement: Weak<SignalRetirement>,
+}
+
+impl SignalLease {
+    pub(crate) fn unpooled(signal: Arc<Signal>) -> Self {
+        Self {
+            signal: Some(signal),
+            retirement: Weak::new(),
+        }
+    }
+
+    pub(crate) fn pooled(signal: Arc<Signal>, retirement: Weak<SignalRetirement>) -> Self {
+        Self {
+            signal: Some(signal),
+            retirement,
+        }
+    }
+
+    fn arc(&self) -> &Arc<Signal> {
+        self.signal.as_ref().expect("signal lease is live")
+    }
+
+    fn get_mut(&mut self) -> Option<&mut Signal> {
+        Arc::get_mut(self.signal.as_mut().expect("signal lease is live"))
+    }
+}
+
+impl Clone for SignalLease {
+    fn clone(&self) -> Self {
+        Self {
+            signal: Some(Arc::clone(self.arc())),
+            retirement: self.retirement.clone(),
+        }
+    }
+}
+
+impl Deref for SignalLease {
+    type Target = Signal;
+
+    fn deref(&self) -> &Self::Target {
+        self.arc()
+    }
+}
+
+impl Drop for SignalLease {
+    fn drop(&mut self) {
+        let signal = self.signal.take().expect("signal lease drops once");
+        if let Some(retirement) = self.retirement.upgrade() {
+            retirement.retire_if_last(signal);
+        }
+    }
+}
+
 /// A status-only prerequisite. Task readiness means the invocation and its
 /// captures have settled and its outcome is available, but successor edges may
 /// still be activating. A group token instead includes its sealed members'
@@ -132,18 +195,18 @@ impl Signal {
 /// cancellation.
 #[derive(Clone)]
 pub struct SWCompletion {
-    signal: Arc<Signal>,
+    signal: SignalLease,
 }
 
 impl SWCompletion {
     pub(crate) fn pending() -> Self {
         Self {
-            signal: Arc::new(Signal::new()),
+            signal: SignalLease::unpooled(Arc::new(Signal::new())),
         }
     }
 
     pub(crate) fn reset(&mut self) {
-        if let Some(signal) = Arc::get_mut(&mut self.signal) {
+        if let Some(signal) = self.signal.get_mut() {
             signal.reset();
         } else {
             *self = Self::pending();
@@ -155,7 +218,7 @@ impl SWCompletion {
     }
 
     pub(crate) fn same_signal(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.signal, &other.signal)
+        Arc::ptr_eq(self.signal.arc(), other.signal.arc())
     }
 
     pub(crate) fn producer_identity(&self) -> Option<(u64, u64)> {
@@ -282,13 +345,15 @@ impl SWCompletion {
         };
         match ready {
             Ok(id) => Subscription {
-                signal: Some(Arc::downgrade(&self.signal)),
+                signal: Some(Arc::downgrade(self.signal.arc())),
+                retirement: self.signal.retirement.clone(),
                 id,
             },
             Err((status, callback)) => {
                 callback(status);
                 Subscription {
                     signal: None,
+                    retirement: Weak::new(),
                     id: 0,
                 }
             }
@@ -300,6 +365,7 @@ impl SWCompletion {
 /// promptly, including its captured scheduler reference.
 pub(crate) struct Subscription {
     signal: Option<std::sync::Weak<Signal>>,
+    retirement: Weak<SignalRetirement>,
     id: u64,
 }
 
@@ -307,6 +373,10 @@ impl Subscription {
     fn detach(&mut self) {
         let Some(signal) = self.signal.take().and_then(|signal| signal.upgrade()) else {
             return;
+        };
+        let signal = SignalLease {
+            signal: Some(signal),
+            retirement: self.retirement.clone(),
         };
         let callback = signal.lock().subscribers.remove(&self.id);
         drop(callback);
@@ -321,7 +391,7 @@ impl Drop for Subscription {
 
 struct ResultCell<T> {
     outcome: Mutex<ResultStorage<T>>,
-    signal: Arc<Signal>,
+    signal: SignalLease,
 }
 
 enum ResultStorage<T> {
@@ -405,10 +475,10 @@ impl<T: Send + 'static> SWTask<T> {
     }
 
     pub(crate) fn pending_pair() -> (Self, CompletionSink<T>) {
-        Self::pending_with_signal(Arc::new(Signal::new()))
+        Self::pending_with_signal(SignalLease::unpooled(Arc::new(Signal::new())))
     }
 
-    pub(crate) fn pending_with_signal(signal: Arc<Signal>) -> (Self, CompletionSink<T>) {
+    pub(crate) fn pending_with_signal(signal: SignalLease) -> (Self, CompletionSink<T>) {
         let cell = Arc::new(ResultCell {
             outcome: Mutex::new(ResultStorage::Unique(None)),
             signal,
@@ -435,12 +505,12 @@ impl<T: Send + 'static> SWTask<T> {
 
     pub fn completion(&self) -> SWCompletion {
         SWCompletion {
-            signal: Arc::clone(&self.cell.signal),
+            signal: self.cell.signal.clone(),
         }
     }
 
     pub fn status(&self) -> Option<SWTaskStatus> {
-        self.completion().status()
+        self.cell.signal.lock().status
     }
 
     /// Borrows the terminal outcome, if ready and still retained. A previous
@@ -530,12 +600,12 @@ impl<T: Send + Sync + 'static> SWShared<T> {
 
     pub fn completion(&self) -> SWCompletion {
         SWCompletion {
-            signal: Arc::clone(&self.cell.signal),
+            signal: self.cell.signal.clone(),
         }
     }
 
     pub fn status(&self) -> Option<SWTaskStatus> {
-        self.completion().status()
+        self.cell.signal.lock().status
     }
 
     /// Returns shared ownership of the same immutable outcome. The returned

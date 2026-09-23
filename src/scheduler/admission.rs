@@ -17,6 +17,8 @@ pub type SWSpawnResult<T, F> = Result<(SWTask<T>, SWProducerControl), SWSpawnRej
 /// limit; it still needs record and edge credits.
 /// Internal reuse caches retain at most `records` job, group, and completion
 /// allocations each, plus `edges` slots of detached subscription buffers.
+/// Job and completion caches contain returned controls; groups retire when the
+/// last public handle drops after sealing and reuse waits for settlement.
 /// Outstanding handles prevent reuse; retained payloads keep their own lifetime.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SWOwnedLimits {

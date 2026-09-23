@@ -1,193 +1,141 @@
-use super::{ArcPool, BufferPool, REUSE_PROBES};
-use crate::execution::group::{GroupInner, SWGroup};
+use super::{GroupPool, SignalPool};
+use crate::execution::group::SWGroup;
 use crate::runtime::config::SWExecutionClass;
-use crate::task::{SWOutcome, SWTask, SWTaskStatus, Signal};
-use std::cell::Cell;
-use std::sync::{Arc, Weak};
+use crate::task::{SWOutcome, SWTask, SWTaskStatus};
+use std::sync::{Arc, Barrier, Weak};
 
 #[test]
-fn control_storage_recycles_without_resetting_retained_results_or_weak_accessors() {
-    let mut signals = ArcPool::new(1);
-    let first = signals.acquire(Signal::new, Signal::reset);
-    let address = Arc::as_ptr(&first);
-    let weak = Arc::downgrade(&first);
+fn retired_signal_reuses_only_after_result_and_observers_release() {
+    let mut signals = SignalPool::new(2);
+    let first = signals.acquire();
+    let address = &*first as *const _;
     let (task, sink) = SWTask::pending_with_signal(first);
     let completion = task.completion();
+    let subscription = completion.subscribe_cancelable(Box::new(|_| {}));
     sink.finish(SWOutcome::Success(41_u32), false);
     let shared = task.into_shared();
     let result = shared.try_result().unwrap();
-    let other = signals.acquire(Signal::new, Signal::reset);
-    assert_ne!(Arc::as_ptr(&other), address);
-    assert_eq!(signals.entries.len(), 1); // Busy capacity doesn't grow the cache.
+    let other = signals.acquire();
+    assert_ne!(&*other as *const _, address);
     assert_eq!(completion.status(), Some(SWTaskStatus::Succeeded));
-    drop((other, shared, completion));
-    let other = signals.acquire(Signal::new, Signal::reset);
-    assert_ne!(Arc::as_ptr(&other), address); // Weak callbacks also pin identity.
-    drop((other, weak));
-    let recycled = signals.acquire(Signal::new, Signal::reset);
-    assert_eq!(Arc::as_ptr(&recycled), address);
+    drop(other);
+    drop(shared);
+    drop(completion);
+    // A detached subscription's weak reference still pins the old identity.
+    let other = signals.acquire();
+    assert_ne!(&*other as *const _, address);
+    drop(other);
+    drop(subscription);
+    // The weak reference outlived the last strong owner, so that particular
+    // allocation was discarded. Detached payload ownership remains valid.
+    assert_eq!(signals.retired.entries.lock().unwrap().len(), 0);
+    let next = signals.acquire();
+    drop(next);
+    assert!(matches!(&*result, SWOutcome::Success(41)));
+
+    let reusable = signals.acquire();
+    let reusable_address = &*reusable as *const _;
+    let (task, sink) = SWTask::pending_with_signal(reusable);
+    sink.finish(SWOutcome::Success(42_u32), false);
+    let completion = task.completion();
+    drop(task);
+    assert_eq!(completion.status(), Some(SWTaskStatus::Succeeded));
+    drop(completion);
+    let recycled = signals.acquire();
+    assert_eq!(&*recycled as *const _, reusable_address);
     let (next, sink) = SWTask::<u32>::pending_with_signal(recycled);
     assert_eq!(next.status(), None);
-    sink.finish(SWOutcome::Success(42), false);
-    // Detached immutable payloads don't prevent control reuse or change value.
-    assert!(matches!(&*result, SWOutcome::Success(41)));
+    sink.finish(SWOutcome::Success(43), false);
     assert_eq!(next.status(), Some(SWTaskStatus::Succeeded));
 }
 
 #[test]
-fn group_and_edge_storage_reuse_preserves_old_completion_and_bounds_retention() {
-    let mut groups = ArcPool::new(1);
+fn retired_group_waits_for_seal_settlement_and_public_release() {
+    let mut groups = GroupPool::new(2);
     let class = SWExecutionClass::High;
-    let acquire = |pool: &mut ArcPool<GroupInner>, id| {
-        pool.acquire_where(
-            || GroupInner::new(id, class),
-            |group| group.reset(id, class),
-            GroupInner::is_complete,
-        )
-    };
-    let group = acquire(&mut groups, 1);
-    let address = Arc::as_ptr(&group);
-    assert!(group.add());
+    let inner = groups.acquire(1, class);
+    let address = Arc::as_ptr(&inner);
+    let group = SWGroup::new(Arc::clone(&inner), Weak::new(), 0);
+    let retained = group.clone();
+    assert!(inner.add());
     let old = group.completion();
-    group.finish(Some(SWTaskStatus::Succeeded));
-    assert_eq!(old.status(), None);
-    // An unsealed wave must never be recycled (even if its public handle is gone).
+    group.seal();
     drop(group);
-    let separate = acquire(&mut groups, 2);
+    let separate = groups.acquire(2, class);
     assert_ne!(Arc::as_ptr(&separate), address);
-    let original = Arc::clone(&groups.entries[0]);
-    SWGroup::new(Arc::clone(&original), Weak::new(), 0).seal();
+    drop(retained);
+    inner.finish(Some(SWTaskStatus::Succeeded));
     assert_eq!(old.status(), Some(SWTaskStatus::Succeeded));
-    drop(original);
-    let recycled = acquire(&mut groups, 3);
+    let still_pinned = groups.acquire(3, class);
+    assert_ne!(Arc::as_ptr(&still_pinned), address);
+    drop(inner);
+    let recycled = groups.acquire(4, class);
     assert_eq!(Arc::as_ptr(&recycled), address);
-    assert_eq!(recycled.id, 3);
+    assert_eq!(recycled.id, 4);
     assert_eq!(recycled.completion().status(), None);
     assert_eq!(old.status(), Some(SWTaskStatus::Succeeded));
-    assert!(recycled.add());
-    SWGroup::new(Arc::clone(&recycled), Weak::new(), 0).seal();
-    recycled.finish(Some(SWTaskStatus::Abandoned));
-    assert_eq!(
-        recycled.completion().status(),
-        Some(SWTaskStatus::PrerequisiteFailed)
-    );
-
-    let mut buffers = BufferPool::<u64>::new(4);
-    let buffer = buffers.acquire(4);
-    let address = buffer.as_ptr();
-    buffers.release(buffer);
-    let buffer = buffers.acquire(2);
-    assert_eq!(buffer.as_ptr(), address);
-    assert_eq!(buffers.capacity, 0);
-    buffers.release(buffer);
-    buffers.release(Vec::with_capacity(8));
-    assert_eq!(buffers.capacity, 4);
-    assert_eq!(buffers.entries.len(), 1);
-
-    // A descending sequence of wide temporary jobs followed by waiting
-    // one-edge jobs used to accumulate E * (E + 1) / 2 backing slots.
-    for edge_limit in [8, 1024] {
-        let mut buffers = BufferPool::<u64>::new(edge_limit);
-        let mut waiting = Vec::new();
-        for width in (1..=edge_limit).rev() {
-            assert!(waiting.len() + width <= edge_limit);
-            let temporary = buffers.acquire(width);
-            assert!(temporary.capacity() <= 2 * width);
-            buffers.release(temporary);
-            assert!(buffers.capacity <= edge_limit);
-            let narrow = buffers.acquire(1);
-            assert!(narrow.capacity() <= 2);
-            waiting.push(narrow);
-        }
-        assert!(waiting.iter().map(Vec::capacity).sum::<usize>() <= 2 * edge_limit);
-        for buffer in waiting {
-            buffers.release(buffer);
-            assert!(buffers.capacity <= edge_limit);
-        }
-    }
 }
 
 #[test]
-fn reuse_searches_are_bounded_and_rotate_past_unavailable_entries() {
-    let count = REUSE_PROBES * 4;
-    let mut pool = ArcPool::new(count);
-    let retained: Vec<_> = (0..count).map(|id| pool.acquire(|| id, |_| {})).collect();
-    // Full pinned cache: allocating on a miss must not inspect every entry.
-    let cursor = pool.cursor;
-    let extra = pool.acquire(|| usize::MAX, |_| {});
-    assert_eq!(pool.cursor, (cursor + REUSE_PROBES) % count);
-    assert_eq!(pool.entries.len(), count);
-    assert!(retained.iter().all(|entry| !Arc::ptr_eq(entry, &extra)));
-    drop(retained);
+fn simultaneous_final_signal_observers_return_one_reusable_allocation() {
+    let mut signals = SignalPool::new(1);
+    let signal = signals.acquire();
+    let address = &*signal as *const _;
+    let (task, sink) = SWTask::pending_with_signal(signal);
+    sink.finish(SWOutcome::Success(()), false);
+    let first = task.completion();
+    let second = first.clone();
+    drop(task);
 
-    // Exclusive but ineligible entries (e.g. unsealed groups) also have bounded
-    // inspection. Rotation eventually finds a reusable entry beyond one probe.
-    pool.cursor = 0;
-    let wanted = REUSE_PROBES * 2 + 1;
-    let checks = Cell::new(0);
-    let mut found = false;
-    for _ in 0..4 {
-        let before = checks.get();
-        let value = pool.acquire_where(
-            || usize::MAX,
-            |_| {},
-            |value| {
-                checks.set(checks.get() + 1);
-                *value == wanted
-            },
-        );
-        assert!(checks.get() - before <= REUSE_PROBES);
-        if *value == wanted {
-            found = true;
-            break;
+    let barrier = Arc::new(Barrier::new(3));
+    std::thread::scope(|scope| {
+        for completion in [first, second] {
+            let barrier = Arc::clone(&barrier);
+            scope.spawn(move || {
+                barrier.wait();
+                drop(completion);
+            });
         }
-    }
-    assert!(found);
-    assert!(checks.get() > REUSE_PROBES);
+        barrier.wait();
+    });
+    let recycled = signals.acquire();
+    assert_eq!(&*recycled as *const _, address);
+}
 
-    // Buffer size filtering must not introduce a new full-cache scan.
-    let mut buffers = BufferPool::<u64>::new(count * 4);
-    let mut wanted_address = std::ptr::null();
-    for index in 0..count {
-        let buffer = Vec::with_capacity(if index == wanted { 2 } else { 4 });
-        if index == wanted {
-            wanted_address = buffer.as_ptr();
-        }
-        buffers.release(buffer);
+#[test]
+fn group_retirement_searches_entire_retired_list_and_caps_retention() {
+    let mut groups = GroupPool::new(12);
+    let class = SWExecutionClass::High;
+    let mut pinned = Vec::new();
+    for id in 0..9 {
+        let inner = groups.acquire(id, class);
+        let group = SWGroup::new(Arc::clone(&inner), Weak::new(), 0);
+        group.seal();
+        drop(group);
+        pinned.push(inner);
     }
-    let first = buffers.acquire(1);
-    assert_eq!(buffers.cursor, REUSE_PROBES);
-    assert_ne!(first.as_ptr(), wanted_address);
-    let mut found = false;
-    for _ in 0..4 {
-        let buffer = buffers.acquire(1);
-        if buffer.as_ptr() == wanted_address {
-            found = true;
-            break;
-        }
-    }
-    assert!(found);
-    // Empty/single-entry cache removal and subsequent insertion keep a valid cursor.
-    let mut single = BufferPool::<u64>::new(4);
-    single.release(Vec::with_capacity(4));
-    let buffer = single.acquire(2);
-    assert_eq!(single.cursor, 0);
-    single.release(buffer);
-    assert_eq!(single.acquire(2).capacity(), 4);
+    let eligible = groups.acquire(9, class);
+    let address = Arc::as_ptr(&eligible);
+    let group = SWGroup::new(Arc::clone(&eligible), Weak::new(), 0);
+    group.seal();
+    drop(group);
+    drop(eligible);
+    assert_eq!(groups.retired.entries.lock().unwrap().len(), 10);
+    let recycled = groups.acquire(10, class);
+    assert_eq!(Arc::as_ptr(&recycled), address);
 
-    // Removing the last slot of a nonempty cache must wrap to a valid entry,
-    // including when the next release appends a different-sized buffer.
-    let mut tail = BufferPool::<u64>::new(16);
-    tail.release(Vec::with_capacity(4));
-    tail.release(Vec::with_capacity(8));
-    tail.cursor = 1;
-    let large = tail.acquire(8);
-    assert_eq!(large.capacity(), 8);
-    assert_eq!(tail.capacity, 4);
-    assert_eq!(tail.cursor, 0);
-    tail.release(large);
-    assert_eq!(tail.acquire(2).capacity(), 4);
-    assert_eq!(tail.acquire(8).capacity(), 8);
-    assert_eq!(tail.capacity, 0);
-    assert!(tail.entries.is_empty());
+    let unsealed = groups.acquire(11, class);
+    let group = SWGroup::new(Arc::clone(&unsealed), Weak::new(), 0);
+    drop(group);
+    drop(unsealed);
+    assert_eq!(groups.retired.entries.lock().unwrap().len(), 9);
+
+    for id in 12..30 {
+        let inner = groups.acquire(id, class);
+        let group = SWGroup::new(Arc::clone(&inner), Weak::new(), 0);
+        group.seal();
+        drop(group);
+        pinned.push(inner);
+    }
+    assert!(groups.retired.entries.lock().unwrap().len() <= 12);
 }
