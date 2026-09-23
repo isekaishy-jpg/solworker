@@ -118,19 +118,20 @@ impl JobPool {
         scheduler: Weak<OwnedScheduler>,
         envelope: Envelope,
     ) -> JobHandle {
-        let mut job = self
-            .recycled
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .free
-            .pop()
-            .unwrap_or_else(|| {
-                Arc::new(Job {
-                    id: 0,
-                    scheduler: Weak::new(),
-                    envelope: Mutex::new(None),
-                })
-            });
+        let recycled = {
+            self.recycled
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .free
+                .pop()
+        };
+        let mut job = recycled.unwrap_or_else(|| {
+            Arc::new(Job {
+                id: 0,
+                scheduler: Weak::new(),
+                envelope: Mutex::new(None),
+            })
+        });
         let control = Arc::get_mut(&mut job).expect("returned job control is exclusive");
         control.id = id;
         control.scheduler = scheduler;

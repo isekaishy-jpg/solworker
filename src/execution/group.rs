@@ -216,6 +216,20 @@ impl SWGroup {
         }
     }
 
+    /// Reuses this wave's allocation only when no other group handle or
+    /// scheduler member can still refer to its old identity. Retained
+    /// completion tokens keep their terminal signal when the wave resets.
+    pub(crate) fn try_reset(&mut self, id: u64) -> bool {
+        let Some(inner) = Arc::get_mut(&mut self.inner) else {
+            return false;
+        };
+        if *inner.public_handles.get_mut() != 1 || !inner.is_complete() {
+            return false;
+        }
+        inner.reset(id, inner.class);
+        true
+    }
+
     pub fn class(&self) -> SWExecutionClass {
         self.inner.class
     }

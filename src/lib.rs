@@ -27,9 +27,9 @@ mod scheduler;
 mod task;
 
 pub use execution::{
-    SWBatchRejected, SWBranchOutcome, SWDeliveryOptions, SWDeliverySpawnRejected,
-    SWDeliverySpawnResult, SWExecutionError, SWGroup, SWJoinRejected, SWLane, SWPanic,
-    SWStageOptions, SWStageRejected, SWStageResult, SWWorkOptions,
+    SWBatch, SWBatchError, SWBatchRejected, SWBranchOutcome, SWDeliveryOptions,
+    SWDeliverySpawnRejected, SWDeliverySpawnResult, SWExecutionError, SWGroup, SWJoinRejected,
+    SWLane, SWPanic, SWStageOptions, SWStageRejected, SWStageResult, SWWorkOptions,
 };
 pub use external::{
     SWExternalAccess, SWExternalAccessOptions, SWExternalAccessRejected,

@@ -205,7 +205,6 @@ struct State {
     demand: DemandState,
     provider_callbacks: usize,
     jobs: JobPool,
-    groups: GroupPool,
     signals: SignalPool,
     subscriptions: BufferPool<Subscription>,
 }
@@ -253,6 +252,7 @@ pub(crate) struct OwnedScheduler {
     control: Weak<RuntimeControl>,
     limits: SWOwnedLimits,
     state: Mutex<State>,
+    groups: GroupPool,
     pub(crate) capacity: Option<SWReservationPool>,
     wake: Arc<crate::progress::SWWake>,
 }
@@ -663,6 +663,7 @@ impl OwnedScheduler {
             limits,
             capacity,
             wake,
+            groups: GroupPool::new(limits.records),
             state: Mutex::new(State {
                 records: HashMap::new(),
                 external: HashMap::new(),
@@ -675,7 +676,6 @@ impl OwnedScheduler {
                 demand: DemandState::new(priorities, demand_leases),
                 provider_callbacks: 0,
                 jobs: JobPool::new(limits.records),
-                groups: GroupPool::new(limits.records),
                 signals: SignalPool::new(limits.records),
                 subscriptions: BufferPool::new(limits.edges),
             }),
@@ -740,20 +740,46 @@ impl OwnedScheduler {
             crate::execution::SWExecutionError::Closed => SWSpawnError::Closed,
             crate::execution::SWExecutionError::InvalidContext => SWSpawnError::InvalidContext,
         })?;
-        let mut state = self.lock_mut();
-        if state.abandoned {
-            return Err(SWSpawnError::Closed);
-        }
-        let id = state.next_group;
-        state.next_group = id.checked_add(1).expect("group identity exhausted");
-        let inner = state.groups.acquire(id, class);
-        drop(state);
+        let id = self.reserve_group_id()?;
+        let inner = self.groups.acquire(id, class);
+        // The reserved ID is the admission point. Keep the runtime admission
+        // alive through checkout even when graceful closure races this call.
         drop(admission);
         Ok(SWGroup::new(
             inner,
             Arc::downgrade(self),
             control.identity(),
         ))
+    }
+
+    pub(crate) fn renew_group(self: &Arc<Self>, group: &mut SWGroup) -> Result<(), SWSpawnError> {
+        let control = self.control.upgrade().ok_or(SWSpawnError::Closed)?;
+        if group.runtime != control.identity()
+            || !Weak::ptr_eq(&group.scheduler, &Arc::downgrade(self))
+        {
+            return Err(SWSpawnError::InvalidGroup);
+        }
+        let admission = control.admit_owned(false).map_err(|error| match error {
+            crate::execution::SWExecutionError::Closed => SWSpawnError::Closed,
+            crate::execution::SWExecutionError::InvalidContext => SWSpawnError::InvalidContext,
+        })?;
+        let id = self.reserve_group_id()?;
+        if !group.try_reset(id) {
+            let inner = self.groups.acquire(id, group.class());
+            *group = SWGroup::new(inner, Arc::downgrade(self), control.identity());
+        }
+        drop(admission);
+        Ok(())
+    }
+
+    fn reserve_group_id(&self) -> Result<u64, SWSpawnError> {
+        let mut state = self.lock_mut();
+        if state.abandoned {
+            return Err(SWSpawnError::Closed);
+        }
+        let id = state.next_group;
+        state.next_group = id.checked_add(1).expect("group identity exhausted");
+        Ok(id)
     }
 
     pub(crate) fn submit_payload<P, T>(

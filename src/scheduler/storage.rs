@@ -48,7 +48,7 @@ impl GroupPool {
         }
     }
 
-    pub(crate) fn acquire(&mut self, id: u64, class: SWExecutionClass) -> Arc<GroupInner> {
+    pub(crate) fn acquire(&self, id: u64, class: SWExecutionClass) -> Arc<GroupInner> {
         let mut entries = self
             .retired
             .entries
@@ -115,13 +115,14 @@ impl SignalPool {
     }
 
     pub(crate) fn acquire(&mut self) -> SignalLease {
-        let mut signal = self
-            .retired
-            .entries
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .pop()
-            .unwrap_or_else(|| Arc::new(Signal::new()));
+        let recycled = {
+            self.retired
+                .entries
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .pop()
+        };
+        let mut signal = recycled.unwrap_or_else(|| Arc::new(Signal::new()));
         Arc::get_mut(&mut signal)
             .expect("retired signal is exclusive")
             .reset();

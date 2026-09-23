@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -248,7 +248,6 @@ fn group_helper_claims_handed_off_members_of_only_its_group() {
     let helped = target.help_ready();
     let target_status = target_task.completion().wait_timeout(TIMEOUT).unwrap();
     let unrelated_before_release = unrelated_ran.load(Ordering::SeqCst);
-    let _ = release_tx.send(());
     assert!(helped.unwrap());
     assert_eq!(target_status, Some(SWTaskStatus::Succeeded));
     assert_eq!(
@@ -259,6 +258,27 @@ fn group_helper_claims_handed_off_members_of_only_its_group() {
         !unrelated_before_release,
         "target help executed unrelated work"
     );
+    target.wait_helping().unwrap();
+    assert!(target.is_complete());
+    drop(target_task);
+    drop(target);
+
+    // Admit another wave while the old target wrapper is still queued behind
+    // the blocker. Group storage may recycle; the old job must remain pinned.
+    let recycled = lane.group().unwrap();
+    let counts: Vec<_> = (0..3).map(|_| Arc::new(AtomicUsize::new(0))).collect();
+    let mut new_tasks = Vec::new();
+    for count in &counts {
+        let count = Arc::clone(count);
+        let (task, _) = lane
+            .try_spawn_in(&recycled, SWSpawnOptions::default(), move || {
+                count.fetch_add(1, Ordering::SeqCst);
+            })
+            .unwrap();
+        new_tasks.push(task);
+    }
+    recycled.seal();
+    let _ = release_tx.send(());
     assert_eq!(
         blocker.completion().wait_timeout(TIMEOUT).unwrap(),
         Some(SWTaskStatus::Succeeded)
@@ -267,9 +287,18 @@ fn group_helper_claims_handed_off_members_of_only_its_group() {
         unrelated_task.completion().wait_timeout(TIMEOUT).unwrap(),
         Some(SWTaskStatus::Succeeded)
     );
-    target.wait_helping().unwrap();
+    for task in new_tasks {
+        assert_eq!(
+            task.completion().wait_timeout(TIMEOUT).unwrap(),
+            Some(SWTaskStatus::Succeeded)
+        );
+    }
+    recycled.wait_helping().unwrap();
+    for count in counts {
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
     unrelated.wait_helping().unwrap();
-    assert!(target.is_complete());
+    assert!(recycled.is_complete());
     assert!(unrelated.is_complete());
     runtime.shutdown().unwrap();
 }
