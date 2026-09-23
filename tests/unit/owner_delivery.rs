@@ -3,6 +3,35 @@ use std::num::NonZeroUsize;
 use std::sync::{Arc, Barrier};
 
 #[test]
+fn protected_delivery_survives_ordinary_endpoint_saturation() {
+    use crate::scheduler::reservation::SWReservationPool;
+    use crate::scheduler::{SWCost, SWLimits};
+
+    let limits = SWLimits::new(SWCost::new(0, 0, 1, 0), SWCost::new(0, 0, 1, 0), 1, None).unwrap();
+    let pool = SWReservationPool::new(11, limits);
+    let transport =
+        Transport::new_with_capacity(NonZeroUsize::new(1).unwrap(), 11, Some(pool.clone()));
+    let ordinary = transport.reserve().unwrap().ticket();
+    assert!(ordinary.is_accounted());
+    assert!(transport.reserve().is_none());
+    let required = pool.try_reserve_required(SWCost::new(0, 0, 1, 0)).unwrap();
+    let protected = transport.reserve_reserved(&required).unwrap().ticket();
+    assert!(protected.is_accounted());
+    assert!(transport.reserve_reserved(&required).is_err());
+    ordinary.ready();
+    protected.ready();
+    for _ in 0..2 {
+        let notification = transport.try_recv().unwrap();
+        assert_eq!(notification.claim(), ClaimResult::Run);
+        notification.settle(SWDeliveryStatus::Published);
+    }
+    assert_eq!(pool.snapshot().ordinary.deliveries, 0);
+    assert_eq!(required.available().deliveries, 1);
+    drop(required);
+    assert_eq!(pool.snapshot().required.deliveries, 0);
+}
+
+#[test]
 fn ready_ticket_notifies_once_and_settles_after_claim() {
     let transport = Transport::new(NonZeroUsize::new(1).unwrap(), 42);
     let reservation = transport.reserve().unwrap();

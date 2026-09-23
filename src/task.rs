@@ -5,6 +5,8 @@
 
 mod completion;
 mod dependency;
+mod retained;
+pub use retained::SWRetained;
 
 use std::sync::Arc;
 

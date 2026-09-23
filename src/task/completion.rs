@@ -4,7 +4,7 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::ops::Deref;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, Weak};
 use std::time::Duration;
 
 use crate::execution::context;
@@ -55,6 +55,13 @@ struct SignalState {
 struct Signal {
     state: Mutex<SignalState>,
     changed: Condvar,
+    producer: OnceLock<ProducerIdentity>,
+}
+
+struct ProducerIdentity {
+    runtime: u64,
+    record: u64,
+    scheduler: Weak<crate::scheduler::OwnedScheduler>,
 }
 
 impl Signal {
@@ -66,6 +73,7 @@ impl Signal {
                 next_subscriber: 1,
             }),
             changed: Condvar::new(),
+            producer: OnceLock::new(),
         }
     }
 
@@ -107,6 +115,51 @@ pub struct SWCompletion {
 }
 
 impl SWCompletion {
+    pub(crate) fn producer_identity(&self) -> Option<(u64, u64)> {
+        self.signal
+            .producer
+            .get()
+            .map(|producer| (producer.runtime, producer.record))
+    }
+
+    /// Retains independent consumer interest while this producer is pending.
+    /// Dropping demand never cancels the producer or releases a retained result.
+    pub fn demand(
+        &self,
+        priority: crate::scheduler::SWPriority,
+    ) -> Result<crate::scheduler::SWDemand, crate::scheduler::SWDemandError> {
+        let producer = self
+            .signal
+            .producer
+            .get()
+            .ok_or(crate::scheduler::SWDemandError::Closed)?;
+        let scheduler = producer
+            .scheduler
+            .upgrade()
+            .ok_or(crate::scheduler::SWDemandError::Closed)?;
+        scheduler.attach_demand(producer.record, priority)
+    }
+
+    /// Retains consumer interest in a separate work set until this producer
+    /// completes, the set is cancelled, or the demand handle is dropped.
+    /// Detaching this interest never cancels the shared producer.
+    pub fn demand_in(
+        &self,
+        set: &crate::scheduler::SWWorkSet,
+        priority: crate::scheduler::SWPriority,
+    ) -> Result<crate::scheduler::SWDemand, crate::scheduler::SWDemandError> {
+        let producer = self
+            .signal
+            .producer
+            .get()
+            .ok_or(crate::scheduler::SWDemandError::Closed)?;
+        let lease = set
+            .try_consumer_lease(producer.runtime)
+            .map_err(|_| crate::scheduler::SWDemandError::Closed)?;
+        let demand = self.demand(priority)?;
+        Ok(demand.bind_consumer(lease, self))
+    }
+
     pub fn status(&self) -> Option<SWTaskStatus> {
         self.signal.lock().status
     }
@@ -262,6 +315,25 @@ pub struct SWTask<T: Send + 'static> {
 }
 
 impl<T: Send + 'static> SWTask<T> {
+    pub(crate) fn set_producer(
+        &self,
+        runtime: u64,
+        record: u64,
+        scheduler: Weak<crate::scheduler::OwnedScheduler>,
+    ) {
+        assert!(
+            self.cell
+                .signal
+                .producer
+                .set(ProducerIdentity {
+                    runtime,
+                    record,
+                    scheduler
+                })
+                .is_ok(),
+            "producer installed once before publication"
+        );
+    }
     pub(crate) fn continuation_input_available(&self) -> bool {
         self.cell.continuation_input_available()
     }

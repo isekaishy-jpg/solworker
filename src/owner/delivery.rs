@@ -10,6 +10,9 @@ use std::sync::{Arc, Mutex, Weak};
 
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
 
+use crate::owner::SWOwnerError;
+use crate::scheduler::reservation::SWReservationPool;
+use crate::scheduler::{SWCost, SWReservation, SWReservationError};
 use crate::task::{SWCompletion, Subscription};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -65,6 +68,14 @@ struct RecordState {
     notified: bool,
     committed: bool,
     subscription: Option<Subscription>,
+    capacity: Option<SWReservation>,
+    accounted: bool,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum EndpointKind {
+    Ordinary,
+    Protected,
 }
 
 struct Record {
@@ -73,6 +84,7 @@ struct Record {
     state: Mutex<RecordState>,
     sender: Sender<NotificationMessage>,
     transport: Weak<Transport>,
+    endpoint: EndpointKind,
 }
 
 impl Record {
@@ -143,11 +155,15 @@ struct TransportState {
     closed: bool,
     next_id: u64,
     records: HashMap<u64, Arc<Record>>,
+    ordinary_records: usize,
+    protected_records: usize,
 }
 
 /// The owner-side transport. Its receiver stays on the owner thread.
 pub(super) struct Transport {
-    capacity: usize,
+    ordinary_capacity: usize,
+    protected_capacity: usize,
+    capacity_pool: Option<SWReservationPool>,
     runtime_identity: u64,
     sender: Sender<NotificationMessage>,
     receiver: Receiver<NotificationMessage>,
@@ -155,10 +171,29 @@ pub(super) struct Transport {
 }
 
 impl Transport {
+    pub(super) fn runtime_identity(&self) -> u64 {
+        self.runtime_identity
+    }
+
+    #[cfg(test)]
     pub(super) fn new(capacity: NonZeroUsize, runtime_identity: u64) -> Arc<Self> {
-        let (sender, receiver) = bounded(capacity.get());
+        Self::new_with_capacity(capacity, runtime_identity, None)
+    }
+
+    pub(super) fn new_with_capacity(
+        ordinary_capacity: NonZeroUsize,
+        runtime_identity: u64,
+        capacity_pool: Option<SWReservationPool>,
+    ) -> Arc<Self> {
+        let protected_capacity = capacity_pool
+            .as_ref()
+            .map_or(0, SWReservationPool::required_delivery_capacity);
+        let (sender, receiver) =
+            bounded(ordinary_capacity.get().saturating_add(protected_capacity));
         Arc::new(Self {
-            capacity: capacity.get(),
+            ordinary_capacity: ordinary_capacity.get(),
+            protected_capacity,
+            capacity_pool,
             runtime_identity,
             sender,
             receiver,
@@ -166,13 +201,64 @@ impl Transport {
                 closed: false,
                 next_id: 1,
                 records: HashMap::new(),
+                ordinary_records: 0,
+                protected_records: 0,
             }),
         })
     }
 
     pub(super) fn reserve(self: &Arc<Self>) -> Option<Reservation> {
+        let charge = match &self.capacity_pool {
+            Some(pool) => Some(pool.try_reserve_ordinary(SWCost::new(0, 0, 1, 0)).ok()?),
+            None => None,
+        };
+        self.reserve_with_charge(EndpointKind::Ordinary, charge)
+    }
+
+    pub(super) fn reserve_reserved(
+        self: &Arc<Self>,
+        reservation: &SWReservation,
+    ) -> Result<Reservation, SWOwnerError> {
+        if reservation.runtime_identity() != self.runtime_identity {
+            return Err(SWOwnerError::InvalidContext);
+        }
+        if self.capacity_pool.is_none() {
+            return Err(SWOwnerError::InvalidContext);
+        }
+        let charge = reservation
+            .stage(SWCost::new(0, 0, 1, 0))
+            .map_err(|error| match error {
+                SWReservationError::Closed => SWOwnerError::Closed,
+                SWReservationError::Full
+                | SWReservationError::TooLarge
+                | SWReservationError::InsufficientCredits => SWOwnerError::Full,
+            })?;
+        let endpoint = if reservation.is_required() {
+            EndpointKind::Protected
+        } else {
+            EndpointKind::Ordinary
+        };
+        self.reserve_with_charge(endpoint, Some(charge))
+            .ok_or_else(|| {
+                if self.is_closed() {
+                    SWOwnerError::Closed
+                } else {
+                    SWOwnerError::Full
+                }
+            })
+    }
+
+    fn reserve_with_charge(
+        self: &Arc<Self>,
+        endpoint: EndpointKind,
+        charge: Option<SWReservation>,
+    ) -> Option<Reservation> {
         let mut state = self.state.lock().unwrap();
-        if state.closed || state.records.len() >= self.capacity {
+        let full = match endpoint {
+            EndpointKind::Ordinary => state.ordinary_records >= self.ordinary_capacity,
+            EndpointKind::Protected => state.protected_records >= self.protected_capacity,
+        };
+        if state.closed || full {
             return None;
         }
         let id = state.next_id;
@@ -186,11 +272,18 @@ impl Transport {
                 notified: false,
                 committed: false,
                 subscription: None,
+                accounted: charge.is_some(),
+                capacity: charge,
             }),
             sender: self.sender.clone(),
             transport: Arc::downgrade(self),
+            endpoint,
         });
         state.records.insert(id, Arc::clone(&record));
+        match endpoint {
+            EndpointKind::Ordinary => state.ordinary_records += 1,
+            EndpointKind::Protected => state.protected_records += 1,
+        }
         Some(Reservation {
             notifier: Notifier {
                 inner: Arc::new(NotifierInner {
@@ -324,6 +417,24 @@ pub(crate) enum TicketCommitError {
 }
 
 impl SWDeliveryTicket {
+    pub(crate) fn is_accounted(&self) -> bool {
+        self.notifier.inner.record.state.lock().unwrap().accounted
+    }
+
+    pub(crate) fn attach_capacity(&self, capacity: SWReservation) {
+        let mut state = self.notifier.inner.record.state.lock().unwrap();
+        if !state.status.is_settled() {
+            assert!(
+                state.capacity.is_none(),
+                "delivery capacity already attached"
+            );
+            state.accounted = true;
+            state.capacity = Some(capacity);
+        } else {
+            drop(state);
+            drop(capacity);
+        }
+    }
     pub(crate) fn runtime_identity(&self) -> u64 {
         self.notifier.inner.record.runtime_identity
     }
@@ -435,20 +546,22 @@ impl Notification {
             ),
             "only terminal delivery states settle"
         );
-        let subscription = {
+        let (subscription, capacity) = {
             let mut state = self.message.pin.state.lock().unwrap();
             assert_eq!(state.status, SWDeliveryStatus::Claimed);
             state.status = status;
-            state.subscription.take()
+            (state.subscription.take(), state.capacity.take())
         };
         drop(subscription);
+        drop(capacity);
         if let Some(transport) = self.message.pin.transport.upgrade() {
-            transport
-                .state
-                .lock()
-                .unwrap()
-                .records
-                .remove(&self.message.id);
+            let mut state = transport.state.lock().unwrap();
+            if state.records.remove(&self.message.id).is_some() {
+                match self.message.pin.endpoint {
+                    EndpointKind::Ordinary => state.ordinary_records -= 1,
+                    EndpointKind::Protected => state.protected_records -= 1,
+                }
+            }
         }
     }
 }

@@ -15,6 +15,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use crate::runtime::{OwnerCallbackGuard, OwnerRegistration, RuntimeControl};
+use crate::scheduler::SWReservation;
+use crate::scheduler::work_set::{SWDiscoveryPermit, SWWorkSet, WorkSetLease};
 use crate::{SWCompletion, SWExecutionError, SWOutcome, SWShared, SWTaskStatus};
 pub(crate) use delivery::TicketCommitError;
 use delivery::{ClaimResult, Notification, Reservation, Transport};
@@ -65,6 +67,7 @@ struct LocalDelivery<O> {
     phase: SWPhase,
     callback: Box<dyn FnOnce(&mut O)>,
     subscription: Option<crate::task::Subscription>,
+    work_set: Option<WorkSetLease>,
 }
 
 /// Returned by a promised local delivery reservation. The ticket is Send and
@@ -114,7 +117,11 @@ impl<O> SWOwner<O> {
         state: O,
         capacity: NonZeroUsize,
     ) -> Result<Self, SWOwnerError> {
-        let transport = Transport::new(capacity, control.identity());
+        let pool = control
+            .owned_scheduler()
+            .ok()
+            .and_then(|scheduler| scheduler.capacity.clone());
+        let transport = Transport::new_with_capacity(capacity, control.identity(), pool);
         let for_close = Arc::clone(&transport);
         let registration = control
             .register_owner(Arc::new(move || for_close.close()))
@@ -204,18 +211,51 @@ impl<O> SWOwner<O> {
     where
         F: FnOnce(&mut O) + 'static,
     {
+        self.reserve_with_lease(phase, callback, None)
+    }
+
+    fn reserve_with_lease<F>(
+        &mut self,
+        phase: SWPhase,
+        callback: F,
+        work_set: Option<WorkSetLease>,
+    ) -> Result<Reservation, SWOwnerRejected<F>>
+    where
+        F: FnOnce(&mut O) + 'static,
+    {
+        self.reserve_with_capacity(phase, callback, work_set, None)
+    }
+
+    fn reserve_with_capacity<F>(
+        &mut self,
+        phase: SWPhase,
+        callback: F,
+        work_set: Option<WorkSetLease>,
+        capacity: Option<&SWReservation>,
+    ) -> Result<Reservation, SWOwnerRejected<F>>
+    where
+        F: FnOnce(&mut O) + 'static,
+    {
         if let Err(reason) = self.accept() {
             return Err(SWOwnerRejected { reason, callback });
         }
-        let Some(reservation) = self.transport.reserve() else {
-            return Err(SWOwnerRejected {
-                reason: if self.transport.is_closed() {
-                    SWOwnerError::Closed
-                } else {
-                    SWOwnerError::Full
-                },
-                callback,
-            });
+        let reservation = if let Some(capacity) = capacity {
+            match self.transport.reserve_reserved(capacity) {
+                Ok(reservation) => reservation,
+                Err(reason) => return Err(SWOwnerRejected { reason, callback }),
+            }
+        } else {
+            let Some(reservation) = self.transport.reserve() else {
+                return Err(SWOwnerRejected {
+                    reason: if self.transport.is_closed() {
+                        SWOwnerError::Closed
+                    } else {
+                        SWOwnerError::Full
+                    },
+                    callback,
+                });
+            };
+            reservation
         };
         self.callbacks.insert(
             reservation.id(),
@@ -223,6 +263,7 @@ impl<O> SWOwner<O> {
                 phase,
                 callback: Box::new(callback),
                 subscription: None,
+                work_set,
             },
         );
         Ok(reservation)
@@ -239,10 +280,139 @@ impl<O> SWOwner<O> {
     where
         F: FnOnce(&mut O) + 'static,
     {
-        let reservation = self.reserve(phase, callback)?;
+        self.prepare_with_capacity(None, None, phase, callback)
+    }
+
+    /// Reserves a promised delivery from a pipeline's delivery credits.
+    /// The callback stays owner-local and its credit lasts through settlement.
+    pub fn prepare_delivery_reserved<F>(
+        &mut self,
+        reservation: &SWReservation,
+        phase: SWPhase,
+        callback: F,
+    ) -> Result<SWPreparedDelivery, SWOwnerRejected<F>>
+    where
+        F: FnOnce(&mut O) + 'static,
+    {
+        self.prepare_with_capacity(None, Some(reservation), phase, callback)
+    }
+
+    /// Reserves a delivery owned by a consumer work set. Cancellation of that
+    /// set suppresses this unclaimed callback without cancelling its producer.
+    pub fn prepare_delivery_in<F>(
+        &mut self,
+        set: &SWWorkSet,
+        phase: SWPhase,
+        callback: F,
+    ) -> Result<SWPreparedDelivery, SWOwnerRejected<F>>
+    where
+        F: FnOnce(&mut O) + 'static,
+    {
+        let lease = match set.try_consumer_lease(self.transport.runtime_identity()) {
+            Ok(lease) => lease,
+            Err(_) => {
+                return Err(SWOwnerRejected {
+                    reason: SWOwnerError::Closed,
+                    callback,
+                });
+            }
+        };
+        self.prepare_with_capacity(Some(lease), None, phase, callback)
+    }
+
+    /// Reserves a consumer-owned promised delivery from a pipeline's credits.
+    pub fn prepare_delivery_reserved_in<F>(
+        &mut self,
+        set: &SWWorkSet,
+        reservation: &SWReservation,
+        phase: SWPhase,
+        callback: F,
+    ) -> Result<SWPreparedDelivery, SWOwnerRejected<F>>
+    where
+        F: FnOnce(&mut O) + 'static,
+    {
+        let lease = match set.try_consumer_lease(self.transport.runtime_identity()) {
+            Ok(lease) => lease,
+            Err(_) => {
+                return Err(SWOwnerRejected {
+                    reason: SWOwnerError::Closed,
+                    callback,
+                });
+            }
+        };
+        self.prepare_with_capacity(Some(lease), Some(reservation), phase, callback)
+    }
+
+    /// Reserves a promised descendant delivery using an existing discoverer.
+    pub fn prepare_delivery_from<F>(
+        &mut self,
+        permit: &SWDiscoveryPermit,
+        phase: SWPhase,
+        callback: F,
+    ) -> Result<SWPreparedDelivery, SWOwnerRejected<F>>
+    where
+        F: FnOnce(&mut O) + 'static,
+    {
+        let lease = match permit.try_child_lease(self.transport.runtime_identity()) {
+            Ok(lease) => lease,
+            Err(_) => {
+                return Err(SWOwnerRejected {
+                    reason: SWOwnerError::Closed,
+                    callback,
+                });
+            }
+        };
+        self.prepare_with_capacity(Some(lease), None, phase, callback)
+    }
+
+    /// Reserves a descendant consumer delivery from a pipeline's credits.
+    pub fn prepare_delivery_reserved_from<F>(
+        &mut self,
+        permit: &SWDiscoveryPermit,
+        reservation: &SWReservation,
+        phase: SWPhase,
+        callback: F,
+    ) -> Result<SWPreparedDelivery, SWOwnerRejected<F>>
+    where
+        F: FnOnce(&mut O) + 'static,
+    {
+        let lease = match permit.try_child_lease(self.transport.runtime_identity()) {
+            Ok(lease) => lease,
+            Err(_) => {
+                return Err(SWOwnerRejected {
+                    reason: SWOwnerError::Closed,
+                    callback,
+                });
+            }
+        };
+        self.prepare_with_capacity(Some(lease), Some(reservation), phase, callback)
+    }
+
+    fn prepare_with_capacity<F>(
+        &mut self,
+        lease: Option<WorkSetLease>,
+        capacity: Option<&SWReservation>,
+        phase: SWPhase,
+        callback: F,
+    ) -> Result<SWPreparedDelivery, SWOwnerRejected<F>>
+    where
+        F: FnOnce(&mut O) + 'static,
+    {
+        let reservation = self.reserve_with_capacity(phase, callback, lease, capacity)?;
+        let control = reservation.control();
+        if let Some(lease) = self
+            .callbacks
+            .get(&reservation.id())
+            .and_then(|entry| entry.work_set.as_ref())
+        {
+            let cancel = control.clone();
+            lease.register_cancel(Box::new(move || {
+                cancel.cancel();
+            }));
+        }
         Ok(SWPreparedDelivery {
             delivery: reservation.observer(),
-            control: reservation.control(),
+            control,
             ticket: reservation.ticket(),
         })
     }
@@ -274,18 +444,131 @@ impl<O> SWOwner<O> {
     where
         F: FnOnce(&mut O, SWTaskStatus) + 'static,
     {
+        self.on_ready_with_lease(completion, phase, callback, None, None)
+    }
+
+    /// Attaches a consumer-owned delivery to an outcome. Cancelling this set only
+    /// suppresses its callback; other consumers and the producer remain live.
+    pub fn on_ready_in<F>(
+        &mut self,
+        set: &SWWorkSet,
+        completion: &SWCompletion,
+        phase: SWPhase,
+        callback: F,
+    ) -> Result<(SWDelivery, SWDeliveryControl), SWOwnerRejected<F>>
+    where
+        F: FnOnce(&mut O, SWTaskStatus) + 'static,
+    {
+        let lease = match set.try_consumer_lease(self.transport.runtime_identity()) {
+            Ok(lease) => lease,
+            Err(_) => {
+                return Err(SWOwnerRejected {
+                    reason: SWOwnerError::Closed,
+                    callback,
+                });
+            }
+        };
+        self.on_ready_with_lease(completion, phase, callback, Some(lease), None)
+    }
+
+    /// Subscribes to an existing outcome using reserved delivery capacity.
+    /// Pending and already-ready outcomes both notify through the owner pump;
+    /// no CPU job is created. Rejection returns the uninvoked callback and
+    /// restores any provisionally checked-out reservation credits.
+    pub fn on_ready_reserved<F>(
+        &mut self,
+        reservation: &SWReservation,
+        completion: &SWCompletion,
+        phase: SWPhase,
+        callback: F,
+    ) -> Result<(SWDelivery, SWDeliveryControl), SWOwnerRejected<F>>
+    where
+        F: FnOnce(&mut O, SWTaskStatus) + 'static,
+    {
+        self.on_ready_with_lease(completion, phase, callback, None, Some(reservation))
+    }
+
+    /// A reserved subscription owned by a consumer set, independent of the
+    /// producer's set. Its credit and set count last through owner-local cleanup.
+    pub fn on_ready_reserved_in<F>(
+        &mut self,
+        set: &SWWorkSet,
+        reservation: &SWReservation,
+        completion: &SWCompletion,
+        phase: SWPhase,
+        callback: F,
+    ) -> Result<(SWDelivery, SWDeliveryControl), SWOwnerRejected<F>>
+    where
+        F: FnOnce(&mut O, SWTaskStatus) + 'static,
+    {
+        let lease = match set.try_consumer_lease(self.transport.runtime_identity()) {
+            Ok(lease) => lease,
+            Err(_) => {
+                return Err(SWOwnerRejected {
+                    reason: SWOwnerError::Closed,
+                    callback,
+                });
+            }
+        };
+        self.on_ready_with_lease(completion, phase, callback, Some(lease), Some(reservation))
+    }
+
+    /// Attaches a reserved descendant subscription after the consumer set has
+    /// sealed. Cancelling that set suppresses only this consumer's publication.
+    pub fn on_ready_reserved_from<F>(
+        &mut self,
+        permit: &SWDiscoveryPermit,
+        reservation: &SWReservation,
+        completion: &SWCompletion,
+        phase: SWPhase,
+        callback: F,
+    ) -> Result<(SWDelivery, SWDeliveryControl), SWOwnerRejected<F>>
+    where
+        F: FnOnce(&mut O, SWTaskStatus) + 'static,
+    {
+        let lease = match permit.try_child_lease(self.transport.runtime_identity()) {
+            Ok(lease) => lease,
+            Err(_) => {
+                return Err(SWOwnerRejected {
+                    reason: SWOwnerError::Closed,
+                    callback,
+                });
+            }
+        };
+        self.on_ready_with_lease(completion, phase, callback, Some(lease), Some(reservation))
+    }
+
+    fn on_ready_with_lease<F>(
+        &mut self,
+        completion: &SWCompletion,
+        phase: SWPhase,
+        callback: F,
+        work_set: Option<WorkSetLease>,
+        capacity: Option<&SWReservation>,
+    ) -> Result<(SWDelivery, SWDeliveryControl), SWOwnerRejected<F>>
+    where
+        F: FnOnce(&mut O, SWTaskStatus) + 'static,
+    {
         if let Err(reason) = self.accept() {
             return Err(SWOwnerRejected { reason, callback });
         }
-        let Some(reservation) = self.transport.reserve() else {
-            return Err(SWOwnerRejected {
-                reason: if self.transport.is_closed() {
-                    SWOwnerError::Closed
-                } else {
-                    SWOwnerError::Full
-                },
-                callback,
-            });
+        let reservation = if let Some(capacity) = capacity {
+            match self.transport.reserve_reserved(capacity) {
+                Ok(reservation) => reservation,
+                Err(reason) => return Err(SWOwnerRejected { reason, callback }),
+            }
+        } else {
+            let Some(reservation) = self.transport.reserve() else {
+                return Err(SWOwnerRejected {
+                    reason: if self.transport.is_closed() {
+                        SWOwnerError::Closed
+                    } else {
+                        SWOwnerError::Full
+                    },
+                    callback,
+                });
+            };
+            reservation
         };
         let observed = completion.clone();
         self.callbacks.insert(
@@ -299,6 +582,7 @@ impl<O> SWOwner<O> {
                     callback(state, status);
                 }),
                 subscription: None,
+                work_set,
             },
         );
         let id = reservation.id();
@@ -310,6 +594,16 @@ impl<O> SWOwner<O> {
             .get_mut(&id)
             .expect("reserved callback remains local")
             .subscription = Some(subscription);
+        if let Some(lease) = self
+            .callbacks
+            .get(&id)
+            .and_then(|entry| entry.work_set.as_ref())
+        {
+            let cancel = control.clone();
+            lease.register_cancel(Box::new(move || {
+                cancel.cancel();
+            }));
+        }
         Ok((observer, control))
     }
 
@@ -367,6 +661,7 @@ impl<O> SWOwner<O> {
                         phase,
                         callback,
                         subscription: None,
+                        work_set: None,
                     },
                 );
             }
@@ -453,6 +748,7 @@ impl<O> SWOwner<O> {
         // Detach unresolved prerequisite capture before callback/destructor
         // cleanup, outside transport synchronization.
         entry.subscription.take();
+        let work_set = entry.work_set.take();
         // The synchronized claim is the cutoff, including runtime abandonment.
         // Rechecking transport closure here would retract an accepted claim.
         if claimed == ClaimResult::Suppress {
@@ -461,6 +757,7 @@ impl<O> SWOwner<O> {
                 drop(entry);
             }
             notification.settle(SWDeliveryStatus::Suppressed);
+            drop(work_set);
             report.suppressed += 1;
             // Local destructors may request teardown just like callbacks.
             self.finish_close_request();
@@ -483,6 +780,7 @@ impl<O> SWOwner<O> {
                 self.fault();
             }
         }
+        drop(work_set);
         self.finish_close_request();
     }
 
@@ -515,11 +813,16 @@ impl<O> SWOwner<O> {
         while let Some(notification) = self.pending.pop_front() {
             let id = notification.id();
             notification.claim();
-            if let Some(entry) = self.callbacks.remove(&id) {
+            let work_set = if let Some(mut entry) = self.callbacks.remove(&id) {
+                let work_set = entry.work_set.take();
                 let _guard = OwnerCallbackGuard::enter();
                 drop(entry);
-            }
+                work_set
+            } else {
+                None
+            };
             notification.settle(SWDeliveryStatus::Suppressed);
+            drop(work_set);
         }
     }
 
@@ -535,6 +838,7 @@ impl<O> SWOwner<O> {
                     phase,
                     callback,
                     subscription: None,
+                    work_set: None,
                 },
             );
         }

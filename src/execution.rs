@@ -5,6 +5,10 @@ mod delivery;
 pub(crate) mod group;
 mod owned;
 mod scope;
+mod work_set;
+pub use work_set::SWWorkOptions;
+mod stage;
+pub use stage::{SWStageOptions, SWStageRejected, SWStageResult};
 
 pub use context::SWExecutionError;
 pub use delivery::{SWDeliveryOptions, SWDeliverySpawnRejected, SWDeliverySpawnResult};

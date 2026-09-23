@@ -8,7 +8,8 @@
 mod admission;
 mod demand;
 mod ready;
-mod work_set;
+pub(crate) mod reservation;
+pub(crate) mod work_set;
 
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
@@ -28,7 +29,27 @@ pub use admission::{
     SWCallerEligibility, SWDependencyPolicy, SWOwnedConfigError, SWOwnedLimits, SWSpawnError,
     SWSpawnOptions, SWSpawnRejected, SWSpawnResult,
 };
+use demand::DemandState;
+pub use demand::{SWDemand, SWDemandError, SWDemandSnapshot, SWPriority};
 use ready::ReadyQueues;
+use reservation::SWReservationPool;
+pub use reservation::{
+    SWByteLease, SWCapacityUsage, SWCost, SWLimitError, SWLimits, SWReservation, SWReservationError,
+};
+use work_set::WorkSetLease;
+pub use work_set::{SWDiscoveryError, SWDiscoveryPermit, SWWorkSet, SWWorkSetProgress};
+
+#[cfg(test)]
+#[path = "../tests/unit/demand.rs"]
+mod demand_tests;
+
+#[derive(Default)]
+pub(crate) struct SubmitExtras {
+    work_set: Option<WorkSetLease>,
+    capacity: Option<SWReservation>,
+    priority: Option<SWPriority>,
+    reserved: bool,
+}
 
 type Finish = Box<dyn FnOnce() + Send>;
 type Envelope = Box<dyn FnOnce(Decision) -> Finish + Send>;
@@ -137,6 +158,9 @@ struct Record {
     attaching: bool,
     deferred_finish: Option<Finish>,
     admission: OwnedAdmission,
+    work_set: Option<WorkSetLease>,
+    capacity: Option<SWReservation>,
+    resource: bool,
 }
 
 pub(crate) struct SubmitRequest<'a> {
@@ -157,6 +181,7 @@ struct State {
     ready: ReadyQueues,
     deferred: [VecDeque<u64>; 3],
     abandoned: bool,
+    demand: DemandState,
 }
 
 /// One control domain for admission, dependencies, claims and terminal cleanup.
@@ -164,21 +189,174 @@ pub(crate) struct OwnedScheduler {
     control: Weak<RuntimeControl>,
     limits: SWOwnedLimits,
     state: Mutex<State>,
+    pub(crate) capacity: Option<SWReservationPool>,
 }
 
 impl OwnedScheduler {
-    pub(crate) fn new(control: Weak<RuntimeControl>, limits: SWOwnedLimits) -> Arc<Self> {
+    fn push_ready(state: &mut State, class: SWExecutionClass, id: u64) {
+        if state.records.get(&id).is_some_and(|record| record.resource) {
+            let selection = state
+                .demand
+                .selection(id)
+                .expect("admitted resource demand");
+            state.ready.push_resource(class, id, selection);
+        } else {
+            state.ready.push(class, id);
+        }
+    }
+
+    pub(crate) fn prepare_stage(
+        &self,
+        runtime: u64,
+        options: &crate::execution::SWStageOptions<'_>,
+    ) -> Result<(SubmitExtras, Option<SWByteLease>), SWSpawnError> {
+        if options.work_set.is_some() && options.discovery.is_some() {
+            return Err(SWSpawnError::InvalidContext);
+        }
+        let work_set = match (options.work_set, options.discovery) {
+            (Some(set), _) => Some(set.try_root_lease(runtime)),
+            (_, Some(permit)) => Some(permit.try_child_lease(runtime)),
+            _ => None,
+        }
+        .transpose()
+        .map_err(|error| match error {
+            SWDiscoveryError::Full => SWSpawnError::Full,
+            _ => SWSpawnError::Closed,
+        })?;
+        let cost = SWCost::new(
+            options.cost.records.max(1),
+            options.cost.edges.max(options.prerequisites.len()),
+            options
+                .cost
+                .deliveries
+                .max(usize::from(options.delivery.is_some()))
+                - usize::from(
+                    options
+                        .delivery
+                        .as_ref()
+                        .is_some_and(|ticket| ticket.is_accounted()),
+                ),
+            options.cost.bytes,
+        );
+        if options.retained_bytes > cost.bytes {
+            return Err(SWSpawnError::TooLarge);
+        }
+        let capacity = if let Some(reservation) = options.reservation {
+            if reservation.runtime_identity() != runtime {
+                return Err(SWSpawnError::InvalidReservation);
+            }
+            Some(reservation.stage(cost).map_err(map_reservation_error)?)
+        } else if let Some(pool) = &self.capacity {
+            Some(
+                pool.try_reserve_ordinary(cost)
+                    .map_err(map_reservation_error)?,
+            )
+        } else {
+            if cost.bytes != 0 {
+                return Err(SWSpawnError::Disabled);
+            }
+            None
+        };
+        let bytes = if options.retained_bytes != 0 {
+            Some(
+                capacity
+                    .as_ref()
+                    .expect("retained bytes require capacity")
+                    .retain_bytes(options.retained_bytes)
+                    .map_err(map_reservation_error)?,
+            )
+        } else {
+            None
+        };
+        Ok((
+            SubmitExtras {
+                work_set,
+                capacity,
+                priority: options.priority,
+                reserved: options.reservation.is_some(),
+            },
+            bytes,
+        ))
+    }
+
+    pub(crate) fn attach_demand(
+        self: &Arc<Self>,
+        id: u64,
+        priority: SWPriority,
+    ) -> Result<SWDemand, SWDemandError> {
+        let lease = {
+            let mut state = self.lock();
+            if state.abandoned {
+                return Err(SWDemandError::Closed);
+            }
+            state.demand.attach(id, priority)?
+        };
+        let scheduler = Arc::downgrade(self);
+        let demand = SWDemand::new(
+            lease,
+            Arc::new(move |id, command| {
+                let scheduler = scheduler.upgrade().ok_or(SWDemandError::Closed)?;
+                scheduler.lock().demand.change(id, command)?;
+                scheduler.service_demand(32);
+                Ok(())
+            }),
+        );
+        self.service_demand(32);
+        Ok(demand)
+    }
+
+    fn service_demand_chunk(&self, budget: usize) {
+        let providers = {
+            let mut state = self.lock();
+            let changes = state.demand.service(budget);
+            let mut providers = Vec::new();
+            for change in changes {
+                if let Some(record) = state.records.get(&change.id)
+                    && record.resource
+                    && record.stage == Stage::Ready
+                {
+                    let class = record.class;
+                    state
+                        .ready
+                        .update_resource(class, change.id, change.selection);
+                }
+                if let Some(provider) = change.provider {
+                    providers.push(provider);
+                }
+            }
+            providers
+        };
+        for (provider, snapshot) in providers {
+            provider(snapshot);
+        }
+    }
+
+    pub(crate) fn service_demand(self: &Arc<Self>, budget: usize) -> bool {
+        self.service_demand_chunk(budget);
+        self.dispatch_ready();
+        self.lock().demand.pending_updates()
+    }
+
+    pub(crate) fn new(
+        control: Weak<RuntimeControl>,
+        limits: SWOwnedLimits,
+        capacity: Option<SWReservationPool>,
+        priorities: Vec<SWPriority>,
+        demand_leases: usize,
+    ) -> Arc<Self> {
         Arc::new(Self {
             control,
             limits,
+            capacity,
             state: Mutex::new(State {
                 records: HashMap::new(),
                 next_id: 1,
                 next_group: 1,
                 edges: 0,
-                ready: ReadyQueues::new(),
+                ready: ReadyQueues::with_priorities(&priorities),
                 deferred: std::array::from_fn(|_| VecDeque::new()),
                 abandoned: false,
+                demand: DemandState::new(priorities, demand_leases),
             }),
         })
     }
@@ -237,6 +415,46 @@ impl OwnedScheduler {
         P: Send + 'static,
         T: Send + 'static,
     {
+        self.submit_payload_accounted(
+            request,
+            payload,
+            run,
+            application_failed,
+            delivery,
+            SubmitExtras::default(),
+        )
+    }
+
+    pub(crate) fn submit_payload_in_set<P: Send + 'static, T: Send + 'static>(
+        self: &Arc<Self>,
+        request: SubmitRequest<'_>,
+        payload: P,
+        run: fn(P) -> T,
+        application_failed: fn(&T) -> bool,
+        lease: WorkSetLease,
+    ) -> SWSpawnResult<T, P> {
+        self.submit_payload_accounted(
+            request,
+            payload,
+            run,
+            application_failed,
+            &mut None,
+            SubmitExtras {
+                work_set: Some(lease),
+                ..SubmitExtras::default()
+            },
+        )
+    }
+
+    pub(crate) fn submit_payload_accounted<P: Send + 'static, T: Send + 'static>(
+        self: &Arc<Self>,
+        request: SubmitRequest<'_>,
+        payload: P,
+        run: fn(P) -> T,
+        application_failed: fn(&T) -> bool,
+        delivery: &mut Option<crate::owner::SWDeliveryTicket>,
+        mut extras: SubmitExtras,
+    ) -> SWSpawnResult<T, P> {
         let SubmitRequest {
             control,
             class,
@@ -260,9 +478,32 @@ impl OwnedScheduler {
                 return Err(reject(SWSpawnError::InvalidContext, payload));
             }
         };
+        if extras.capacity.is_none()
+            && let Some(capacity) = &self.capacity
+        {
+            match capacity.try_reserve_ordinary(SWCost::new(
+                1,
+                prerequisites.len(),
+                usize::from(
+                    delivery
+                        .as_ref()
+                        .is_some_and(|ticket| !ticket.is_accounted()),
+                ),
+                0,
+            )) {
+                Ok(charge) => extras.capacity = Some(charge),
+                Err(error) => return Err(reject(map_reservation_error(error), payload)),
+            }
+        }
         let mut state = self.lock();
         if state.abandoned {
             return Err(reject(SWSpawnError::Closed, payload));
+        }
+        if extras
+            .priority
+            .is_some_and(|priority| !state.demand.contains(priority))
+        {
+            return Err(reject(SWSpawnError::InvalidPriority, payload));
         }
         if prerequisites.len() > self.limits.edges {
             return Err(reject(SWSpawnError::TooLarge, payload));
@@ -303,12 +544,24 @@ impl OwnedScheduler {
             }
             return Err(reject(SWSpawnError::InvalidContext, payload));
         }
-        if saturated && !inline {
+        if saturated && !inline && !extras.reserved {
             if let Some(group) = &group_inner {
                 group.finish();
             }
             return Err(reject(SWSpawnError::Full, payload));
         }
+        let delivery_capacity = if delivery
+            .as_ref()
+            .is_some_and(|ticket| !ticket.is_accounted())
+        {
+            extras.capacity.as_ref().map(|capacity| {
+                capacity
+                    .stage(SWCost::new(0, 0, 1, 0))
+                    .expect("stage reserved promised delivery")
+            })
+        } else {
+            None
+        };
         if let Some(ticket) = delivery.as_mut() {
             let rejection = if ticket.runtime_identity() != control.identity() {
                 Some(SWSpawnError::InvalidDelivery)
@@ -330,7 +583,22 @@ impl OwnedScheduler {
         let id = state.next_id;
         state.next_id = id.checked_add(1).expect("owned record identity exhausted");
         let (task, sink) = SWTask::pending_pair();
+        task.set_producer(control.identity(), id, Arc::downgrade(self));
+        if state.demand.enabled() {
+            let parents = prerequisites
+                .iter()
+                .filter_map(|completion| completion.producer_identity())
+                .filter_map(|(runtime, record)| (runtime == control.identity()).then_some(record))
+                .collect::<Vec<_>>();
+            state
+                .demand
+                .register(id, extras.priority, &parents, None)
+                .expect("resource rank validated before commitment");
+        }
         if let Some(ticket) = delivery.take() {
+            if let Some(capacity) = delivery_capacity {
+                ticket.attach_capacity(capacity);
+            }
             // This new result cannot complete before the record is published.
             // Binding registers an internal notifier, never a user callback.
             // The delivery entitlement was committed before exposing CPU work.
@@ -343,12 +611,15 @@ impl OwnedScheduler {
             scheduler: Arc::downgrade(self),
             envelope: Mutex::new(Some(envelope)),
         });
-        let stage = if prerequisites.is_empty() {
-            Stage::Ready
-        } else {
+        let stage = if !prerequisites.is_empty() {
             Stage::Waiting
+        } else if saturated && !inline {
+            Stage::DeferredReady
+        } else {
+            Stage::Ready
         };
         state.edges += prerequisites.len();
+        let set_registration = extras.work_set.clone();
         state.records.insert(
             id,
             Record {
@@ -365,10 +636,15 @@ impl OwnedScheduler {
                 attaching: !prerequisites.is_empty(),
                 deferred_finish: None,
                 admission,
+                work_set: extras.work_set,
+                capacity: extras.capacity,
+                resource: extras.priority.is_some(),
             },
         );
         if stage == Stage::Ready {
-            state.ready.push(class, id);
+            Self::push_ready(&mut state, class, id);
+        } else if stage == Stage::DeferredReady {
+            state.deferred[class.index()].push_back(id);
         }
         drop(state);
         let weak = Arc::downgrade(self);
@@ -377,6 +653,9 @@ impl OwnedScheduler {
                 scheduler.suppress(id, SWTaskStatus::Cancelled);
             }
         }));
+        if let Some(registration) = set_registration {
+            registration.register_producer(producer.clone());
+        }
         for prerequisite in prerequisites {
             let weak = Arc::downgrade(self);
             let subscription = prerequisite.subscribe_cancelable(Box::new(move |status| {
@@ -442,7 +721,7 @@ impl OwnedScheduler {
                     .expect("activation retains record");
                 if has_slot {
                     record.stage = Stage::Ready;
-                    state.ready.push(class, id);
+                    Self::push_ready(&mut state, class, id);
                     group = ready_group;
                 } else {
                     record.stage = Stage::DeferredReady;
@@ -459,9 +738,12 @@ impl OwnedScheduler {
         self.dispatch();
     }
 
-    fn suppress(self: &Arc<Self>, id: u64, status: SWTaskStatus) {
+    fn suppress(self: &Arc<Self>, id: u64, mut status: SWTaskStatus) {
         let job = {
             let mut state = self.lock();
+            if state.abandoned {
+                status = SWTaskStatus::Abandoned;
+            }
             let Some(record) = state.records.get_mut(&id) else {
                 return;
             };
@@ -557,8 +839,55 @@ impl OwnedScheduler {
     }
 
     fn promote_locked(&self, state: &mut State, class: SWExecutionClass) {
+        if !state.deferred[class.index()].is_empty() {
+            // Ready and deferred-ready are both unhanded work. Refill the
+            // bounded runnable window from both so capacity pressure cannot
+            // freeze a background resource ahead of newly urgent work.
+            // Keep previously-ready ordinary entries before deferred ordinary
+            // entries, preserving their FIFO activation order.
+            let mut pending = VecDeque::new();
+            while let Some(id) = state.ready.pop(class) {
+                state
+                    .records
+                    .get_mut(&id)
+                    .expect("ready record exists")
+                    .stage = Stage::DeferredReady;
+                state.ready.runnable[class.index()] -= 1;
+                pending.push_back(id);
+            }
+            pending.append(&mut state.deferred[class.index()]);
+            state.deferred[class.index()] = pending;
+        }
         while state.ready.runnable[class.index()] < self.limits.runnable_for(class) {
-            let Some(id) = state.deferred[class.index()].pop_front() else {
+            let queue = &state.deferred[class.index()];
+            let ordinary = queue
+                .iter()
+                .enumerate()
+                .find(|(_, id)| state.records.get(id).is_some_and(|record| !record.resource))
+                .map(|(index, id)| (index, *id));
+            let resource = queue
+                .iter()
+                .enumerate()
+                .filter_map(|(index, id)| {
+                    let record = state.records.get(id)?;
+                    if !record.resource {
+                        return None;
+                    }
+                    let selection = state.demand.selection(*id)?;
+                    Some((
+                        index,
+                        *id,
+                        (!selection.active, selection.priority, selection.tie),
+                    ))
+                })
+                .min_by_key(|(_, _, key)| *key);
+            let index = match (ordinary, resource) {
+                (Some((index, id)), Some((_, resource, _))) if id < resource => Some(index),
+                (_, Some((index, _, _))) | (Some((index, _)), None) => Some(index),
+                (None, None) => None,
+            };
+            let Some(id) = index.and_then(|index| state.deferred[class.index()].remove(index))
+            else {
                 break;
             };
             let Some(record) = state.records.get_mut(&id) else {
@@ -571,7 +900,7 @@ impl OwnedScheduler {
             if let Some(group) = &record.group {
                 group.notify_ready();
             }
-            state.ready.push(class, id);
+            Self::push_ready(state, class, id);
         }
     }
 
@@ -647,24 +976,21 @@ impl OwnedScheduler {
     }
 
     fn finalize_record(self: &Arc<Self>, id: u64) {
-        let admission = {
+        let record = {
             let mut state = self.lock();
-            if let Some(group) = state
-                .records
-                .get(&id)
-                .and_then(|record| record.group.as_ref())
-            {
-                // Group completion is bookkeeping only. Commit it before
-                // releasing record/edge credit under this admission lock.
-                group.finish();
-            }
             let Some(record) = state.records.remove(&id) else {
                 return;
             };
             state.edges -= record.edges;
-            record.admission
+            state.demand.remove(id);
+            record
         };
-        drop(admission);
+        // Strong settlement follows capacity return, not just result readiness.
+        drop(record.capacity);
+        if let Some(group) = record.group {
+            group.finish();
+        }
+        drop((record.work_set, record.admission));
         self.dispatch();
     }
 
@@ -705,6 +1031,11 @@ impl OwnedScheduler {
     }
 
     fn dispatch(self: &Arc<Self>) {
+        self.service_demand_chunk(32);
+        self.dispatch_ready();
+    }
+
+    fn dispatch_ready(self: &Arc<Self>) {
         let Some(control) = self.control.upgrade() else {
             return;
         };
@@ -712,9 +1043,11 @@ impl OwnedScheduler {
             loop {
                 let job = {
                     let mut state = self.lock();
-                    if state.abandoned
-                        || state.ready.handed_off[class.index()] >= self.limits.handoff_for(class)
-                    {
+                    if state.abandoned {
+                        break;
+                    }
+                    self.promote_locked(&mut state, class);
+                    if state.ready.handed_off[class.index()] >= self.limits.handoff_for(class) {
                         break;
                     }
                     let Some(id) = state.ready.pop(class) else {
@@ -748,6 +1081,14 @@ impl OwnedScheduler {
                 }
             }
         }
+    }
+}
+
+fn map_reservation_error(error: SWReservationError) -> SWSpawnError {
+    match error {
+        SWReservationError::Full | SWReservationError::InsufficientCredits => SWSpawnError::Full,
+        SWReservationError::TooLarge => SWSpawnError::TooLarge,
+        SWReservationError::Closed => SWSpawnError::Closed,
     }
 }
 

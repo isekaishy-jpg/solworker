@@ -20,6 +20,7 @@ mod task;
 pub use execution::{
     SWBatchRejected, SWBranchOutcome, SWDeliveryOptions, SWDeliverySpawnRejected,
     SWDeliverySpawnResult, SWExecutionError, SWGroup, SWJoinRejected, SWLane, SWPanic,
+    SWStageOptions, SWStageRejected, SWStageResult, SWWorkOptions,
 };
 pub use owner::{
     SWCancelResult, SWDelivery, SWDeliveryControl, SWDeliveryStatus, SWDeliveryTicket, SWOwner,
@@ -32,10 +33,12 @@ pub use runtime::config::{
 };
 pub use runtime::{SWBuildError, SWRuntime, SWRuntimeBuilder, SWRuntimeState, SWShutdownError};
 pub use scheduler::{
-    SWCallerEligibility, SWDependencyPolicy, SWOwnedConfigError, SWOwnedLimits, SWSpawnError,
-    SWSpawnOptions, SWSpawnRejected, SWSpawnResult,
+    SWByteLease, SWCallerEligibility, SWCapacityUsage, SWCost, SWDemand, SWDemandError,
+    SWDemandSnapshot, SWDependencyPolicy, SWDiscoveryError, SWDiscoveryPermit, SWLimitError,
+    SWLimits, SWOwnedConfigError, SWOwnedLimits, SWPriority, SWReservation, SWReservationError,
+    SWSpawnError, SWSpawnOptions, SWSpawnRejected, SWSpawnResult, SWWorkSet, SWWorkSetProgress,
 };
 pub use task::{
-    SWCompletion, SWOutcome, SWOutcomeRef, SWProducerControl, SWShared, SWTask, SWTaskStatus,
-    SWThenRejected, SWThenResult, SWWaitError,
+    SWCompletion, SWOutcome, SWOutcomeRef, SWProducerControl, SWRetained, SWShared, SWTask,
+    SWTaskStatus, SWThenRejected, SWThenResult, SWWaitError,
 };

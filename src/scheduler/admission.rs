@@ -92,6 +92,8 @@ pub enum SWSpawnError {
     InvalidGroup,
     /// The promised delivery belongs to another runtime or was already used.
     InvalidDelivery,
+    InvalidPriority,
+    InvalidReservation,
     Consumed,
 }
 

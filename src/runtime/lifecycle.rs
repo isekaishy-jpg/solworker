@@ -181,6 +181,7 @@ struct ControlState {
     backend: Weak<BackendOwner>,
     owner_closers: HashMap<u64, Weak<dyn Fn() + Send + Sync>>,
     next_owner: u64,
+    work_sets: Vec<Weak<crate::scheduler::work_set::WorkSetInner>>,
 }
 
 /// Lanes retain admission state, but cannot keep an idle executor alive.
@@ -206,6 +207,7 @@ impl RuntimeControl {
                 backend: Arc::downgrade(backend),
                 owner_closers: HashMap::new(),
                 next_owner: 1,
+                work_sets: Vec::new(),
             }),
             changed: Condvar::new(),
             owned: OnceLock::new(),
@@ -218,6 +220,32 @@ impl RuntimeControl {
 
     pub(crate) fn identity(&self) -> u64 {
         self.id
+    }
+
+    pub(crate) fn work_set(
+        self: &Arc<Self>,
+        capacity: std::num::NonZeroUsize,
+    ) -> Result<crate::scheduler::SWWorkSet, SWSpawnError> {
+        let mut state = self.lock();
+        if state.phase != SWRuntimeState::Running {
+            return Err(SWSpawnError::Closed);
+        }
+        let set = crate::scheduler::SWWorkSet::new(self, capacity);
+        state.work_sets.retain(|set| set.strong_count() != 0);
+        state.work_sets.push(Arc::downgrade(&set.inner));
+        Ok(set)
+    }
+
+    pub(super) fn cancel_work_sets(&self) {
+        let sets = self
+            .lock()
+            .work_sets
+            .iter()
+            .filter_map(Weak::upgrade)
+            .collect::<Vec<_>>();
+        for set in sets {
+            set.cancel();
+        }
     }
 
     /// The closer contains only transferable transport bookkeeping, never O
@@ -319,7 +347,7 @@ impl RuntimeControl {
         })
     }
 
-    pub(super) fn phase(&self) -> SWRuntimeState {
+    pub(crate) fn phase(&self) -> SWRuntimeState {
         self.lock().phase
     }
 
@@ -354,6 +382,14 @@ impl RuntimeControl {
         let mut state = self.lock();
         if !state.owner_closers.is_empty() {
             return Err(SWShutdownError::LiveOwners);
+        }
+        if state
+            .work_sets
+            .iter()
+            .filter_map(Weak::upgrade)
+            .any(|set| !set.progress().is_drained())
+        {
+            return Err(SWShutdownError::LiveWorkSets);
         }
         state.phase = SWRuntimeState::Closing;
         while state.active != 0 {

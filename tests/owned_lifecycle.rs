@@ -165,12 +165,20 @@ fn abandonment_settles_unclaimed_work_without_waiting_for_running_work() {
             19usize
         })
         .unwrap();
+    let set = runtime
+        .work_set(std::num::NonZeroUsize::new(1).unwrap())
+        .unwrap();
+    let (set_queued, _) = set
+        .try_spawn(&low, SWSpawnOptions::default(), || 21usize)
+        .unwrap();
     runtime.abandon();
     let queued_status = queued.completion().wait_timeout(TIMEOUT).unwrap();
     let dropped_before_release = dropped.load(Ordering::SeqCst);
     let _ = release_tx.send(());
     assert_eq!(runtime.state(), SWRuntimeState::Abandoned);
     assert_eq!(queued_status, Some(SWTaskStatus::Abandoned));
+    assert_eq!(set_queued.status(), Some(SWTaskStatus::Abandoned));
+    assert!(set.is_drained());
     assert!(
         dropped_before_release,
         "abandoned capture was not cleaned up"
