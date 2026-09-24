@@ -214,6 +214,7 @@ struct State {
 struct StateMutation<'a> {
     state: Option<MutexGuard<'a, State>>,
     wake: &'a crate::progress::SWWake,
+    _notification: crate::notification::NotificationScope,
 }
 
 impl std::ops::Deref for StateMutation<'_> {
@@ -388,6 +389,9 @@ impl OwnedScheduler {
         let signal = state.signals.acquire();
         let (task, sink) = SWTask::pending_with_signal(signal);
         task.set_producer(control.identity(), id, Arc::downgrade(self));
+        if let Some(domain) = control.notification_domain() {
+            task.set_notification_source(domain);
+        }
         let core = Arc::new(ExternalCore::new(sink, bytes));
         if state.demand.enabled() {
             state
@@ -687,9 +691,11 @@ impl OwnedScheduler {
     }
 
     fn lock_mut(&self) -> StateMutation<'_> {
+        let notification = self.wake.notification_scope();
         StateMutation {
             state: Some(self.lock()),
             wake: &self.wake,
+            _notification: notification,
         }
     }
 
@@ -742,6 +748,10 @@ impl OwnedScheduler {
         })?;
         let id = self.reserve_group_id()?;
         let inner = self.groups.acquire(id, class);
+        inner.set_notification_runtime(control.identity());
+        if let Some(domain) = control.notification_domain() {
+            inner.set_notification_source(domain);
+        }
         // The reserved ID is the admission point. Keep the runtime admission
         // alive through checkout even when graceful closure races this call.
         drop(admission);
@@ -767,6 +777,10 @@ impl OwnedScheduler {
         if !group.try_reset(id) {
             let inner = self.groups.acquire(id, group.class());
             *group = SWGroup::new(inner, Arc::downgrade(self), control.identity());
+        }
+        group.inner.set_notification_runtime(control.identity());
+        if let Some(domain) = control.notification_domain() {
+            group.inner.set_notification_source(domain);
         }
         drop(admission);
         Ok(())
@@ -984,6 +998,9 @@ impl OwnedScheduler {
         let signal = state.signals.acquire();
         let (task, sink) = SWTask::pending_with_signal(signal);
         task.set_producer(control.identity(), id, Arc::downgrade(self));
+        if let Some(domain) = control.notification_domain() {
+            task.set_notification_source(domain);
+        }
         if state.demand.enabled() {
             let parents = prerequisites
                 .iter()

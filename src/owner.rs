@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
+use crate::notification::NotifySource;
 use crate::progress::SWWake;
 use crate::runtime::{
     OwnerCallbackGuard, OwnerRegistration, OwnerRootAdmission, RuntimeControl, SWRuntimeState,
@@ -87,6 +88,7 @@ pub struct SWPreparedDelivery {
 pub struct SWOwnerControl {
     close_requested: Arc<AtomicBool>,
     wake: Arc<SWWake>,
+    notification_source: Option<NotifySource>,
 }
 
 impl SWOwnerControl {
@@ -94,8 +96,12 @@ impl SWOwnerControl {
     /// not run cleanup on the requesting thread. Sender admission closes when
     /// the owner observes the request; no unclaimed callback then publishes.
     pub fn request_close(&self) {
-        self.close_requested.store(true, Ordering::Release);
-        self.wake.notify();
+        if !self.close_requested.swap(true, Ordering::AcqRel) {
+            self.wake.notify();
+            if let Some(source) = &self.notification_source {
+                source.publish();
+            }
+        }
     }
 }
 
@@ -129,12 +135,17 @@ impl<O> SWOwner<O> {
             .and_then(|scheduler| scheduler.capacity.clone());
         let transport = Transport::new_with_capacity(capacity, control.identity(), pool);
         transport.install_wake(control.wake());
+        let notification_source = control.notification_domain().map(NotifySource::new);
+        if let Some(source) = &notification_source {
+            transport.install_notification_source(source.clone());
+        }
         let for_close = Arc::clone(&transport);
         let for_progress = Arc::clone(&transport);
         let registration = control
             .register_owner(
                 Arc::new(move || for_close.close()),
                 Arc::new(move || for_progress.progress()),
+                notification_source,
             )
             .map_err(|error| match error {
                 SWExecutionError::Closed => SWOwnerError::Closed,
@@ -176,7 +187,12 @@ impl<O> SWOwner<O> {
         SWOwnerControl {
             close_requested: Arc::clone(&self.close_requested),
             wake: self.control.wake(),
+            notification_source: self.transport.notification_source(),
         }
+    }
+
+    pub(crate) fn notification_source(&self) -> Option<NotifySource> {
+        self.transport.notification_source()
     }
 
     /// A transferable phase-addressed sender. Its callbacks must be Send;
@@ -216,7 +232,7 @@ impl<O> SWOwner<O> {
             Err(SWOwnerError::Closed)
         } else if self.faulted {
             Err(SWOwnerError::Faulted)
-        } else if self.active {
+        } else if self.active || crate::notification::invocation_active() {
             Err(SWOwnerError::InvalidContext)
         } else if accounted_descendant {
             match self.control.phase() {
@@ -746,7 +762,7 @@ impl<O> SWOwner<O> {
         phase: SWPhase,
         budget: SWPumpBudget,
     ) -> Result<SWPumpReport, SWOwnerError> {
-        if self.active {
+        if self.active || crate::notification::invocation_active() {
             return Err(SWOwnerError::InvalidContext);
         }
         self.finish_close_request();

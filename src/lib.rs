@@ -22,6 +22,7 @@ mod backend;
 mod cleanup;
 mod execution;
 mod external;
+mod notification;
 mod owner;
 mod platform;
 mod progress;
@@ -38,6 +39,10 @@ pub use external::{
     SWExternalAccess, SWExternalAccessOptions, SWExternalAccessRejected,
     SWExternalActivationRejected, SWExternalOptions, SWExternalPrepared, SWExternalProgress,
     SWExternalRejected, SWExternalResult, SWProducer,
+};
+pub use notification::{
+    SWNotifyBinding, SWNotifyError, SWNotifyFault, SWNotifyLimits, SWNotifyRejected, SWNotifyRoute,
+    SWNotifyStamp,
 };
 pub use owner::{
     SWCancelResult, SWDelivery, SWDeliveryControl, SWDeliveryStatus, SWDeliveryTicket, SWOwner,

@@ -8,8 +8,9 @@ use std::thread::{self, ThreadId};
 use std::time::{Duration, Instant};
 
 use solworker::{
-    SWBatch, SWCallerEligibility, SWExecutionClass, SWLane, SWOutcome, SWOwnedLimits, SWRuntime,
-    SWRuntimeConfig, SWSpawnError, SWSpawnOptions, SWTask, SWTaskStatus, SWWorkerConfig,
+    SWBatch, SWCallerEligibility, SWExecutionClass, SWGroup, SWLane, SWNotifyBinding,
+    SWNotifyLimits, SWOutcome, SWOwnedLimits, SWRuntime, SWRuntimeConfig, SWSpawnError,
+    SWSpawnOptions, SWTask, SWTaskStatus, SWWorkerConfig,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -71,12 +72,22 @@ impl Executor {
     }
 
     pub fn with_limits(workers: usize, limits: SWOwnedLimits) -> Self {
-        let runtime = SWRuntime::builder(
+        Self::with_notification_limits(workers, limits, None)
+    }
+
+    pub fn with_notification_limits(
+        workers: usize,
+        limits: SWOwnedLimits,
+        notifications: Option<SWNotifyLimits>,
+    ) -> Self {
+        let mut builder = SWRuntime::builder(
             SWRuntimeConfig::new(workers * 3, [SWWorkerConfig::new(workers); 3]).unwrap(),
         )
-        .with_owned_limits(limits)
-        .build()
-        .unwrap();
+        .with_owned_limits(limits);
+        if let Some(limits) = notifications {
+            builder = builder.with_notification_limits(limits);
+        }
+        let runtime = builder.build().unwrap();
         let high = runtime.lane(SWExecutionClass::High);
         let batch = high.batch();
         Self {
@@ -129,6 +140,19 @@ impl World {
     }
 
     pub fn frame(&mut self, executor: &mut Executor, schedule: Schedule, rounds: usize) -> &[Draw] {
+        self.frame_with_group_binding(executor, schedule, rounds, |_| None)
+    }
+
+    pub fn frame_with_group_binding<F>(
+        &mut self,
+        executor: &mut Executor,
+        schedule: Schedule,
+        rounds: usize,
+        mut on_group: F,
+    ) -> &[Draw]
+    where
+        F: FnMut(&SWGroup) -> Option<SWNotifyBinding>,
+    {
         assert_eq!(thread::current().id(), self.owner);
         self.admission_retries = 0;
         self.frame += 1;
@@ -169,6 +193,7 @@ impl World {
                 }
                 Schedule::RetainedWaves => {
                     let group = executor.batch.begin().unwrap();
+                    let _binding = on_group(group);
                     let mut tasks = Vec::with_capacity(self.partitions.len());
                     let deadline = Instant::now() + Duration::from_secs(10);
                     for partition in &mut self.partitions {

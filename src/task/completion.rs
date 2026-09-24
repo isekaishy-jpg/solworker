@@ -8,6 +8,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, Weak};
 use std::time::Duration;
 
 use crate::execution::context;
+use crate::notification::{NotifyDomain, NotifySource};
 use crate::scheduler::storage::SignalRetirement;
 
 /// A completed owned invocation. Application errors remain in a successful
@@ -57,6 +58,9 @@ pub(crate) struct Signal {
     state: Mutex<SignalState>,
     changed: Condvar,
     producer: OnceLock<ProducerIdentity>,
+    runtime_identity: OnceLock<u64>,
+    notification_domain: OnceLock<Weak<NotifyDomain>>,
+    notification: OnceLock<NotifySource>,
 }
 
 struct ProducerIdentity {
@@ -75,6 +79,9 @@ impl Signal {
             }),
             changed: Condvar::new(),
             producer: OnceLock::new(),
+            runtime_identity: OnceLock::new(),
+            notification_domain: OnceLock::new(),
+            notification: OnceLock::new(),
         }
     }
 
@@ -87,6 +94,9 @@ impl Signal {
         state.status = None;
         state.next_subscriber = 1;
         self.producer.take();
+        self.notification.take();
+        self.notification_domain.take();
+        self.runtime_identity.take();
     }
 
     pub(crate) fn is_reusable(&self) -> bool {
@@ -98,21 +108,61 @@ impl Signal {
         self.state.lock().unwrap_or_else(|error| error.into_inner())
     }
 
+    fn set_runtime_identity(&self, runtime: u64) {
+        assert!(
+            self.runtime_identity.set(runtime).is_ok(),
+            "completion runtime installed once before publication"
+        );
+    }
+
+    fn set_notification_source(&self, domain: &Arc<NotifyDomain>) {
+        debug_assert!(self.runtime_identity.get().is_some());
+        assert!(
+            self.notification_domain.set(Arc::downgrade(domain)).is_ok(),
+            "notification domain installed once before publication"
+        );
+    }
+
+    fn notification_source(&self) -> Option<NotifySource> {
+        let state = self.lock();
+        let domain = self.notification_domain.get()?.upgrade()?;
+        Some(
+            self.notification
+                .get_or_init(|| {
+                    let source = NotifySource::new(&domain);
+                    // This source is not visible to a binding until this lock
+                    // is released. A concurrent publisher either sees it
+                    // under this same lock or has already committed status.
+                    if state.status.is_some() {
+                        source.publish_terminal();
+                    }
+                    source
+                })
+                .clone(),
+        )
+    }
+
     fn publish(&self, status: SWTaskStatus) {
         self.publish_notifying(status, || {});
     }
 
     fn publish_notifying(&self, status: SWTaskStatus, notify: impl FnOnce()) {
-        let subscribers = {
+        let (subscribers, source) = {
             let mut state = self.lock();
             debug_assert!(state.status.is_none(), "completion published twice");
             state.status = Some(status);
             self.changed.notify_all();
-            std::mem::take(&mut state.subscribers)
+            (
+                std::mem::take(&mut state.subscribers),
+                self.notification.get().cloned(),
+            )
         };
         // Wake the group's separate helping predicate after status is visible,
         // before arbitrary downstream activation or cleanup can block/unwind.
         notify();
+        if let Some(source) = source {
+            source.publish_terminal();
+        }
         // Activation never runs under the result or status lock.
         let mut first_panic = None;
         for (_, subscriber) in subscribers {
@@ -215,6 +265,22 @@ impl SWCompletion {
 
     pub(crate) fn publish_notifying(&self, status: SWTaskStatus, notify: impl FnOnce()) {
         self.signal.publish_notifying(status, notify);
+    }
+
+    pub(crate) fn set_runtime_identity(&self, runtime: u64) {
+        self.signal.set_runtime_identity(runtime);
+    }
+
+    pub(crate) fn set_notification_source(&self, domain: &Arc<NotifyDomain>) {
+        self.signal.set_notification_source(domain);
+    }
+
+    pub(crate) fn notification_source(&self) -> Option<NotifySource> {
+        self.signal.notification_source()
+    }
+
+    pub(crate) fn notification_runtime_id(&self) -> Option<u64> {
+        self.signal.runtime_identity.get().copied()
     }
 
     pub(crate) fn same_signal(&self, other: &Self) -> bool {
@@ -451,12 +517,17 @@ pub struct SWTask<T: Send + 'static> {
 }
 
 impl<T: Send + 'static> SWTask<T> {
+    pub(crate) fn set_notification_source(&self, domain: &Arc<NotifyDomain>) {
+        self.cell.signal.set_notification_source(domain);
+    }
+
     pub(crate) fn set_producer(
         &self,
         runtime: u64,
         record: u64,
         scheduler: Weak<crate::scheduler::OwnedScheduler>,
     ) {
+        self.cell.signal.set_runtime_identity(runtime);
         assert!(
             self.cell
                 .signal

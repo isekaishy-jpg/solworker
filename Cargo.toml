@@ -19,3 +19,7 @@ debug = 1
 [[bench]]
 name = "bursts"
 harness = false
+
+[[bench]]
+name = "notifications"
+harness = false

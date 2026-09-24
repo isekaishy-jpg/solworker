@@ -59,7 +59,7 @@ pub(crate) fn passive_wait_forbidden() -> bool {
 }
 
 pub(crate) fn control_callback_active() -> bool {
-    CONTROL_CALLBACKS.with(|count| count.get() != 0)
+    CONTROL_CALLBACKS.with(|count| count.get() != 0) || crate::notification::invocation_active()
 }
 
 /// Provider hooks and external settlement retain accounting until they return.

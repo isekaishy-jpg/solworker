@@ -74,6 +74,42 @@ must decide whether the partially updated domain state can be used.
 
 Source: [scoped operations](../src/execution/scope.rs).
 
+## Submit, overlap, join and consume
+
+Use `SWGroup` as the completion boundary for a wave whose accepted members must
+settle before a consumer proceeds. For recurring work, retain an `SWBatch` and
+begin a new group generation after the preceding wave is sealed and complete.
+The application retains result handles and any domain storage separately.
+
+1. Admit meaningful chunks into the group and retain their result handles.
+   Preserve rejected inputs and admission errors; rejection is not membership.
+2. Seal membership, including on an admission-error path. Where ownership
+   allows, admit downstream stages behind `group.completion()` without first
+   waiting for the producer wave.
+3. Perform independent coordinator work while admitted jobs execute.
+4. At the consumer boundary, use `wait_helping` if remaining work can finish
+   without services this caller must provide. It helps eligible members of that
+   exact group and handles internal parking and readiness rechecks. Otherwise
+   keep the required host services progressing as described in [lifecycle](lifecycle.md).
+5. Check admission errors, completion status and relevant task outcomes before
+   consuming or publishing results. A successful return from `wait_helping`
+   establishes settlement, not successful job outcomes.
+
+For example, launch evaluation and independent visibility work, prepare unrelated
+owner state, then join each wave where draw preparation needs its results.
+Recording can depend on a separate draw/finalization completion boundary. Avoid
+one frame-wide group when consumers need different subsets, and avoid an
+immediate join after each submission when independent work could overlap.
+
+Completion is distinct from a wake notification. Internal notifications let a
+waiter recheck its predicate; they do not authorize consuming an unfinished
+result, executing an owner callback or resetting GPU storage. Applications use
+the group APIs rather than reproducing internal counters or wait registration.
+Hosts with a combined native wait can optionally
+[watch the group completion](notifications.md) and recheck this same terminal
+predicate after a signal. Each `SWBatch` wave needs its own completion binding;
+an old binding remains tied to the previous wave.
+
 ## Build a dependency graph with useful overlap
 
 A generic frame might have the following arrangement:

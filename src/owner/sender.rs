@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 
 use super::delivery::{SWDelivery, SWDeliveryControl, Transport};
 use super::{SWOwnerError, SWOwnerRejected, SWPhase};
+use crate::notification::NotificationScope;
 use crate::runtime::RuntimeControl;
 
 pub(super) type SendCallback<O> = Box<dyn FnOnce(&mut O) + Send + 'static>;
@@ -51,9 +52,12 @@ impl<O> Inbox<O> {
     /// Close sender admission atomically with transport closure while keeping
     /// accepted packages for budgeted owner-thread cleanup.
     pub(super) fn mark_closed(&self) {
-        let mut state = self.state.lock().unwrap();
-        state.closed = true;
-        self.transport.close();
+        let closure = {
+            let mut state = self.state.lock().unwrap();
+            state.closed = true;
+            self.transport.begin_close()
+        };
+        self.transport.finish_close(closure);
     }
 
     pub(super) fn is_empty(&self) -> bool {
@@ -103,11 +107,17 @@ impl<O> SWOwnerSender<O> {
     where
         F: FnOnce(&mut O) + Send + 'static,
     {
+        let _scope = NotificationScope::enter_if(self.inbox.transport.notifications_enabled());
         let _admission = match self.inbox.control.admit_owner_root() {
             Ok(admission) => admission,
-            Err(_) => {
+            Err(error) => {
                 return Err(SWOwnerRejected {
-                    reason: SWOwnerError::Closed,
+                    reason: match error {
+                        crate::execution::SWExecutionError::Closed => SWOwnerError::Closed,
+                        crate::execution::SWExecutionError::InvalidContext => {
+                            SWOwnerError::InvalidContext
+                        }
+                    },
                     callback,
                 });
             }

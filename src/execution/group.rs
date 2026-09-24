@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 
 use crate::execution::context::{SWExecutionError, current};
+use crate::notification::NotifyDomain;
 use crate::runtime::config::SWExecutionClass;
 use crate::scheduler::OwnedScheduler;
 use crate::task::{SWCompletion, SWTaskStatus};
@@ -78,6 +79,14 @@ impl GroupInner {
 
     pub(crate) fn completion(&self) -> SWCompletion {
         self.completion.clone()
+    }
+
+    pub(crate) fn set_notification_runtime(&self, runtime: u64) {
+        self.completion.set_runtime_identity(runtime);
+    }
+
+    pub(crate) fn set_notification_source(&self, domain: &Arc<NotifyDomain>) {
+        self.completion.set_notification_source(domain);
     }
 
     pub(crate) fn add(&self) -> bool {
@@ -289,6 +298,9 @@ impl SWGroup {
     }
 
     fn check_context(&self) -> Result<(), SWExecutionError> {
+        if crate::notification::invocation_active() {
+            return Err(SWExecutionError::InvalidContext);
+        }
         match current() {
             Some(context)
                 if context.runtime == self.runtime && context.class == self.inner.class =>

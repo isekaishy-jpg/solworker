@@ -20,6 +20,9 @@ The useful question is what obligation ends when a particular handle settles.
 For external producers, logical completion is a provider publication event,
 not proof of physical release. The published value must already be safe to
 observe; see [external access](rendering.md).
+An optional [completion notification](notifications.md) wakes a host to recheck
+that logical status. It neither services the provider nor advances the owner
+phase. Bind owner or broad progress too when the host must service those steps.
 
 Counts should follow ownership rather than duplicate it. A renderer that already
 owns a fence need not add a scheduler counter for every graphics object. Add SW
@@ -52,6 +55,8 @@ holding it. Shared outcomes provide independent immutable ownership instead.
 already available values without dispatch. A cache hit should not need a dummy
 CPU task just to produce a handle. Use a ready shared value or reuse the cache's
 existing shared handle, then choose the correct owner-publication behavior.
+An already-ready standalone completion can be watched on any notification
+route; registration requests an immediate recheck and retains no source.
 
 Source: [task and result contracts](../src/task/completion.rs).
 

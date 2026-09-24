@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
 
+use crate::notification::NotifySource;
 use crate::owner::SWOwnerError;
 use crate::progress::{SWOwnerProgress, SWWake};
 use crate::scheduler::reservation::SWReservationPool;
@@ -135,10 +136,12 @@ impl Record {
         };
         let subscription = state.subscription.take();
         drop(state);
-        drop(subscription);
-        if let Some(transport) = self.transport.upgrade() {
+        if result == SWCancelResult::Requested
+            && let Some(transport) = self.transport.upgrade()
+        {
             transport.notify_progress();
         }
+        drop(subscription);
         result
     }
 
@@ -177,6 +180,11 @@ pub(super) struct Transport {
     receiver: Receiver<NotificationMessage>,
     state: Mutex<TransportState>,
     wake: OnceLock<Arc<SWWake>>,
+    notification_source: OnceLock<NotifySource>,
+}
+
+pub(super) struct TransportClosure {
+    records: Vec<Arc<Record>>,
 }
 
 impl Transport {
@@ -214,6 +222,7 @@ impl Transport {
                 protected_records: 0,
             }),
             wake: OnceLock::new(),
+            notification_source: OnceLock::new(),
         })
     }
 
@@ -221,7 +230,29 @@ impl Transport {
         assert!(self.wake.set(wake).is_ok(), "owner wake installed once");
     }
 
+    pub(super) fn install_notification_source(&self, source: NotifySource) {
+        assert!(
+            self.notification_source.set(source).is_ok(),
+            "owner notification source installed once"
+        );
+    }
+
+    pub(super) fn notification_source(&self) -> Option<NotifySource> {
+        self.notification_source.get().cloned()
+    }
+
+    pub(super) fn notifications_enabled(&self) -> bool {
+        self.notification_source.get().is_some()
+    }
+
     fn notify_progress(&self) {
+        self.notify_runtime_progress();
+        if let Some(source) = self.notification_source.get() {
+            source.publish();
+        }
+    }
+
+    fn notify_runtime_progress(&self) {
         if let Some(wake) = self.wake.get() {
             wake.notify();
         }
@@ -331,7 +362,7 @@ impl Transport {
             EndpointKind::Protected => state.protected_records += 1,
         }
         drop(state);
-        self.notify_progress();
+        self.notify_runtime_progress();
         Some(Reservation {
             notifier: Notifier {
                 inner: Arc::new(NotifierInner {
@@ -361,16 +392,24 @@ impl Transport {
         self.state.lock().unwrap().closed
     }
 
-    pub(super) fn close(&self) {
+    pub(super) fn begin_close(&self) -> TransportClosure {
         let records = {
             let mut state = self.state.lock().unwrap();
             state.closed = true;
             state.records.values().cloned().collect::<Vec<_>>()
         };
-        for record in records {
+        TransportClosure { records }
+    }
+
+    pub(super) fn finish_close(&self, closure: TransportClosure) {
+        self.notify_progress();
+        for record in closure.records {
             record.cancel();
         }
-        self.notify_progress();
+    }
+
+    pub(super) fn close(&self) {
+        self.finish_close(self.begin_close());
     }
 
     pub(super) fn suppress_all(&self) {

@@ -25,21 +25,38 @@ pump, and a long caller-eligible job can delay the host just as a long callback
 can. Eligibility is a latency and reentrancy decision as well as a thread-safety
 decision.
 
-An interactive host loop conceptually performs:
+Choose the wait arrangement from the services the remaining work needs. A
+coordinator can use the following pattern when workers can finish the required
+CPU wave without further owner/provider service:
 
 ```text
+submit and seal the required CPU wave
 run independent owner work
-inspect required results and phase eligibility
-pump permitted owner publications and provider progress
-service bounded demand/control updates
-help eligible work from the specifically needed group
-recheck results, cleanup obligations and native input/deadlines
-park only when the host has no useful permitted work and wake coverage is valid
+join the required group with targeted helping
+check admission errors and outcomes, then consume results
+service owner publications, platform input and providers at their allowed phases
 ```
 
-This is an integration pattern, not a supplied event-loop function. Input
-servicing need not advance the simulation's semantic input cutoff. Keep those
-two decisions separate when a wait occurs inside a frame.
+This is a work arrangement, not a mandatory frame order. The host places its
+service phases according to application semantics. A group join does not pump
+messages or callbacks, and owner publication may still be pending after that
+group completes. If the join's duration would delay input too long, or its
+completion requires this caller's service, use a host-driven progress path:
+
+```text
+inspect the required completion and permitted phase work
+service bounded owner/provider/demand work and native input where allowed
+help eligible work from the specifically needed group
+recheck completion, required services and deadlines
+return to the host's normal loop, or use a verified host wait arrangement
+```
+
+Neither `help_ready` returning `Ok(false)` nor an empty owner pump proves that
+all work is complete or that a native wait is safe. Do not turn this outline into
+an unbounded busy loop. Parking requires a host mechanism that cannot miss the
+transitions needed for progress; a pending CPU group alone does not provide a
+native event-loop signal. Input servicing also need not advance the simulation's
+semantic input cutoff. Keep those decisions separate during an in-frame wait.
 
 ## Progress snapshots are diagnostic observations
 
@@ -56,33 +73,26 @@ Observation does not pump providers, owner work or demand updates.
 
 Source: [progress API](../src/progress.rs).
 
-## Native wake integration remains a proposed capability
+## Native event-loop integration is a host choice
 
-This checkout does **not** expose a runtime-wide native wake callback or a
-`SWRuntimeBuilder::wake_hook` method. `with_worker_setup` is worker initialization,
-not a notification hook. Passive progress waits do not replace a main-thread
-window-system wait.
+The optional [`SWNotifyRoute`](notifications.md) binds completion, owner or broad
+runtime progress to a host-supplied signal function. `with_worker_setup` remains
+worker initialization. Existing group waits manage their internal
+notification/recheck protocol. A finite CPU pipeline or an offscreen renderer
+does not need a native wake bridge merely to use that protocol.
 
-A future platform-neutral hook should let a host signal its own durable native
-wake bridge. The intended integration requirements are:
+A host that parks on a combined input/completion wait has an additional
+integration requirement: CPU readiness must be able to reach that wait, and
+the host must recheck durable state before sleeping. Platform handles, input
+dispatch, pacing and the decision to park belong to the host/platform adapter.
+Passive `SWProgress` waits do not replace this integration and remain forbidden
+from live owner/CPU execution contexts.
 
-- Publish readiness/control state before advancing a generation and signalling.
-- Cover failure, cancellation, owner delivery, capacity/control progress and
-  external completion, not just successful CPU returns.
-- Invoke outside scheduler/owner locks, with a short, nonblocking callback safe
-  for concurrent notification. Do not reenter scheduler or owner execution.
-- Define callback panic reporting and a host path that leaves native parking if
-  notifications can no longer be trusted.
-- Keep the bridge valid through in-flight notifications and retained observers;
-  destroy native handles only after notification activity is safely excluded.
-- Use an arm-and-recheck protocol: a wake before arming prevents sleep; a wake
-  after arming signals the native wait. Do not rely solely on another thread's
-  promise to signal later.
-
-These are design requirements, not guarantees of an existing hook. Integrations
-that need combined input/completion parking must supply and verify wake coverage
-for all relevant transitions or implement this missing capability first. The
-examples deliberately avoid a native parking loop; they are finite CPU examples.
+Configure notification limits, bind every source whose progress the host must
+service, then use the [reset, arm and recheck protocol](notifications.md#arm-inspect-then-park)
+before parking. A completion-only binding cannot wake the host to perform
+owner or provider work that the completion still depends on. The host owns the
+native wake destination and its consumption.
 
 ## Distinguish admission, application failure and execution failure
 

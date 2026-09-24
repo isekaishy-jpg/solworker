@@ -104,6 +104,7 @@ pub struct SWRuntimeBuilder {
     demand_priorities: Vec<crate::scheduler::SWPriority>,
     demand_leases: usize,
     external_capacity: Option<std::num::NonZeroUsize>,
+    notification_limits: Option<crate::notification::SWNotifyLimits>,
 }
 
 impl SWRuntimeBuilder {
@@ -116,6 +117,7 @@ impl SWRuntimeBuilder {
             demand_priorities: Vec::new(),
             demand_leases: 0,
             external_capacity: None,
+            notification_limits: None,
         }
     }
 
@@ -123,6 +125,13 @@ impl SWRuntimeBuilder {
     /// Without this option the runtime provides scoped execution only.
     pub fn with_owned_limits(mut self, limits: SWOwnedLimits) -> Self {
         self.owned_limits = Some(limits);
+        self
+    }
+
+    /// Enables bounded, optional host notification without creating threads.
+    /// Internal worker and group wakes remain independent of host adapters.
+    pub fn with_notification_limits(mut self, limits: crate::notification::SWNotifyLimits) -> Self {
+        self.notification_limits = Some(limits);
         self
     }
 
@@ -281,7 +290,11 @@ impl SWRuntimeBuilder {
             self.capacity_limits
                 .map_or(0, |limits| limits.required_allowance.records),
         );
-        let control = Arc::new(RuntimeControl::new(&backend, Arc::clone(&physical)));
+        let control = Arc::new(RuntimeControl::new_with_notifications(
+            &backend,
+            Arc::clone(&physical),
+            self.notification_limits,
+        ));
         let owned = self.owned_limits.map(|mut limits| {
             let capacity = self.capacity_limits.map(|policy| {
                 limits.records = limits
@@ -366,6 +379,25 @@ impl fmt::Display for SWShutdownError {
 impl Error for SWShutdownError {}
 
 impl SWRuntime {
+    /// Binds a reusable host signal destination. The adapter runs synchronously
+    /// on publishers, outside bookkeeping locks; it must only signal the host.
+    /// Rejection returns the uninvoked closure and its captures.
+    pub fn notification_route<F>(
+        &self,
+        signal: F,
+    ) -> Result<crate::notification::SWNotifyRoute, crate::notification::SWNotifyRejected<F>>
+    where
+        F: Fn() -> io::Result<()> + Send + Sync + 'static,
+    {
+        match self.control.notification_domain() {
+            Some(domain) => domain.create_route(signal),
+            None => Err(crate::notification::SWNotifyRejected {
+                reason: crate::notification::SWNotifyError::Disabled,
+                signal,
+            }),
+        }
+    }
+
     /// Admits a provider-owned logical result without occupying a CPU worker.
     /// Provider submission occurs only after successful admission. Dropping the
     /// producer abandons its logical result, never a separate physical access.

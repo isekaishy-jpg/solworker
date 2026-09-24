@@ -193,18 +193,47 @@ pub(crate) struct RuntimeControl {
     owned: OnceLock<Weak<OwnedScheduler>>,
     physical: Arc<crate::external::PhysicalRegistry>,
     wake: Arc<crate::progress::SWWake>,
+    notifications: Option<Arc<crate::notification::NotifyDomain>>,
+}
+
+// The scope outlives the mutex guard, including early returns and unwinding.
+// Nested publications may record claims, but cannot call adapters under control.
+struct ControlGuard<'a> {
+    state: MutexGuard<'a, ControlState>,
+    _notification: crate::notification::NotificationScope,
+}
+
+impl std::ops::Deref for ControlGuard<'_> {
+    type Target = ControlState;
+    fn deref(&self) -> &Self::Target {
+        &self.state
+    }
+}
+
+impl std::ops::DerefMut for ControlGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.state
+    }
 }
 
 impl RuntimeControl {
-    pub(super) fn new(
+    pub(super) fn new_with_notifications(
         backend: &Arc<BackendOwner>,
         physical: Arc<crate::external::PhysicalRegistry>,
+        limits: Option<crate::notification::SWNotifyLimits>,
     ) -> Self {
         static NEXT_ID: AtomicU64 = AtomicU64::new(1);
         // IDs have no publication role; the mutex publishes runtime state.
         let id = NEXT_ID
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
             .expect("runtime identity space exhausted");
+        let notifications = limits
+            .filter(|limits| limits.routes != 0)
+            .map(|limits| crate::notification::NotifyDomain::new(id, limits));
+        let wake = crate::progress::SWWake::new();
+        if let Some(domain) = &notifications {
+            wake.install_notification_source(domain.progress_source());
+        }
         Self {
             id,
             state: Mutex::new(ControlState {
@@ -219,12 +248,21 @@ impl RuntimeControl {
             }),
             owned: OnceLock::new(),
             physical,
-            wake: crate::progress::SWWake::new(),
+            wake,
+            notifications,
         }
     }
 
-    fn lock(&self) -> MutexGuard<'_, ControlState> {
-        self.state.lock().unwrap_or_else(|error| error.into_inner())
+    fn lock(&self) -> ControlGuard<'_> {
+        let scope = self.wake.notification_scope();
+        ControlGuard {
+            state: self.state.lock().unwrap_or_else(|error| error.into_inner()),
+            _notification: scope,
+        }
+    }
+
+    pub(crate) fn notification_domain(&self) -> Option<&Arc<crate::notification::NotifyDomain>> {
+        self.notifications.as_ref()
     }
 
     pub(crate) fn identity(&self) -> u64 {
@@ -236,6 +274,9 @@ impl RuntimeControl {
     pub(crate) fn admit_owner_root(
         self: &Arc<Self>,
     ) -> Result<OwnerRootAdmission, SWExecutionError> {
+        if crate::notification::invocation_active() {
+            return Err(SWExecutionError::InvalidContext);
+        }
         let mut state = self.lock();
         if state.phase != SWRuntimeState::Running {
             return Err(SWExecutionError::Closed);
@@ -262,6 +303,9 @@ impl RuntimeControl {
         self: &Arc<Self>,
         accounted: bool,
     ) -> Result<ExternalAdmission, SWExecutionError> {
+        if crate::notification::invocation_active() {
+            return Err(SWExecutionError::InvalidContext);
+        }
         let descendant = current().is_some_and(|context| context.runtime == self.id);
         let mut state = self.lock();
         if state.phase != SWRuntimeState::Running
@@ -284,6 +328,9 @@ impl RuntimeControl {
         required: bool,
         accounted: bool,
     ) -> Result<u64, SWSpawnError> {
+        if crate::notification::invocation_active() {
+            return Err(SWSpawnError::InvalidContext);
+        }
         let descendant = current().is_some_and(|context| context.runtime == self.id);
         let state = self.lock();
         if state.phase != SWRuntimeState::Running
@@ -361,8 +408,12 @@ impl RuntimeControl {
         self: &Arc<Self>,
         closer: Arc<dyn Fn() + Send + Sync>,
         progress: Arc<dyn Fn() -> crate::progress::SWOwnerProgress + Send + Sync>,
+        notification: Option<crate::notification::NotifySource>,
     ) -> Result<OwnerRegistration, SWExecutionError> {
-        if current().is_some() || context::owner_callback_active() {
+        if current().is_some()
+            || context::owner_callback_active()
+            || crate::notification::invocation_active()
+        {
             return Err(SWExecutionError::InvalidContext);
         }
         let mut state = self.lock();
@@ -381,6 +432,7 @@ impl RuntimeControl {
             id,
             _closer: closer,
             _progress: progress,
+            notification,
             not_send: PhantomData,
         })
     }
@@ -456,6 +508,9 @@ impl RuntimeControl {
         self: &Arc<Self>,
         accounted: bool,
     ) -> Result<OwnedAdmission, SWExecutionError> {
+        if crate::notification::invocation_active() {
+            return Err(SWExecutionError::InvalidContext);
+        }
         let descendant = current().is_some_and(|context| context.runtime == self.id);
         let mut state = self.lock();
         if state.phase != SWRuntimeState::Running
@@ -481,6 +536,9 @@ impl RuntimeControl {
         self: &Arc<Self>,
         class: SWExecutionClass,
     ) -> Result<ExecutionLease, SWExecutionError> {
+        if crate::notification::invocation_active() {
+            return Err(SWExecutionError::InvalidContext);
+        }
         let mut state = self.lock();
         if !matches!(
             state.phase,
@@ -509,6 +567,9 @@ impl RuntimeControl {
         self: &Arc<Self>,
         class: SWExecutionClass,
     ) -> Result<ExecutionLease, SWExecutionError> {
+        if crate::notification::invocation_active() {
+            return Err(SWExecutionError::InvalidContext);
+        }
         let nested = match current() {
             Some(context) if context.runtime == self.id && context.class == class => true,
             Some(_) => return Err(SWExecutionError::InvalidContext),
@@ -617,6 +678,7 @@ pub(crate) struct OwnerRegistration {
     id: u64,
     _closer: Arc<dyn Fn() + Send + Sync>,
     _progress: Arc<dyn Fn() -> crate::progress::SWOwnerProgress + Send + Sync>,
+    notification: Option<crate::notification::NotifySource>,
     not_send: PhantomData<Rc<()>>,
 }
 
@@ -628,6 +690,9 @@ impl Drop for OwnerRegistration {
             state.owner_progress.remove(&self.id);
         }
         context::unregister_live_owner();
+        if let Some(source) = &self.notification {
+            source.publish();
+        }
         self.control.notify_progress();
     }
 }

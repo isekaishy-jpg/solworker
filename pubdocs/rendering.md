@@ -33,6 +33,16 @@ be reserved early. The owner can prepare unrelated work while those jobs run.
 A dependency graph is useful only if domain inputs and mutation rules permit
 the overlap it represents.
 
+The renderer supplies the recording plan: exclusive contexts, ordered ranges,
+logical submission positions and guards that close or discard reservations.
+Solworker executes those operations and exposes their CPU group completion.
+At consumption, the renderer checks both job outcomes and reservation
+dispositions before submitting usable work in the required order. Subsequent
+GPU retirement stays with the device adapter. These responsibilities can be
+composed with existing groups and dependencies. A host that already combines
+native input and CPU readiness in one wait can bind an optional
+[completion notification](notifications.md) to the appropriate CPU stage.
+
 Preserve owner-only event delivery between worker waves when required. Multiple
 views or passes should consume the appropriate version rather than accidentally
 advance a simulation clock repeatedly. Offscreen objects can still have event,
@@ -136,6 +146,9 @@ charge; it does not make potentially active memory safe to free. Cancellation,
 timeout and logical producer completion do not acknowledge physical release.
 Device failure needs a backend-specific end-of-access proof, not a fabricated
 successful fence value.
+An external producer's logical completion can notify a host after publication,
+but the notification does not poll the device or acknowledge physical release.
+Retain the adapter's exact fence or completion-value proof before reusing memory.
 
 When transferring the released resource to a logical provider result, use
 `SWProducer::complete_retained` and configure that producer's

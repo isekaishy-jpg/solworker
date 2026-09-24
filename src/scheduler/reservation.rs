@@ -468,6 +468,14 @@ impl SWReservation {
 
     /// Transfers capacity from the pool atomically. Failure leaves this handle unchanged.
     pub fn try_grow(&mut self, additional: SWCost) -> Result<(), SWReservationError> {
+        // Ledger::claim publishes progress while this operation still owns the
+        // pipeline total lock. Delay the host adapter until both locks retire.
+        let _notification = self
+            .pipeline
+            .ledger
+            .wake
+            .get()
+            .map(|wake| wake.notification_scope());
         let mut total = self
             .pipeline
             .total

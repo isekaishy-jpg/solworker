@@ -1,7 +1,7 @@
 //! Passive host observation and a generation-based wake protocol.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::Instant;
 
 use crate::execution::context;
@@ -154,6 +154,7 @@ pub(crate) struct SWWake {
     enabled: AtomicBool,
     lock: Mutex<()>,
     changed: Condvar,
+    notification: OnceLock<crate::notification::NotifySource>,
 }
 
 impl SWWake {
@@ -163,7 +164,19 @@ impl SWWake {
             enabled: AtomicBool::new(false),
             lock: Mutex::new(()),
             changed: Condvar::new(),
+            notification: OnceLock::new(),
         })
+    }
+
+    pub(crate) fn install_notification_source(&self, source: crate::notification::NotifySource) {
+        assert!(
+            self.notification.set(source).is_ok(),
+            "progress source installed once"
+        );
+    }
+
+    pub(crate) fn notification_scope(&self) -> crate::notification::NotificationScope {
+        crate::notification::NotificationScope::enter_if(self.notification.get().is_some())
     }
 
     pub(crate) fn generation(&self) -> u64 {
@@ -177,16 +190,21 @@ impl SWWake {
         // If this precedes the first enable in SeqCst order, the mutation
         // itself precedes the subsequent snapshot. Otherwise incrementing
         // the generation lets the host detect it before sleeping.
-        if !self.enabled.load(Ordering::SeqCst) {
-            return;
+        if self.enabled.load(Ordering::SeqCst) {
+            self.generation
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |generation| {
+                    generation.checked_add(1)
+                })
+                .expect("progress wake generation exhausted");
+            let _guard = self.lock.lock().unwrap_or_else(|error| error.into_inner());
+            self.changed.notify_all();
         }
-        self.generation
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |generation| {
-                generation.checked_add(1)
-            })
-            .expect("progress wake generation exhausted");
-        let _guard = self.lock.lock().unwrap_or_else(|error| error.into_inner());
-        self.changed.notify_all();
+        // Preserve the fixed CV wake before an arbitrary host adapter. Host
+        // interest does not activate that CV, and scopes defer adapters past
+        // enclosing bookkeeping locks.
+        if let Some(source) = self.notification.get() {
+            source.publish();
+        }
     }
 
     pub(crate) fn wait_since(&self, observed: u64, deadline: Instant) -> bool {
