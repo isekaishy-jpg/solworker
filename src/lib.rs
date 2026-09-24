@@ -9,6 +9,9 @@
 //! Explicit root closure lets hosts service accepted work before joining;
 //! passive progress snapshots and deadline-based wakes report remaining work.
 //!
+//! The source checkout includes an application usage guide at
+//! `pubdocs/README.md` and runnable integration examples under `examples/`.
+//!
 //! Runtime-discarded panic payloads are destroyed inside containment. If that
 //! destruction panics, its new payload is deliberately retained to avoid an
 //! unbounded disposal/unwind chain. Caller-owned panic payloads stay caller-owned.

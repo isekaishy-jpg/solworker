@@ -3,7 +3,19 @@ name = "solworker"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.96"
+readme = "pubdocs/README.md"
 
 [dependencies]
 crossbeam-channel = "0.5.17"
 micropool = { path = "vendor/micropool" }
+
+[[bench]]
+name = "world"
+harness = false
+
+[profile.bench]
+debug = 1
+
+[[bench]]
+name = "bursts"
+harness = false
