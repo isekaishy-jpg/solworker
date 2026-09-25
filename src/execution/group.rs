@@ -32,6 +32,12 @@ struct GroupState {
 }
 
 impl GroupInner {
+    #[cfg(feature = "diagnostics")]
+    fn trace(&self, event: &'static str) {
+        let runtime = self.completion.notification_runtime_id().unwrap_or(0);
+        crate::diagnostics::record(event, runtime, self.id, 0);
+    }
+
     pub(crate) fn new(id: u64, class: SWExecutionClass) -> Self {
         Self {
             id,
@@ -156,10 +162,17 @@ impl GroupInner {
 
     fn publish(&self, terminal: Option<SWTaskStatus>) {
         if let Some(status) = terminal {
+            #[cfg(feature = "diagnostics")]
+            self.trace("group.publish.begin");
             // Dependencies can reenter the scheduler. Never publish under the
             // group mutex (or a scheduler admission lock).
-            self.completion
-                .publish_notifying(status, || self.notify_ready());
+            self.completion.publish_notifying(status, || {
+                #[cfg(feature = "diagnostics")]
+                self.trace("group.terminal_visible");
+                self.notify_ready();
+            });
+            #[cfg(feature = "diagnostics")]
+            self.trace("group.publish.end");
         }
     }
 
@@ -179,11 +192,15 @@ impl GroupInner {
     fn wait_change(&self, generation: u64) {
         let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         if state.generation == generation && !self.is_complete() {
+            #[cfg(feature = "diagnostics")]
+            self.trace("group.condvar.begin");
             drop(
                 self.changed
                     .wait(state)
                     .unwrap_or_else(|error| error.into_inner()),
             );
+            #[cfg(feature = "diagnostics")]
+            self.trace("group.condvar.end");
         }
     }
 }

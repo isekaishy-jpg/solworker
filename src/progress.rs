@@ -203,7 +203,7 @@ impl SWWake {
         // interest does not activate that CV, and scopes defer adapters past
         // enclosing bookkeeping locks.
         if let Some(source) = self.notification.get() {
-            source.publish();
+            source.publish_if_watched();
         }
     }
 

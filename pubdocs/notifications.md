@@ -51,6 +51,14 @@ completion. Register every intermediate source that the host must service to
 reach the final result. For example, a host that must pump owner delivery or
 publish an external result cannot rely only on a group completion binding.
 
+Enabling notification routes alone does not activate broad progress publication.
+Its source bookkeeping stays dormant until the first successful
+`watch_progress()` registration. After that first use, publication remains
+enabled even if every broad binding is dropped; detachment removes interest but
+does not restore the initial fast path. Completion and owner bindings keep
+their independent publication paths. Host notification interest does not
+activate the passive progress condvar.
+
 Registration requests an initial recheck, including when the source already
 changed. A completed `SWTask::ready` or `ready_outcome` token is accepted on any
 route and returns an inert binding. Runtime-owned tokens retain their runtime

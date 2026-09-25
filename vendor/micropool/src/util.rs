@@ -3,6 +3,10 @@ use std::sync::atomic::{AtomicU64, Ordering, fence};
 use std::thread::{self};
 use wait_on_address::AtomicWait;
 
+#[cfg(test)]
+#[path = "../tests/unit/event.rs"]
+mod event_tests;
+
 /// A synchronization primitive for blocking threads until an event occurs.
 /// The primitive is reusable and will wake up all pending listeners each time
 /// it is signaled.
@@ -13,6 +17,8 @@ pub struct Event {
     /// The uppermost bit is reserved for [`Self::WAITER_FLAG`],
     /// which indicates whether threads are sleeping on this event.
     atomic: AtomicU64,
+    #[cfg(test)]
+    test_hook: event_tests::Hook,
 }
 
 impl Event {
@@ -24,12 +30,16 @@ impl Event {
     pub const fn new() -> Self {
         Self {
             atomic: AtomicU64::new(0),
+            #[cfg(test)]
+            test_hook: event_tests::Hook::new(),
         }
     }
 
     /// Notifies all listeners that this event has changed.
     pub fn notify(&self) {
         let atomic = self.atomic.fetch_add(1, Ordering::Release);
+        #[cfg(test)]
+        self.test_hook.after_increment();
         if (atomic & Self::WAITER_FLAG) != 0 {
             self.atomic
                 .fetch_and(!Event::WAITER_FLAG, Ordering::Relaxed);
@@ -80,20 +90,28 @@ impl<'a> EventListener<'a> {
     /// called at least once since the previous call to [`Self::wait`] (or this
     /// listener's creation).
     pub fn wait(&mut self) {
-        let (Ok(atomic) | Err(atomic)) = self.event.atomic.compare_exchange(
-            self.version,
-            self.version | Event::WAITER_FLAG,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        );
+        loop {
+            // A delayed notifier may clear a newer listener's flag without
+            // changing its saved version, so every retry must re-arm it.
+            let (Ok(atomic) | Err(atomic)) = self.event.atomic.compare_exchange(
+                self.version,
+                self.version | Event::WAITER_FLAG,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
 
-        if !self.read_new_version(atomic) {
-            loop {
-                self.event.atomic.wait(self.version | Event::WAITER_FLAG);
+            if self.read_new_version(atomic) {
+                return;
+            }
 
-                if self.read_new_version(self.event.atomic.load(Ordering::Relaxed)) {
-                    break;
-                }
+            #[cfg(test)]
+            self.event.test_hook.before_wait(self.version);
+            self.event.atomic.wait(self.version | Event::WAITER_FLAG);
+
+            // Keep the normal wake path read-only. Retry the arm operation
+            // only if a spurious wake or a cleared flag left the version equal.
+            if self.read_new_version(self.event.atomic.load(Ordering::Relaxed)) {
+                return;
             }
         }
     }

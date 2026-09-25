@@ -61,16 +61,36 @@ pub(crate) struct WorkSetInner {
     state: Mutex<State>,
     changed: Condvar,
     wake: Arc<crate::progress::SWWake>,
+    #[cfg(test)]
+    drop_probe: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl Drop for WorkSetInner {
     fn drop(&mut self) {
+        #[cfg(test)]
+        let probe = self
+            .drop_probe
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        #[cfg(test)]
+        if let Some(probe) = probe {
+            probe();
+        }
         // Dropping the last empty, open set also removes a shutdown blocker.
         self.wake.notify();
     }
 }
 
 impl WorkSetInner {
+    #[cfg(test)]
+    pub(crate) fn on_drop_for_test(&self, probe: impl FnOnce() + Send + 'static) {
+        *self
+            .drop_probe
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(Box::new(probe));
+    }
+
     fn runtime_accepts(&self, root: bool) -> bool {
         self.control
             .upgrade()
@@ -138,11 +158,16 @@ impl WorkSetInner {
         }
     }
 
-    pub(crate) fn seal(&self) {
+    // Runtime closure calls this while control is locked, so broad progress
+    // publication belongs to the enclosing control release.
+    pub(crate) fn seal_without_progress(&self) {
         let mut state = self.lock();
         state.open = false;
         self.changed.notify_all();
-        drop(state);
+    }
+
+    pub(crate) fn seal(&self) {
+        self.seal_without_progress();
         self.wake.notify();
     }
 }
@@ -174,6 +199,8 @@ impl SWWorkSet {
                 }),
                 changed: Condvar::new(),
                 wake: control.wake(),
+                #[cfg(test)]
+                drop_probe: Mutex::new(None),
             }),
         }
     }

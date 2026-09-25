@@ -20,6 +20,8 @@
 
 mod backend;
 mod cleanup;
+#[cfg(feature = "diagnostics")]
+pub mod diagnostics;
 mod execution;
 mod external;
 mod notification;

@@ -94,6 +94,17 @@ State whether the number is main-thread elapsed time, aggregate CPU time or
 critical-path contribution. A frame's total time alone does not establish a
 50-microsecond scheduler cost, and this crate currently promises no such bound.
 
+Workers use zero configured idle spins. The backend still rechecks and re-arms
+its event after an OS wait returns; this handles changed values and spurious
+wakes without intentionally polling while idle. A function named `spin_wait`
+in a stack can include the blocking path, so its name alone does not establish
+busy spinning.
+
+Lifecycle progress publication releases the runtime count mutex before taking
+notification-source locks. This limits propagation of contention through that
+mutex; it does not guarantee immediate publication or OS scheduling. Separate
+time blocked on a lock from time a runnable thread spends waiting for CPU.
+
 ## Use benchmarks and flamegraphs together
 
 Benchmarks quantify time and variation. CPU flamegraphs locate sampled CPU costs
@@ -117,3 +128,36 @@ Keep generated profiles and reports under ignored build/output directories with
 bounded retention. Cargo's build cache and run-history artifacts serve different
 purposes; avoid duplicating the build tree for every measurement. This guide
 does not require any private repository tooling to run the public examples.
+
+## Optional diagnostic timeline
+
+The `diagnostics` Cargo feature adds `diagnostics::SWTrace`. Call `start` once
+with a shared `Instant` origin before creating the runtime, then `drain` outside
+measured work. The caller owns output and drained-buffer retention. Without the
+feature the probes are compiled out; without `start` they collect nothing.
+
+The timeline distinguishes owned ready/handoff/claim/invocation, result
+publication, group terminal publication and condition-variable returns. Scheduler
+lock acquisition and hold intervals longer than 50 microseconds include elapsed
+durations; slow holds identify the acquisition line in `src/scheduler.rs`. Lock
+intervals are buffered after unlocking. These timings include preemption and
+instrumentation, so they do not alone establish contention or production cost.
+On Windows, slow holds also record execution-cycle deltas when available. Cycle
+queries add probe cost and cycles are not a portable elapsed-time conversion.
+This observes transitions; it does not replace completion/count APIs or establish
+an OS scheduling cause. Record IDs are runtime-local; each event carries a
+process-local runtime identity, so correlate the pair rather than a record ID
+alone. Events from different threads can arrive out of timestamp order.
+
+`SWTrace::current_job()` exposes the current owned job's runtime, record and
+optional group identity for application instrumentation. Nested caller helping
+temporarily changes that identity and restores it afterward, including on unwind.
+It does not give scoped pool operations owned-job identities. Keep any application
+operation IDs and parent relationships in the caller's tracing layer. These are
+diagnostic identifiers, not scheduling or lifetime handles. Logging, warning
+policy, event analysis and OS tracing remain the application's responsibility.
+
+Storage is bounded to 64 publishing threads and 65,536 events per thread; `drain`
+reports cumulative drops. Check that count before interpreting a missing event.
+The first observation allocates its thread buffer, and draining briefly locks it.
+Use separate uninstrumented controls: traces change timing and host pacing.

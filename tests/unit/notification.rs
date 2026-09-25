@@ -2,6 +2,7 @@ use super::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Barrier, mpsc};
 use std::thread;
+use std::time::Duration;
 
 fn domain() -> Arc<NotifyDomain> {
     NotifyDomain::new(
@@ -11,6 +12,126 @@ fn domain() -> Arc<NotifyDomain> {
             bindings: 2,
         },
     )
+}
+
+#[test]
+fn broad_source_gate_tracks_successful_watch_and_terminal_state() {
+    let domain = domain();
+    let source = domain.progress_source();
+    let wake = crate::progress::SWWake::new();
+    wake.install_notification_source(source.clone());
+    wake.notify();
+    assert_eq!(source.inner.source_lock_entries.load(Ordering::SeqCst), 0);
+
+    let mut route = domain.create_route(|| Ok(())).unwrap();
+    let binding = route.watch_source(&source).unwrap();
+    assert!(source.inner.ever_watched.load(Ordering::SeqCst));
+    wake.notify();
+    assert_eq!(source.inner.source_lock_entries.load(Ordering::SeqCst), 1);
+
+    drop(binding);
+    wake.notify();
+    assert_eq!(source.inner.source_lock_entries.load(Ordering::SeqCst), 2);
+    let _rebound = route.watch_source(&source).unwrap();
+    wake.notify();
+    assert_eq!(source.inner.source_lock_entries.load(Ordering::SeqCst), 3);
+
+    let empty_domain = NotifyDomain::new(
+        31,
+        SWNotifyLimits {
+            routes: 1,
+            bindings: 0,
+        },
+    );
+    let empty_source = empty_domain.progress_source();
+    let mut empty_route = empty_domain.create_route(|| Ok(())).unwrap();
+    assert!(matches!(
+        empty_route.watch_source(&empty_source),
+        Err(SWNotifyError::Full)
+    ));
+    assert!(!empty_source.inner.ever_watched.load(Ordering::SeqCst));
+    empty_source.publish_if_watched();
+    assert_eq!(
+        empty_source
+            .inner
+            .source_lock_entries
+            .load(Ordering::SeqCst),
+        0
+    );
+
+    let terminal_source = NotifySource::new(&domain);
+    terminal_source.publish_terminal();
+    let mut terminal_route = domain.create_route(|| Ok(())).unwrap();
+    let inert = terminal_route.watch_source(&terminal_source).unwrap();
+    assert!(!lock(&inert.cell.as_ref().unwrap().state).active);
+    assert!(!terminal_source.inner.ever_watched.load(Ordering::SeqCst));
+    assert!(lock(&terminal_source.inner.state).terminal);
+}
+
+#[test]
+fn first_broad_watch_rechecks_mutations_around_registration_and_arm() {
+    let domain = domain();
+    let source = domain.progress_source();
+    let wake = crate::progress::SWWake::new();
+    wake.install_notification_source(source.clone());
+    let state = Arc::new(Mutex::new(0usize));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&calls);
+    let mut route = domain
+        .create_route(move || {
+            observed.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+        .unwrap();
+
+    // A mutation before registration takes the false fast path. The host
+    // subsequently sees that state through its synchronized snapshot.
+    *lock(&state) = 1;
+    wake.notify();
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert_eq!(source.inner.source_lock_entries.load(Ordering::SeqCst), 0);
+
+    // Hold the source lock so a registration must wait while another mutation
+    // and false-gated publication occur. Its unconditional initial mark closes
+    // that gap once membership is installed.
+    let source_guard = lock(&source.inner.state);
+    let (started_tx, started_rx) = mpsc::channel();
+    let registrar_source = source.clone();
+    let (finished_tx, finished_rx) = mpsc::channel();
+    let registrar = thread::spawn(move || {
+        started_tx.send(()).unwrap();
+        let binding = route.watch_source(&registrar_source).unwrap();
+        finished_tx.send((route, binding)).unwrap();
+    });
+    let started = started_rx.recv_timeout(Duration::from_secs(5));
+    let publisher_state = Arc::clone(&state);
+    let publisher_wake = Arc::clone(&wake);
+    let (published_tx, published_rx) = mpsc::channel();
+    let publisher = thread::spawn(move || {
+        *lock(&publisher_state) = 2;
+        publisher_wake.notify();
+        let _ = published_tx.send(());
+    });
+    let published_while_locked = published_rx.recv_timeout(Duration::from_secs(5)).is_ok();
+    let skipped_entries = source.inner.source_lock_entries.load(Ordering::SeqCst);
+    drop(source_guard);
+    publisher.join().unwrap();
+    let (mut route, _binding) = finished_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    registrar.join().unwrap();
+    started.unwrap();
+    assert!(
+        published_while_locked,
+        "never-watched publication took the source lock"
+    );
+    assert_eq!(skipped_entries, 0);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    let stamp = route.prepare_wait().unwrap();
+    assert_eq!(*lock(&state), 2);
+    assert!(!route.changed_since(stamp).unwrap());
+    *lock(&state) = 3;
+    wake.notify();
+    assert!(route.changed_since(stamp).unwrap());
 }
 
 #[test]

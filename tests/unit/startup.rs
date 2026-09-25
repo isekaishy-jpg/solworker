@@ -1,12 +1,152 @@
 use std::cell::RefCell;
 use std::io;
+use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use super::{Phase, Startup};
+use super::{BackendOwner, Phase, RuntimeControl, Startup};
+use crate::external::PhysicalRegistry;
+use crate::notification::SWNotifyLimits;
 use crate::{SWBuildError, SWExecutionClass, SWRuntime, SWRuntimeConfig, SWWorkerConfig};
+
+const LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn notification_control() -> (Arc<RuntimeControl>, Arc<BackendOwner>) {
+    let backend = Arc::new(BackendOwner::new(Vec::new()));
+    let physical = PhysicalRegistry::new(NonZeroUsize::new(2), 0);
+    let control = Arc::new(RuntimeControl::new_with_notifications(
+        &backend,
+        physical,
+        Some(SWNotifyLimits {
+            routes: 1,
+            bindings: 1,
+        }),
+    ));
+    (control, backend)
+}
+
+fn control_readable_during_source_publication(
+    control: Arc<RuntimeControl>,
+    mutate: impl FnOnce(Arc<RuntimeControl>) + Send + 'static,
+    observe: impl Fn(&RuntimeControl) -> bool + Send + 'static,
+) {
+    let domain = Arc::clone(control.notification_domain().unwrap());
+    let mut route = domain.create_route(|| Ok(())).unwrap();
+    let _binding = route.watch_source(&domain.progress_source()).unwrap();
+
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let holder = thread::spawn(move || {
+        domain.with_progress_source_lock_for_test(|| {
+            entered_tx.send(()).unwrap();
+            release_rx.recv_timeout(LOCK_TIMEOUT).unwrap();
+        });
+    });
+    entered_rx.recv_timeout(LOCK_TIMEOUT).unwrap();
+
+    let mutator_control = Arc::clone(&control);
+    let mutator = thread::spawn(move || mutate(mutator_control));
+    let (probe_tx, probe_rx) = mpsc::channel();
+    let probe = thread::spawn(move || {
+        let deadline = Instant::now() + LOCK_TIMEOUT;
+        while Instant::now() < deadline {
+            if observe(&control) {
+                let _ = probe_tx.send(true);
+                return;
+            }
+            thread::yield_now();
+        }
+        let _ = probe_tx.send(false);
+    });
+    // Release and join even when the assertion fails, so a broken lock
+    // boundary does not leave a blocked thread behind.
+    let readable = probe_rx
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap_or(false);
+    release_tx.send(()).unwrap();
+    holder.join().unwrap();
+    mutator.join().unwrap();
+    probe.join().unwrap();
+    assert!(
+        readable,
+        "control remained locked during source publication"
+    );
+    route.close().unwrap();
+}
+
+#[test]
+fn admission_publication_releases_control_before_source_lock() {
+    let (control, _backend) = notification_control();
+    control_readable_during_source_publication(
+        Arc::clone(&control),
+        |control| {
+            let admission = control.admit_owned(false).unwrap();
+            drop(admission);
+        },
+        |control| control.active_leases() == 1,
+    );
+    let admission = control.admit_owned(false).unwrap();
+    control_readable_during_source_publication(
+        control,
+        move |_| drop(admission),
+        |control| control.active_leases() == 0,
+    );
+}
+
+#[test]
+fn closure_publication_releases_control_after_sealing_sets() {
+    let (control, _backend) = notification_control();
+    let set = control.work_set(NonZeroUsize::new(1).unwrap()).unwrap();
+    let observed_set = set.clone();
+    control_readable_during_source_publication(
+        control,
+        |control| control.begin_shutdown(),
+        move |control| {
+            control.phase() == crate::runtime::SWRuntimeState::Closing
+                && observed_set.progress().sealed
+        },
+    );
+}
+
+#[test]
+fn last_upgraded_set_drops_after_quiescence_scan_unlocks_control() {
+    let (control, _backend) = notification_control();
+    let set = control.work_set(NonZeroUsize::new(1).unwrap()).unwrap();
+    control.begin_shutdown();
+
+    let (drop_started_tx, drop_started_rx) = mpsc::channel();
+    let (release_drop_tx, release_drop_rx) = mpsc::channel();
+    set.inner.on_drop_for_test(move || {
+        drop_started_tx.send(()).unwrap();
+        release_drop_rx.recv_timeout(LOCK_TIMEOUT).unwrap();
+    });
+
+    let (upgraded_tx, upgraded_rx) = mpsc::channel();
+    let (release_scan_tx, release_scan_rx) = mpsc::channel();
+    control.on_quiescence_scan_for_test(move || {
+        upgraded_tx.send(()).unwrap();
+        release_scan_rx.recv_timeout(LOCK_TIMEOUT).unwrap();
+    });
+    let scan_control = Arc::clone(&control);
+    let scanner = thread::spawn(move || scan_control.is_quiescent());
+    upgraded_rx.recv_timeout(LOCK_TIMEOUT).unwrap();
+    drop(set);
+    release_scan_tx.send(()).unwrap();
+    drop_started_rx.recv_timeout(LOCK_TIMEOUT).unwrap();
+
+    let (probe_tx, probe_rx) = mpsc::channel();
+    let probe_control = Arc::clone(&control);
+    let probe = thread::spawn(move || {
+        probe_tx.send(probe_control.phase()).unwrap();
+    });
+    let readable = probe_rx.recv_timeout(Duration::from_secs(2));
+    release_drop_tx.send(()).unwrap();
+    scanner.join().unwrap();
+    probe.join().unwrap();
+    assert_eq!(readable.unwrap(), crate::runtime::SWRuntimeState::Closing);
+}
 
 struct CountExit(Arc<AtomicUsize>);
 

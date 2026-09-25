@@ -33,6 +33,7 @@ impl MicropoolBackend {
     ) -> Result<Self, E> {
         ThreadPoolBuilder::default()
             .num_threads(num_threads)
+            .idle_spin_cycles(0)
             .try_build_with(spawn)
             .map(|pool| Self { pool })
     }

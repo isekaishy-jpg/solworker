@@ -194,13 +194,48 @@ pub(crate) struct RuntimeControl {
     physical: Arc<crate::external::PhysicalRegistry>,
     wake: Arc<crate::progress::SWWake>,
     notifications: Option<Arc<crate::notification::NotifyDomain>>,
+    #[cfg(test)]
+    quiescence_scan_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 // The scope outlives the mutex guard, including early returns and unwinding.
 // Nested publications may record claims, but cannot call adapters under control.
 struct ControlGuard<'a> {
     state: MutexGuard<'a, ControlState>,
+    #[cfg(feature = "diagnostics")]
+    _trace: ControlRelease,
+    progress: ProgressOnRelease<'a>,
     _notification: crate::notification::NotificationScope,
+}
+
+struct ProgressOnRelease<'a> {
+    wake: &'a crate::progress::SWWake,
+    marked: bool,
+}
+
+impl Drop for ProgressOnRelease<'_> {
+    fn drop(&mut self) {
+        // Control and its release diagnostic have already dropped. The
+        // notification scope still defers adapters until this returns.
+        if self.marked {
+            self.wake.notify();
+        }
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+struct ControlRelease {
+    runtime: u64,
+    site: u64,
+}
+
+#[cfg(feature = "diagnostics")]
+impl Drop for ControlRelease {
+    fn drop(&mut self) {
+        // Fields drop in declaration order: the mutex is already released,
+        // and deferred notification adapters have not yet been drained.
+        crate::diagnostics::record("control.released", self.runtime, self.site, 0);
+    }
 }
 
 impl std::ops::Deref for ControlGuard<'_> {
@@ -213,6 +248,12 @@ impl std::ops::Deref for ControlGuard<'_> {
 impl std::ops::DerefMut for ControlGuard<'_> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.state
+    }
+}
+
+impl ControlGuard<'_> {
+    fn mark_progress(&mut self) {
+        self.progress.marked = true;
     }
 }
 
@@ -250,13 +291,32 @@ impl RuntimeControl {
             physical,
             wake,
             notifications,
+            #[cfg(test)]
+            quiescence_scan_hook: Mutex::new(None),
         }
     }
 
+    #[cfg_attr(feature = "diagnostics", track_caller)]
     fn lock(&self) -> ControlGuard<'_> {
         let scope = self.wake.notification_scope();
+        #[cfg(feature = "diagnostics")]
+        let site = u64::from(std::panic::Location::caller().line());
+        #[cfg(feature = "diagnostics")]
+        crate::diagnostics::record("control.request", self.id, site, 0);
+        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        #[cfg(feature = "diagnostics")]
+        crate::diagnostics::record("control.acquired", self.id, site, state.active as u64);
         ControlGuard {
-            state: self.state.lock().unwrap_or_else(|error| error.into_inner()),
+            state,
+            #[cfg(feature = "diagnostics")]
+            _trace: ControlRelease {
+                runtime: self.id,
+                site,
+            },
+            progress: ProgressOnRelease {
+                wake: &self.wake,
+                marked: false,
+            },
             _notification: scope,
         }
     }
@@ -285,7 +345,7 @@ impl RuntimeControl {
             .active
             .checked_add(1)
             .expect("owner root count overflow");
-        self.wake.notify();
+        state.mark_progress();
         Ok(OwnedAdmission {
             control: Arc::clone(self),
         })
@@ -317,7 +377,7 @@ impl RuntimeControl {
             .external
             .checked_add(1)
             .expect("external count exhausted");
-        self.wake.notify();
+        state.mark_progress();
         Ok(ExternalAdmission {
             control: Arc::clone(self),
         })
@@ -332,14 +392,14 @@ impl RuntimeControl {
             return Err(SWSpawnError::InvalidContext);
         }
         let descendant = current().is_some_and(|context| context.runtime == self.id);
-        let state = self.lock();
+        let mut state = self.lock();
         if state.phase != SWRuntimeState::Running
             && !(state.phase == SWRuntimeState::Closing && (accounted || descendant))
         {
             return Err(SWSpawnError::Closed);
         }
         let id = self.physical.reserve(required)?;
-        self.wake.notify();
+        state.mark_progress();
         Ok(id)
     }
 
@@ -349,7 +409,7 @@ impl RuntimeControl {
         id: u64,
         work_set: Option<&crate::scheduler::work_set::WorkSetLease>,
     ) -> Result<(), SWSpawnError> {
-        let state = self.lock();
+        let mut state = self.lock();
         if !matches!(
             state.phase,
             SWRuntimeState::Running | SWRuntimeState::Closing
@@ -363,7 +423,7 @@ impl RuntimeControl {
             Ok(())
         };
         if result.is_ok() {
-            self.notify_progress();
+            state.mark_progress();
         }
         result
     }
@@ -386,17 +446,15 @@ impl RuntimeControl {
         let set = crate::scheduler::SWWorkSet::new(self, capacity);
         state.work_sets.retain(|set| set.strong_count() != 0);
         state.work_sets.push(Arc::downgrade(&set.inner));
-        self.wake.notify();
+        state.mark_progress();
         Ok(set)
     }
 
     pub(super) fn cancel_work_sets(&self) {
-        let sets = self
-            .lock()
-            .work_sets
-            .iter()
-            .filter_map(Weak::upgrade)
-            .collect::<Vec<_>>();
+        let mut sets = Vec::new();
+        let state = self.lock();
+        sets.extend(state.work_sets.iter().filter_map(Weak::upgrade));
+        drop(state);
         for set in sets {
             set.cancel();
         }
@@ -424,8 +482,7 @@ impl RuntimeControl {
         state.next_owner = id.checked_add(1).expect("owner identity exhausted");
         state.owner_closers.insert(id, Arc::downgrade(&closer));
         state.owner_progress.insert(id, Arc::downgrade(&progress));
-        self.wake.notify();
-        drop(state);
+        state.mark_progress();
         context::register_live_owner();
         Ok(OwnerRegistration {
             control: Arc::clone(self),
@@ -464,12 +521,10 @@ impl RuntimeControl {
     }
 
     pub(crate) fn work_sets_progress(&self) -> crate::progress::SWWorkSetsProgress {
-        let sets = self
-            .lock()
-            .work_sets
-            .iter()
-            .filter_map(Weak::upgrade)
-            .collect::<Vec<_>>();
+        let mut sets = Vec::new();
+        let state = self.lock();
+        sets.extend(state.work_sets.iter().filter_map(Weak::upgrade));
+        drop(state);
         let mut total = crate::progress::SWWorkSetsProgress {
             sets: sets.len(),
             ..Default::default()
@@ -522,7 +577,7 @@ impl RuntimeControl {
             .active
             .checked_add(1)
             .expect("owned admission count overflow");
-        self.wake.notify();
+        state.mark_progress();
         Ok(OwnedAdmission {
             control: Arc::clone(self),
         })
@@ -551,7 +606,7 @@ impl RuntimeControl {
             .active
             .checked_add(1)
             .expect("execution lease count overflow");
-        self.wake.notify();
+        state.mark_progress();
         Ok(ExecutionLease {
             control: Arc::clone(self),
             backend: Some(backend),
@@ -586,7 +641,7 @@ impl RuntimeControl {
             .active
             .checked_add(1)
             .expect("execution lease count overflow");
-        self.wake.notify();
+        state.mark_progress();
         Ok(ExecutionLease {
             control: Arc::clone(self),
             backend: Some(backend),
@@ -595,6 +650,9 @@ impl RuntimeControl {
     }
 
     pub(super) fn prepare_shutdown(&self) -> Result<(), SWShutdownError> {
+        // Declared before control so a last upgraded set cannot drop under it,
+        // including rejected shutdown and unwinding paths.
+        let mut sets = Vec::new();
         let mut state = self.lock();
         if !state.owner_closers.is_empty() {
             return Err(SWShutdownError::LiveOwners);
@@ -602,19 +660,19 @@ impl RuntimeControl {
         if state.external != 0 || !self.physical.is_empty() {
             return Err(SWShutdownError::LiveExternal);
         }
-        if state
-            .work_sets
-            .iter()
-            .filter_map(Weak::upgrade)
-            .any(|set| !set.progress().is_drained())
-        {
+        sets.extend(state.work_sets.iter().filter_map(Weak::upgrade));
+        if sets.iter().any(|set| !set.progress().is_drained()) {
             return Err(SWShutdownError::LiveWorkSets);
         }
-        self.begin_shutdown_locked(&mut state);
+        self.begin_shutdown_locked(&mut state, &sets);
         Ok(())
     }
 
-    fn begin_shutdown_locked(&self, state: &mut ControlState) {
+    fn begin_shutdown_locked(
+        &self,
+        state: &mut ControlGuard<'_>,
+        sets: &[Arc<crate::scheduler::work_set::WorkSetInner>],
+    ) {
         if state.phase != SWRuntimeState::Running {
             return;
         }
@@ -622,43 +680,67 @@ impl RuntimeControl {
         // while holding this lock prevents a racing root from slipping through.
         state.phase = SWRuntimeState::Closing;
         state.work_sets.retain(|set| set.strong_count() != 0);
-        for set in state.work_sets.iter().filter_map(Weak::upgrade) {
-            set.seal();
+        for set in sets {
+            set.seal_without_progress();
         }
-        self.notify_progress();
+        state.mark_progress();
     }
 
     pub(super) fn begin_shutdown(&self) {
+        let mut sets = Vec::new();
         let mut state = self.lock();
-        self.begin_shutdown_locked(&mut state);
+        if state.phase != SWRuntimeState::Running {
+            return;
+        }
+        sets.extend(state.work_sets.iter().filter_map(Weak::upgrade));
+        self.begin_shutdown_locked(&mut state, &sets);
     }
 
     pub(super) fn is_quiescent(&self) -> bool {
+        let mut sets = Vec::new();
         let state = self.lock();
-        state.phase == SWRuntimeState::Closing
-            && state.active == 0
-            && state.external == 0
-            && state.owner_closers.is_empty()
-            && self.physical.is_empty()
-            && state
-                .work_sets
-                .iter()
-                .filter_map(Weak::upgrade)
-                .all(|set| set.progress().is_drained())
+        if state.phase != SWRuntimeState::Closing
+            || state.active != 0
+            || state.external != 0
+            || !state.owner_closers.is_empty()
+            || !self.physical.is_empty()
+        {
+            return false;
+        }
+        sets.extend(state.work_sets.iter().filter_map(Weak::upgrade));
+        #[cfg(test)]
+        {
+            let hook = self
+                .quiescence_scan_hook
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+        sets.iter().all(|set| set.progress().is_drained())
+    }
+
+    #[cfg(test)]
+    fn on_quiescence_scan_for_test(&self, hook: impl FnOnce() + Send + 'static) {
+        *self
+            .quiescence_scan_hook
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(Box::new(hook));
     }
 
     pub(super) fn shutdown_blocker(&self) -> Option<SWShutdownError> {
+        let mut sets = Vec::new();
         let state = self.lock();
         if !state.owner_closers.is_empty() {
-            Some(SWShutdownError::LiveOwners)
-        } else if state.external != 0 || !self.physical.is_empty() {
-            Some(SWShutdownError::LiveExternal)
-        } else if state
-            .work_sets
-            .iter()
-            .filter_map(Weak::upgrade)
-            .any(|set| !set.progress().is_drained())
-        {
+            return Some(SWShutdownError::LiveOwners);
+        }
+        if state.external != 0 || !self.physical.is_empty() {
+            return Some(SWShutdownError::LiveExternal);
+        }
+        sets.extend(state.work_sets.iter().filter_map(Weak::upgrade));
+        if sets.iter().any(|set| !set.progress().is_drained()) {
             Some(SWShutdownError::LiveWorkSets)
         } else {
             None
@@ -666,8 +748,9 @@ impl RuntimeControl {
     }
 
     pub(super) fn set_phase(&self, phase: SWRuntimeState) {
-        self.lock().phase = phase;
-        self.notify_progress();
+        let mut state = self.lock();
+        state.phase = phase;
+        state.mark_progress();
     }
 }
 
@@ -722,7 +805,7 @@ impl Drop for ExecutionLease {
         drop(self.backend.take());
         let mut state = self.control.lock();
         state.active -= 1;
-        self.control.wake.notify();
+        state.mark_progress();
     }
 }
 
@@ -740,7 +823,7 @@ impl Drop for ExternalAdmission {
     fn drop(&mut self) {
         let mut state = self.control.lock();
         state.external -= 1;
-        self.control.wake.notify();
+        state.mark_progress();
     }
 }
 
@@ -748,6 +831,6 @@ impl Drop for OwnedAdmission {
     fn drop(&mut self) {
         let mut state = self.control.lock();
         state.active -= 1;
-        self.control.wake.notify();
+        state.mark_progress();
     }
 }

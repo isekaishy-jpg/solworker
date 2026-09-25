@@ -181,7 +181,13 @@ destruction and implicit access to a worker's scratch buffer.
 
 `SWGroup::help_ready` attempts one ready eligible member of that exact group.
 It does not recursively help every prerequisite group. If the needed producer
-is in another group, that producer must have its own progress route.
+is in another group, that producer must have its own progress route. At a
+consumer boundary, explicitly help/wait the known producer groups before their
+gated successor group, or service both in the host loop. Submit the successor
+early to preserve overlap; helping producers does not require delaying its
+admission. A logically finished caller-run job may still have an outstanding
+backend wrapper occupying a handoff slot, so successor-only helping can leave
+ready producer work idle until a worker drains those wrappers.
 `wait_helping` helps and then parks until the group settles. It does not pump
 owner callbacks or a native event loop. It is suitable only when the remaining
 work can finish without services that the waiting caller must provide.

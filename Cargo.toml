@@ -5,6 +5,9 @@ edition = "2024"
 rust-version = "1.96"
 readme = "pubdocs/README.md"
 
+[features]
+diagnostics = []
+
 [dependencies]
 crossbeam-channel = "0.5.17"
 micropool = { path = "vendor/micropool" }

@@ -7,6 +7,9 @@ use std::marker::PhantomData;
 use std::mem::ManuallyDrop;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::rc::Rc;
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 /// Preallocated route and binding capacities for one runtime. Zero routes
@@ -112,6 +115,13 @@ impl NotifyDomain {
             .get()
             .expect("enabled notification domain has progress source")
             .clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_progress_source_lock_for_test(&self, callback: impl FnOnce()) {
+        let source = self.progress_source();
+        let _guard = lock(&source.inner.state);
+        callback();
     }
 
     pub(crate) fn create_route<F>(
@@ -231,6 +241,9 @@ struct SourceState {
 struct SourceInner {
     runtime_id: u64,
     serial: u64,
+    ever_watched: AtomicBool,
+    #[cfg(test)]
+    source_lock_entries: AtomicUsize,
     state: Mutex<SourceState>,
 }
 
@@ -259,6 +272,9 @@ impl NotifySource {
             inner: Arc::new(SourceInner {
                 runtime_id: domain.runtime_id,
                 serial: *serial,
+                ever_watched: AtomicBool::new(false),
+                #[cfg(test)]
+                source_lock_entries: AtomicUsize::new(0),
                 state: Mutex::new(SourceState {
                     terminal: false,
                     head: None,
@@ -280,13 +296,32 @@ impl NotifySource {
         self.publish_impl(false);
     }
 
+    /// Broad nonterminal progress can skip source bookkeeping until its first
+    /// successful registration. The gate stays enabled after detachment.
+    pub(crate) fn publish_if_watched(&self) {
+        if self.inner.ever_watched.load(Ordering::SeqCst) {
+            self.publish_impl(false);
+        }
+    }
+
     /// Marks a one-shot source changed and removes its memberships.
     pub(crate) fn publish_terminal(&self) {
         self.publish_impl(true);
     }
 
     fn publish_impl(&self, terminal: bool) {
+        #[cfg(feature = "diagnostics")]
+        crate::diagnostics::record(
+            "notify.publish.begin",
+            self.runtime_id(),
+            self.serial(),
+            u64::from(terminal),
+        );
         let _scope = NotificationScope::enter();
+        #[cfg(test)]
+        self.inner
+            .source_lock_entries
+            .fetch_add(1, Ordering::SeqCst);
         let mut state = lock(&self.inner.state);
         if state.terminal {
             return;
@@ -314,6 +349,13 @@ impl NotifySource {
         if terminal {
             state.head = None;
         }
+        #[cfg(feature = "diagnostics")]
+        crate::diagnostics::record(
+            "notify.publish.marked",
+            self.runtime_id(),
+            self.serial(),
+            u64::from(terminal),
+        );
     }
 }
 
@@ -428,6 +470,13 @@ struct RouteCell {
 }
 
 impl RouteCell {
+    #[cfg(feature = "diagnostics")]
+    fn trace(&self, event: &'static str, related: u64) {
+        if let Some(domain) = self.domain.upgrade() {
+            crate::diagnostics::record(event, domain.runtime_id, self.index as u64 + 1, related);
+        }
+    }
+
     fn new(index: usize, domain: Weak<NotifyDomain>) -> Self {
         Self {
             index,
@@ -459,7 +508,11 @@ impl RouteCell {
                 return;
             };
             state.epoch = epoch;
+            #[cfg(feature = "diagnostics")]
+            self.trace("notify.changed", epoch);
             if state.pending {
+                #[cfg(feature = "diagnostics")]
+                self.trace("notify.coalesced", epoch);
                 return;
             }
             state.pending = true;
@@ -484,7 +537,11 @@ impl RouteCell {
             state.signal.as_ref().map(Arc::clone)
         };
         if let Some(signal) = signal {
+            #[cfg(feature = "diagnostics")]
+            self.trace("notify.signal.begin", 0);
             let result = catch_unwind(AssertUnwindSafe(|| signal()));
+            #[cfg(feature = "diagnostics")]
+            self.trace("notify.signal.end", 0);
             let mut fault = match result {
                 Ok(Ok(())) => None,
                 Ok(Err(error)) => {
@@ -609,10 +666,16 @@ impl SWNotifyRoute {
             binding.route_generation = self.generation;
             binding.next = source_state.head.take();
             source_state.head = Some(Arc::clone(&cell));
+            // Membership is installed under the source lock before a publisher
+            // can observe this flag. The initial mark below covers a publisher
+            // whose false load preceded this first registration.
+            source.inner.ever_watched.store(true, Ordering::SeqCst);
         }
         drop(route);
         drop(binding);
         drop(source_state);
+        #[cfg(feature = "diagnostics")]
+        self.cell.trace("notify.watch", source.serial());
         // Initial recheck covers state published before or during registration.
         self.cell.mark_changed(self.generation);
         Ok(SWNotifyBinding {
@@ -685,6 +748,8 @@ impl SWNotifyRoute {
             return Err(SWNotifyError::Faulted);
         }
         state.pending = false;
+        #[cfg(feature = "diagnostics")]
+        self.cell.trace("notify.arm", state.epoch);
         Ok(SWNotifyStamp {
             runtime_id: self.domain.runtime_id,
             route_index: self.cell.index,
@@ -705,7 +770,17 @@ impl SWNotifyRoute {
             return Err(SWNotifyError::ForeignStamp);
         }
         let state = lock(&self.cell.state);
-        Ok(state.closed || state.fault.is_some() || state.epoch != stamp.epoch)
+        let changed = state.closed || state.fault.is_some() || state.epoch != stamp.epoch;
+        #[cfg(feature = "diagnostics")]
+        self.cell.trace(
+            if changed {
+                "notify.recheck.changed"
+            } else {
+                "notify.recheck.unchanged"
+            },
+            stamp.epoch,
+        );
+        Ok(changed)
     }
 
     pub fn fault(&self) -> Option<SWNotifyFault> {

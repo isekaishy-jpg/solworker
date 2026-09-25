@@ -209,10 +209,94 @@ struct State {
     subscriptions: BufferPool<Subscription>,
 }
 
+#[cfg(not(feature = "diagnostics"))]
+type StateGuard<'a> = MutexGuard<'a, State>;
+
+#[cfg(feature = "diagnostics")]
+struct StateGuard<'a> {
+    guard: Option<MutexGuard<'a, State>>,
+    timing: Option<(std::time::Instant, std::time::Instant)>,
+    scheduler: u64,
+    runtime: u64,
+    site: u32,
+    cycles: Option<u64>,
+}
+
+#[cfg(feature = "diagnostics")]
+impl std::ops::Deref for StateGuard<'_> {
+    type Target = State;
+    fn deref(&self) -> &State {
+        self.guard.as_deref().expect("live state guard")
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+impl std::ops::DerefMut for StateGuard<'_> {
+    fn deref_mut(&mut self) -> &mut State {
+        self.guard.as_deref_mut().expect("live state guard")
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+impl Drop for StateGuard<'_> {
+    fn drop(&mut self) {
+        let cycles = self
+            .cycles
+            .and_then(|start| crate::diagnostics::cycles().map(|end| end.saturating_sub(start)));
+        let released = self.timing.map(|_| std::time::Instant::now());
+        // Trace buffering must not extend the scheduler critical section.
+        drop(self.guard.take());
+        if let (Some((started, acquired)), Some(released)) = (self.timing, released) {
+            let waiting = acquired
+                .duration_since(started)
+                .as_nanos()
+                .min(u64::MAX as u128) as u64;
+            let holding = released
+                .duration_since(acquired)
+                .as_nanos()
+                .min(u64::MAX as u128) as u64;
+            if waiting >= 50_000 {
+                crate::diagnostics::record_at(
+                    "scheduler.lock.slow",
+                    self.runtime,
+                    self.scheduler,
+                    waiting,
+                    acquired,
+                );
+            }
+            if holding >= 50_000 {
+                crate::diagnostics::record_at(
+                    "scheduler.hold.slow",
+                    self.runtime,
+                    self.scheduler,
+                    holding,
+                    released,
+                );
+                if let Some(cycles) = cycles {
+                    crate::diagnostics::record_at(
+                        "scheduler.hold.cycles",
+                        self.runtime,
+                        self.scheduler,
+                        cycles,
+                        released,
+                    );
+                }
+                crate::diagnostics::record_at(
+                    "scheduler.hold.site",
+                    self.runtime,
+                    self.scheduler,
+                    u64::from(self.site),
+                    released,
+                );
+            }
+        }
+    }
+}
+
 /// Publish wake changes after releasing the scheduler lock. Read-only snapshots
 /// use the plain guard and cannot wake themselves.
 struct StateMutation<'a> {
-    state: Option<MutexGuard<'a, State>>,
+    state: Option<StateGuard<'a>>,
     wake: &'a crate::progress::SWWake,
     _notification: crate::notification::NotificationScope,
 }
@@ -251,6 +335,8 @@ impl Drop for ProviderCallbacks<'_> {
 /// One control domain for admission, dependencies, claims and terminal cleanup.
 pub(crate) struct OwnedScheduler {
     control: Weak<RuntimeControl>,
+    #[cfg(feature = "diagnostics")]
+    trace_runtime: u64,
     limits: SWOwnedLimits,
     state: Mutex<State>,
     groups: GroupPool,
@@ -259,6 +345,25 @@ pub(crate) struct OwnedScheduler {
 }
 
 impl OwnedScheduler {
+    #[cfg(feature = "diagnostics")]
+    fn trace(&self, event: &'static str, id: u64, related: u64) {
+        crate::diagnostics::record(event, self.trace_runtime, id, related);
+    }
+
+    #[cfg(feature = "diagnostics")]
+    fn trace_job(&self, id: u64) -> crate::diagnostics::JobGuard {
+        let group = self
+            .lock()
+            .records
+            .get(&id)
+            .and_then(|record| record.group.as_ref().map(|group| group.id));
+        crate::diagnostics::JobGuard::enter(crate::diagnostics::SWTraceJob {
+            runtime: self.trace_runtime,
+            id,
+            group,
+        })
+    }
+
     pub(crate) fn admit_external<'a, T: Send + 'static>(
         self: &Arc<Self>,
         control: &Arc<RuntimeControl>,
@@ -494,7 +599,9 @@ impl OwnedScheduler {
         }
     }
 
-    fn push_ready(state: &mut State, class: SWExecutionClass, id: u64) {
+    fn push_ready(&self, state: &mut State, class: SWExecutionClass, id: u64) {
+        #[cfg(feature = "diagnostics")]
+        self.trace("job.ready", id, class.index() as u64);
         if state.records.get(&id).is_some_and(|record| record.resource) {
             let selection = state
                 .demand
@@ -663,6 +770,8 @@ impl OwnedScheduler {
             capacity.set_wake(Arc::clone(&wake));
         }
         Arc::new(Self {
+            #[cfg(feature = "diagnostics")]
+            trace_runtime: control.upgrade().expect("building live runtime").identity(),
             control,
             limits,
             capacity,
@@ -686,10 +795,27 @@ impl OwnedScheduler {
         })
     }
 
-    fn lock(&self) -> MutexGuard<'_, State> {
-        self.state.lock().unwrap_or_else(|error| error.into_inner())
+    #[track_caller]
+    fn lock(&self) -> StateGuard<'_> {
+        #[cfg(feature = "diagnostics")]
+        let started = crate::diagnostics::clock();
+        let guard = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        #[cfg(feature = "diagnostics")]
+        {
+            StateGuard {
+                guard: Some(guard),
+                timing: started.map(|start| (start, std::time::Instant::now())),
+                scheduler: self as *const Self as usize as u64,
+                runtime: self.trace_runtime,
+                site: std::panic::Location::caller().line(),
+                cycles: started.and_then(|_| crate::diagnostics::cycles()),
+            }
+        }
+        #[cfg(not(feature = "diagnostics"))]
+        guard
     }
 
+    #[track_caller]
     fn lock_mut(&self) -> StateMutation<'_> {
         let notification = self.wake.notification_scope();
         StateMutation {
@@ -1056,7 +1182,7 @@ impl OwnedScheduler {
             },
         );
         if stage == Stage::Ready {
-            Self::push_ready(&mut state, class, id);
+            self.push_ready(&mut state, class, id);
         } else if stage == Stage::DeferredReady {
             state.deferred[class.index()].push_back(id);
         }
@@ -1135,7 +1261,7 @@ impl OwnedScheduler {
                     .expect("activation retains record");
                 if has_slot {
                     record.stage = Stage::Ready;
-                    Self::push_ready(&mut state, class, id);
+                    self.push_ready(&mut state, class, id);
                     group = ready_group;
                 } else {
                     record.stage = Stage::DeferredReady;
@@ -1230,6 +1356,8 @@ impl OwnedScheduler {
             self.promote_locked(&mut state, class);
             (job, class, group_id)
         };
+        #[cfg(feature = "diagnostics")]
+        self.trace("job.claimed", id, group_id.unwrap_or(0));
         let _context = ContextGuard::enter_owned(control.identity(), class, group_id);
         self.settle(job, Decision::Run);
         true
@@ -1238,6 +1366,8 @@ impl OwnedScheduler {
     fn run_job(self: &Arc<Self>, job: &Job) {
         // The claim obtains a temporary backend lease before running. Queued
         // records retain only admission credit and never own a backend Arc.
+        #[cfg(feature = "diagnostics")]
+        self.trace("job.backend_entry", job.id(), 0);
         self.claim_and_run(job.id(), false);
     }
 
@@ -1308,7 +1438,7 @@ impl OwnedScheduler {
             if let Some(group) = &record.group {
                 group.notify_ready();
             }
-            Self::push_ready(state, class, id);
+            self.push_ready(state, class, id);
         }
     }
 
@@ -1338,12 +1468,24 @@ impl OwnedScheduler {
         let Some(envelope) = job.take_envelope() else {
             return;
         };
+        #[cfg(feature = "diagnostics")]
+        let _trace_job = self.trace_job(job.id());
         // Cancellation and abandonment may be initiated by a host caller.
         // Destructors and terminal callbacks remain participating CPU work,
         // so a shutdown requested from either must not join this runtime.
         let _context = self.cleanup_context(job.id());
         // Capture cleanup executes outside the control lock. The admission
         // token stays live through result publication and group completion.
+        #[cfg(feature = "diagnostics")]
+        self.trace(
+            if matches!(&decision, Decision::Run) {
+                "job.invoke"
+            } else {
+                "job.suppress"
+            },
+            job.id(),
+            0,
+        );
         let finish = match catch_unwind(AssertUnwindSafe(|| envelope(decision))) {
             Ok(finish) => finish,
             Err(payload) => {
@@ -1351,6 +1493,8 @@ impl OwnedScheduler {
                 Box::new(|| {})
             }
         };
+        #[cfg(feature = "diagnostics")]
+        self.trace("job.body_returned", job.id(), 0);
         {
             let mut state = self.lock_mut();
             if let Some(record) = state.records.get_mut(&job.id()) {
@@ -1361,6 +1505,11 @@ impl OwnedScheduler {
     }
 
     fn finish_record(self: &Arc<Self>, id: u64, finish: Finish) {
+        #[cfg(feature = "diagnostics")]
+        let _trace_job = match crate::diagnostics::SWTrace::current_job() {
+            Some(job) if job.runtime == self.trace_runtime && job.id == id => None,
+            _ => Some(self.trace_job(id)),
+        };
         let _context = self.cleanup_context(id);
         let mut subscriptions = {
             let mut state = self.lock_mut();
@@ -1375,12 +1524,16 @@ impl OwnedScheduler {
         };
         subscriptions.clear();
         self.lock_mut().subscriptions.release(subscriptions);
+        #[cfg(feature = "diagnostics")]
+        self.trace("job.result_publish.begin", id, 0);
         if let Err(payload) = catch_unwind(AssertUnwindSafe(finish)) {
             crate::cleanup::discard_panic(payload);
         }
         // A terminal publication can activate another edge, which can itself
         // publish a terminal outcome. Drain those callbacks without recursing,
         // and retain this record's credits until its callbacks have run.
+        #[cfg(feature = "diagnostics")]
+        self.trace("job.result_publish.end", id, 0);
         enqueue_activation(Activation::Finalize(Arc::clone(self), id));
     }
 
@@ -1404,6 +1557,8 @@ impl OwnedScheduler {
                 .expect("group member retains its completion")
                 .status()
                 .expect("settled member has an outcome");
+            #[cfg(feature = "diagnostics")]
+            self.trace("job.group_finish", id, group.id);
             group.finish(Some(status));
         }
         // Keep runtime closure accounted through group-trigger publication,
@@ -1483,6 +1638,12 @@ impl OwnedScheduler {
                         continue;
                     }
                     record.stage = Stage::Handed;
+                    #[cfg(feature = "diagnostics")]
+                    self.trace(
+                        "job.handed",
+                        id,
+                        record.group.as_ref().map_or(0, |group| group.id),
+                    );
                     let job = record.job.clone();
                     state.ready.handed_off[class.index()] += 1;
                     job

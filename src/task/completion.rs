@@ -159,6 +159,15 @@ impl Signal {
         };
         // Wake the group's separate helping predicate after status is visible,
         // before arbitrary downstream activation or cleanup can block/unwind.
+        #[cfg(feature = "diagnostics")]
+        if let Some(source) = &source {
+            crate::diagnostics::record(
+                "completion.visible",
+                source.runtime_id(),
+                source.serial(),
+                0,
+            );
+        }
         notify();
         if let Some(source) = source {
             source.publish_terminal();
