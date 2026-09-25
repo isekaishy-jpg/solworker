@@ -567,7 +567,7 @@ impl OwnedScheduler {
             let provider = state.demand.remove(id);
             (record, provider)
         };
-        drop(provider);
+        crate::cleanup::discard_value(provider);
         if let Some(record) = record {
             let ExternalRecord {
                 admission,
@@ -743,12 +743,12 @@ impl OwnedScheduler {
         for (provider, snapshot) in providers {
             // Provider demand is advisory. A panicking hook cannot unwind an
             // admission or worker dispatch after the record was committed.
-            if let Err(payload) = catch_unwind(AssertUnwindSafe(move || {
-                provider(snapshot);
-                drop(provider);
-            })) {
+            if let Err(payload) = catch_unwind(AssertUnwindSafe(|| provider(snapshot))) {
                 crate::cleanup::discard_panic(payload);
             }
+            // Settlement can remove the node during invocation. Keep the last
+            // hook reference outside that unwind, and contain its cleanup too.
+            crate::cleanup::discard_value(provider);
         }
     }
 
@@ -1547,7 +1547,7 @@ impl OwnedScheduler {
             let provider = state.demand.remove(id);
             (record, provider)
         };
-        drop(provider);
+        crate::cleanup::discard_value(provider);
         // Strong settlement follows capacity return, not just result readiness.
         drop(record.capacity);
         drop(record.work_set);

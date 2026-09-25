@@ -1,11 +1,13 @@
 use std::num::NonZeroUsize;
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
 
 use solworker::{
     SWDemandSnapshot, SWExecutionClass, SWExternalOptions, SWOutcome, SWOwnedLimits, SWPriority,
-    SWRuntime, SWRuntimeConfig, SWShutdownError, SWSpawnError, SWSpawnOptions, SWTaskStatus,
-    SWWorkerConfig,
+    SWProducerControl, SWRuntime, SWRuntimeConfig, SWShutdownError, SWSpawnError, SWSpawnOptions,
+    SWTaskStatus, SWWorkerConfig,
 };
 
 fn runtime(records: usize) -> SWRuntime {
@@ -179,7 +181,7 @@ fn fallible_external_result_preserves_error_and_provider_demand_versions() {
 }
 
 #[test]
-fn panicking_provider_demand_does_not_lose_committed_result() {
+fn panicking_provider_demand_and_cleanup_do_not_interrupt_settlement() {
     let mut runtime = runtime(1);
     let (producer, task, _) = runtime
         .external::<u32>(SWExternalOptions {
@@ -193,5 +195,97 @@ fn panicking_provider_demand_does_not_lose_committed_result() {
     assert!(producer.complete(42).is_ok());
     assert_eq!(task.completion().wait().unwrap(), SWTaskStatus::Succeeded);
     drop(interest);
+    runtime.shutdown().unwrap();
+
+    struct PanicOnDrop(Arc<AtomicBool>);
+    impl Drop for PanicOnDrop {
+        fn drop(&mut self) {
+            if !self.0.swap(true, Ordering::SeqCst) {
+                panic!("provider capture cleanup failed");
+            }
+        }
+    }
+
+    // Final callback cleanup must not interrupt settlement or the abandonment
+    // loop, regardless of the external-record iteration order.
+    for abandon in [false, true] {
+        let mut runtime = self::runtime(2);
+        let dropped = Arc::new(AtomicBool::new(false));
+        let mut operations = Vec::new();
+        for _ in 0..2 {
+            let capture = PanicOnDrop(Arc::clone(&dropped));
+            operations.push(
+                runtime
+                    .external::<u32>(SWExternalOptions {
+                        provider_demand: Some(Arc::new(move |_| {
+                            std::hint::black_box(&capture);
+                        })),
+                        ..Default::default()
+                    })
+                    .unwrap(),
+            );
+        }
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            if abandon {
+                runtime.abandon();
+            } else {
+                for (producer, _, _) in &operations {
+                    assert!(producer.complete(42).is_ok());
+                }
+            }
+        }));
+        assert!(
+            result.is_ok(),
+            "provider cleanup escaped: abandon={abandon}"
+        );
+        assert!(dropped.load(Ordering::SeqCst));
+        for (_, task, _) in &operations {
+            assert_eq!(
+                task.completion().status(),
+                Some(if abandon {
+                    SWTaskStatus::Abandoned
+                } else {
+                    SWTaskStatus::Succeeded
+                }),
+            );
+        }
+        if !abandon {
+            runtime.shutdown().unwrap();
+        }
+    }
+
+    struct ObserveDrop(Arc<Mutex<Option<bool>>>);
+    impl Drop for ObserveDrop {
+        fn drop(&mut self) {
+            *self.0.lock().unwrap() = Some(thread::panicking());
+        }
+    }
+
+    // A callback may settle its own node, leaving the invocation's Arc as the
+    // final reference. Drop that reference only after catching its panic, or a
+    // panicking capture destructor would abort the process during unwinding.
+    let mut runtime = self::runtime(1);
+    let control_slot = Arc::new(Mutex::new(None::<SWProducerControl>));
+    let callback_slot = Arc::clone(&control_slot);
+    let drop_observation = Arc::new(Mutex::new(None));
+    let capture = ObserveDrop(Arc::clone(&drop_observation));
+    let (_producer, task, control) = runtime
+        .external::<u32>(SWExternalOptions {
+            provider_demand: Some(Arc::new(move |_| {
+                std::hint::black_box(&capture);
+                let control = callback_slot.lock().unwrap().take();
+                if let Some(control) = control {
+                    control.cancel();
+                    panic!("provider failed after cancelling itself");
+                }
+            })),
+            ..Default::default()
+        })
+        .unwrap();
+    *control_slot.lock().unwrap() = Some(control);
+    let _interest = task.completion().demand(SWPriority::new(0)).unwrap();
+    while runtime.service_demand(1) {}
+    assert_eq!(task.completion().status(), Some(SWTaskStatus::Cancelled));
+    assert_eq!(*drop_observation.lock().unwrap(), Some(false));
     runtime.shutdown().unwrap();
 }
