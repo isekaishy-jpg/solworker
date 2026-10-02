@@ -14,10 +14,21 @@ consumer request -> source lookup / producer deduplication
                  -> renderer upload or another consumer
 ```
 
-Solworker supplies the CPU, dependency, demand and lifetime mechanisms. The host
-keeps cache keys, format parsing, source identity, resident storage and provider
-service. File/network/audio services can retain their own execution contexts.
+Solworker supplies the CPU, dependency, demand and execution-lifetime mechanisms.
+The host defines cache keys, format parsing, source identity and provider service.
+Solcache can supply shared resource ownership, pending-production association,
+versioned publication, residency and reusable storage through its public APIs.
+File/network/audio services can retain their own execution contexts.
 Replacing a CPU pool does not automatically migrate their persistent threads.
+
+The base resource integration maps Forever mechanisms onto Stock workloads.
+Use SC and SW directly; no adapter layer or dependency from SC onto SW is needed.
+The [Solcache integration guide](https://github.com/isekaishy-jpg/solcache/blob/main/pubdocs/solworker.md)
+maps the evidence to actual handoffs and executable checks. In particular,
+`begin_shared` joins or starts an SC production; `begin_attempt` starts a publication
+round: only a newly started shared production gets a new ticket. Joining must
+preserve the original ticket. SC family admission, provider slots, SW capacity
+and retained bytes remain separate policies.
 
 Use `SWRuntime::external` to admit a provider-supplied logical result without
 occupying a CPU worker. Start the provider only after admission succeeds. The
@@ -44,6 +55,11 @@ Sources: [external producers](../src/external/producer.rs),
 A cache can deduplicate a pending producer and give several consumers the same
 `SWShared` result. Its producer lifetime may span several scenes or documents.
 Each consumer has its own interest, publication and cancellation rules.
+
+With SC, joined `SCProduction` observers instead coordinate one claim and cache
+publication; consumers then share the installed `SCBacking`. An `SWShared` result
+is an available execution-level composition, not an automatic conversion of an
+SC production into multiple owned claims. Warm SC hits need no worker submission.
 
 For example, two views need one texture. Closing one view should detach that
 view's demand and suppress its unclaimed publication, while leaving the shared
@@ -117,8 +133,8 @@ Its return value reports whether more propagation remains serviceable.
 
 External providers can receive `provider_demand` callbacks with a versioned
 `SWDemandSnapshot`. Calls occur outside scheduler locks, may overlap and may
-arrive after logical settlement. The adapter must reject old versions and check
-its own provider lifetime. No demand is not a physical cancellation proof. A
+arrive after logical settlement. The provider integration must reject old versions
+and check its own lifetime. No demand is not a physical cancellation proof. A
 callback panic is contained and that notification discarded; provider state
 must remain valid without treating a notification as a one-shot ownership grant.
 
