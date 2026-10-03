@@ -533,7 +533,7 @@ impl OwnedScheduler {
                     ready_group = record.group.clone();
                 } else {
                     record.stage = Stage::DeferredReady;
-                    state.deferred.push_back(job.id());
+                    self.push_deferred(&mut state, job, record);
                 }
             }
         }

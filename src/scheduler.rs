@@ -16,6 +16,7 @@ pub(crate) mod work_set;
 
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
+use std::mem::ManuallyDrop;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
@@ -39,7 +40,7 @@ pub use admission::{
 };
 use demand::DemandState;
 pub use demand::{SWDemand, SWDemandError, SWDemandSnapshot, SWPriority};
-use ready::ReadyQueue;
+use ready::{PendingQueue, ReadyQueue};
 use reservation::SWReservationPool;
 pub use reservation::{
     SWByteLease, SWCapacityUsage, SWCost, SWLimitError, SWLimits, SWReservation, SWReservationError,
@@ -100,27 +101,44 @@ struct ActivationQueue {
 }
 
 thread_local! {
-    static ACTIVATIONS: RefCell<ActivationQueue> = const { RefCell::new(ActivationQueue {
+    // The control slot must remain accessible from later host TLS destructors.
+    // Only the destructible cache retains an allocation while the drain is idle.
+    static ACTIVATIONS: ManuallyDrop<RefCell<ActivationQueue>> = const { ManuallyDrop::new(RefCell::new(ActivationQueue {
         draining: false,
         pending: VecDeque::new(),
-    }) };
+    })) };
+    static ACTIVATION_STORAGE: RefCell<VecDeque<Activation>> = const { RefCell::new(VecDeque::new()) };
 }
 
 struct DrainGuard;
 
 impl Drop for DrainGuard {
     fn drop(&mut self) {
-        ACTIVATIONS.with(|queue| queue.borrow_mut().draining = false);
+        let mut buffer = ACTIVATIONS.with(|queue| {
+            let mut queue = queue.borrow_mut();
+            queue.draining = false;
+            std::mem::take(&mut queue.pending)
+        });
+        debug_assert!(buffer.is_empty());
+        // During thread teardown the cache may already be destroyed. In that
+        // case the local buffer is freed here instead of being retained in TLS.
+        let _ = ACTIVATION_STORAGE.try_with(|cache| {
+            std::mem::swap(&mut *cache.borrow_mut(), &mut buffer);
+        });
     }
 }
 
 fn enqueue_activation(activation: Activation) {
     let start = ACTIVATIONS.with(|queue| {
         let mut queue = queue.borrow_mut();
-        queue.pending.push_back(activation);
         if queue.draining {
+            queue.pending.push_back(activation);
             false
         } else {
+            queue.pending = ACTIVATION_STORAGE
+                .try_with(|cache| std::mem::take(&mut *cache.borrow_mut()))
+                .unwrap_or_default();
+            queue.pending.push_back(activation);
             queue.draining = true;
             true
         }
@@ -128,19 +146,31 @@ fn enqueue_activation(activation: Activation) {
     if !start {
         return;
     }
-    let _guard = DrainGuard;
+    let guard = DrainGuard;
+    let mut panic = None;
     loop {
         let next = ACTIVATIONS.with(|queue| queue.borrow_mut().pending.pop_front());
-        match next {
-            Some(Activation::Prerequisite(scheduler, id, status)) => {
+        let Some(next) = next else { break };
+        let result = catch_unwind(AssertUnwindSafe(|| match next {
+            Activation::Prerequisite(scheduler, id, status) => {
                 scheduler.activate_prerequisite(&id, status)
             }
-            Some(Activation::PrerequisiteRange(scheduler, range, status)) => {
+            Activation::PrerequisiteRange(scheduler, range, status) => {
                 scheduler.activate_prerequisite_range(range.take_members(), status)
             }
-            Some(Activation::Finalize(scheduler, id)) => scheduler.finalize_record(id),
-            None => break,
+            Activation::Finalize(scheduler, id) => scheduler.finalize_record(id),
+        }));
+        if let Err(payload) = result {
+            if panic.is_none() {
+                panic = Some(payload);
+            } else {
+                crate::cleanup::discard_panic(payload);
+            }
         }
+    }
+    drop(guard);
+    if let Some(payload) = panic {
+        std::panic::resume_unwind(payload);
     }
 }
 
@@ -305,7 +335,8 @@ impl Drop for AccountingLease {
 struct ClassState {
     records: HashMap<u64, JobHandle>,
     ready: ReadyQueue,
-    deferred: VecDeque<u64>,
+    deferred: PendingQueue,
+    rebalance: bool,
     attaching_runnable: usize,
 }
 
@@ -560,7 +591,8 @@ impl OwnedScheduler {
                 Mutex::new(ClassState {
                     records: HashMap::new(),
                     ready: ReadyQueue::with_priorities(&priorities),
-                    deferred: VecDeque::new(),
+                    deferred: PendingQueue::default(),
+                    rebalance: false,
                     attaching_runnable: 0,
                 })
             }),
@@ -1442,6 +1474,7 @@ impl OwnedScheduler {
         Ok((task, producer))
     }
     fn push_ready(&self, state: &mut ClassState, job: &JobHandle, record: &Record) {
+        state.rebalance = true;
         #[cfg(feature = "diagnostics")]
         self.trace("job.ready", job.id(), job.class().index() as u64);
         if record.resource {
@@ -1454,6 +1487,18 @@ impl OwnedScheduler {
         } else {
             state.ready.push(job.id());
         }
+    }
+
+    fn push_deferred(&self, state: &mut ClassState, job: &JobHandle, record: &Record) {
+        state.deferred.push(
+            job.id(),
+            record
+                .resource
+                .then(|| record.selection.expect("attached resource")),
+        );
+        state.rebalance |= record.resource
+            || state.ready.pending.has_resources()
+            || state.deferred.has_resources();
     }
 
     fn activate_prerequisite(self: &Arc<Self>, job: &JobHandle, status: SWTaskStatus) {
@@ -1527,7 +1572,7 @@ impl OwnedScheduler {
                     ready_group = record.group.clone();
                 } else {
                     record.stage = Stage::DeferredReady;
-                    state.deferred.push_back(job.id());
+                    self.push_deferred(&mut state, job, record);
                 }
             }
         }
@@ -1566,7 +1611,7 @@ impl OwnedScheduler {
                 (None, record.group.clone())
             } else {
                 record.stage = Stage::DeferredReady;
-                state.deferred.push_back(job.id());
+                self.push_deferred(&mut state, job, record);
                 (None, None)
             }
         };
@@ -1610,8 +1655,13 @@ impl OwnedScheduler {
             record.stage = Stage::Finalizing;
             let range_member = record.prerequisite_range.take();
             match stage {
-                Stage::Ready => state.ready.remove(job.id()),
-                Stage::DeferredReady => state.deferred.retain(|id| *id != job.id()),
+                Stage::Ready => Self::remove_ready(&mut state, job.id()),
+                Stage::DeferredReady => {
+                    state.deferred.remove(job.id());
+                    state.rebalance |= record.resource
+                        || state.ready.pending.has_resources()
+                        || state.deferred.has_resources();
+                }
                 _ => {}
             }
             drop(guard);
@@ -1659,7 +1709,7 @@ impl OwnedScheduler {
             record.stage = Stage::Running;
             drop(guard);
             if was_ready {
-                state.ready.remove(job.id());
+                Self::remove_ready(&mut state, job.id());
             }
             state.ready.runnable -= 1;
             self.promote_locked(&mut state, class)
@@ -1684,6 +1734,17 @@ impl OwnedScheduler {
         self.class_lock(class).ready.handed_off -= 1;
     }
 
+    fn remove_ready(state: &mut ClassState, id: u64) {
+        // Helping/cancellation can remove a member other than the next head.
+        // In a mixed queue that can expose a resource ahead of the old window.
+        if state.ready.pending.peek() != Some(id)
+            && (state.ready.pending.has_resources() || state.deferred.has_resources())
+        {
+            state.rebalance = true;
+        }
+        state.ready.remove(id);
+    }
+
     fn promote_locked(
         &self,
         state: &mut ClassState,
@@ -1691,48 +1752,31 @@ impl OwnedScheduler {
     ) -> Vec<Arc<GroupInner>> {
         self.apply_demand_updates(state, class);
         let mut notifications = Vec::new();
-        if !state.deferred.is_empty() {
-            let mut pending = VecDeque::new();
+        // Ordinary progress consumes the existing frontier directly. Only
+        // arrivals, rank changes, or out-of-order mixed-route removals repair
+        // the unhanded window; the deferred backlog is never scanned.
+        if state.rebalance && !state.deferred.is_empty() {
+            let mut pending = Vec::new();
             while let Some(id) = state.ready.pop() {
                 let job = state.records.get(&id).expect("ready record exists");
-                if let Some(record) = job.record_lock().as_mut() {
-                    record.stage = Stage::DeferredReady;
-                }
+                let mut guard = job.record_lock();
+                let record = guard.as_mut().expect("ready record remains live");
+                record.stage = Stage::DeferredReady;
                 state.ready.runnable -= 1;
-                pending.push_back(id);
+                pending.push((
+                    id,
+                    record
+                        .resource
+                        .then(|| record.selection.expect("attached resource")),
+                ));
             }
-            pending.append(&mut state.deferred);
-            state.deferred = pending;
+            for (id, selection) in pending.into_iter().rev() {
+                state.deferred.push_front(id, selection);
+            }
         }
+        state.rebalance = false;
         while state.ready.runnable + state.attaching_runnable < self.limits.runnable_for(class) {
-            let ordinary = state.deferred.iter().enumerate().find_map(|(index, id)| {
-                let record = state.records.get(id)?.record_lock();
-                (!record.as_ref()?.resource).then_some((index, *id))
-            });
-            let resource = state
-                .deferred
-                .iter()
-                .enumerate()
-                .filter_map(|(index, id)| {
-                    let record = state.records.get(id)?.record_lock();
-                    let record = record.as_ref()?;
-                    if !record.resource {
-                        return None;
-                    }
-                    let selection = record.selection?;
-                    Some((
-                        index,
-                        *id,
-                        (!selection.active, selection.priority, selection.tie),
-                    ))
-                })
-                .min_by_key(|(_, _, key)| *key);
-            let index = match (ordinary, resource) {
-                (Some((index, id)), Some((_, resource, _))) if id < resource => Some(index),
-                (_, Some((index, _, _))) | (Some((index, _)), None) => Some(index),
-                (None, None) => None,
-            };
-            let Some(id) = index.and_then(|index| state.deferred.remove(index)) else {
+            let Some(id) = state.deferred.pop() else {
                 break;
             };
             let job = state.records.get(&id).expect("deferred record exists");
@@ -2171,6 +2215,10 @@ impl OwnedScheduler {
                 record.selection = Some(selection);
                 if record.stage == Stage::Ready {
                     state.ready.update_resource(id, selection);
+                    state.rebalance = true;
+                } else if record.stage == Stage::DeferredReady {
+                    state.deferred.update_resource(id, selection);
+                    state.rebalance = true;
                 }
             }
         }

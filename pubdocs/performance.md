@@ -48,6 +48,20 @@ The membership lock is released before claiming or executing a job. Avoid
 treating a larger batch as free helping, and measure large retained groups at
 their actual consumer boundary.
 
+A successful `help_ready` call also searches from the start of the live
+membership index. If a small runnable window becomes ready in a different order
+from member IDs, repeated calls can revisit deferred members and accumulate
+quadratic member visits across a drain. Shared-prerequisite callbacks do not
+promise admission-order activation. Keep this search cost separate from queue
+promotion when measuring large groups; one successful job per call does not
+mean constant scheduler work per call.
+
+Ready and deferred selection use keyed indexes, so promoting the next job or
+removing an indexed entry does not scan the deferred backlog. Ordering changes
+can still repair the unhanded runnable window. Its configured size, demand
+updates, and out-of-order helping or cancellation therefore remain relevant to
+latency; indexing is not a constant-time guarantee for every scheduler call.
+
 Launch independent work before serial preparation that does not depend on it.
 Admit downstream work behind completion tokens early where ownership allows.
 Keep caller helping selective and give helpers valid scratch. Avoid a large
