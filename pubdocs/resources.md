@@ -110,6 +110,13 @@ Sources: [work sets](../src/scheduler/work_set.rs),
 
 ## Resource urgency follows pending demand
 
+When composing with Solcache, keep each consumer's SC interest and delivery
+metadata in the resource coordinator. Derive effective rank on interest changes,
+map larger SC urgency to smaller SW rank explicitly, and forward it to the
+current stage. Avoid a second independent subscriber/priority system or repeated
+locked demand snapshots inside queue comparators. Source replacement and consumer
+departure have different meanings; neither grants physical cancellation proof.
+
 Configure supported ranks and a lease bound with `with_demand_limits`. A resource
 stage can carry a baseline `priority`; consumers retain independent `SWDemand`
 leases. Lower ranks are more urgent within the resource route.
@@ -183,6 +190,39 @@ the same request. Admission retry must remain bounded and preserve ownership.
 
 Sources: [owned limits](../src/scheduler/admission.rs),
 [reservations](../src/scheduler/reservation.rs).
+
+## Asset providers and loading stalls
+
+SW provides CPU execution and external readiness/ownership mechanisms. It does
+not supply archive selection, an OS asynchronous I/O backend, format decoding or
+texture upload. Solcache likewise supplies resource coordination rather than the
+asset loader. The application provider must connect real success, failure and
+physical-release events to the appropriate APIs. Admit external readiness before
+starting a provider that may complete inline.
+
+Dedicated provider threads can serve a synchronous reader without occupying SW
+CPU workers. This is a different implementation from platform asynchronous I/O.
+Increasing provider slots may only increase lock wait when every operation uses
+one locked archive reader. Measure archive-lock acquisition separately from the
+read/decrypt/decompress operation, then measure completion-to-owner collection,
+decode admission/start, publication and upload. Pending queue delay and host
+service gaps are not decoder execution time.
+
+On decode admission failure, preserve the returned operation and its input owners
+for bounded retry or explicit settlement. When SC owns production state, its
+original publication ticket and actual access owners must survive that retry.
+Do not turn blocking file access into caller-helpable CPU work, or block owner
+service on a provider join before accepted operations can finish.
+
+Keep provider-operation limits, SC family production/retention policies and SW
+record/runnable/handoff capacity separate. Forever's component 16-production and
+32 MiB retention settings are family policies, not universal texture or SW limits.
+Compare matched settings separately from policy changes. Verify actual warm cache
+hits, and separate diagnostic logging from timing: per-frame flushes and stderr
+can affect cadence and host progress outside the measured CPU work span.
+
+See the [SC integration failure guide](https://github.com/isekaishy-jpg/solcache/blob/main/pubdocs/integration-pitfalls.md)
+for the complete provider-to-device boundary checklist and Stock/Forever evidence.
 
 ## Coherent publication is an application composition
 

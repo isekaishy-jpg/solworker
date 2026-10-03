@@ -157,7 +157,10 @@ registering one `on_ready`, or retain a host inbox that represents them. Never
 interpret one ready notice as proof that unrelated prerequisites are satisfied.
 
 `SWPumpMode::Live` rechecks arrivals between entries. `Batch` freezes the eligible
-frontier at entry. Count/time limits are checked between callbacks and cleanup;
+frontier at entry, including which phases can be cleaned in that call. Closure or
+fault during a batch suppresses its remaining entries; it does not replace them
+with previously ineligible deliveries. A subsequent pump entered after closure
+can clean other phases within its own budget. Count/time limits are checked between callbacks and cleanup;
 one long callback or destructor can exceed the duration budget. Keep callback
 work short or divide domain work at valid semantic boundaries.
 

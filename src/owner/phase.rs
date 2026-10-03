@@ -13,7 +13,8 @@ pub enum SWPumpMode {
     /// Recheck the route after each callback and local cleanup.
     #[default]
     Live,
-    /// Freeze the eligible frontier at pump entry.
+    /// Freeze the eligible frontier at pump entry. Closure or fault can suppress
+    /// those deliveries, but does not add other phases to this batch's cleanup.
     Batch,
 }
 

@@ -594,6 +594,17 @@ impl RuntimeControl {
         if crate::notification::invocation_active() {
             return Err(SWExecutionError::InvalidContext);
         }
+        self.acquire_handoff(class)
+    }
+
+    /// Retain the backend only to enqueue already-admitted work. Notification
+    /// capture retirement can make a successor ready, even while user entry is
+    /// forbidden. This lease must not authorize synchronous caller execution;
+    /// claims still go through `acquire_owned` and its invocation check.
+    pub(crate) fn acquire_handoff(
+        self: &Arc<Self>,
+        class: SWExecutionClass,
+    ) -> Result<ExecutionLease, SWExecutionError> {
         let mut state = self.lock();
         if !matches!(
             state.phase,

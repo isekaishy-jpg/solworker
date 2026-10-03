@@ -114,6 +114,11 @@ The signal closure owns its captures until route closure and claimed invocations
 retire. Capturing the runtime itself can form a retention cycle through the
 runtime's notification storage; explicitly close such a route to release it.
 Adapter capture destruction also runs outside Solworker bookkeeping locks.
+Retiring a capture can settle a producer and make an already accepted successor
+ready. Internal backend handoff remains permitted in that context; closing the
+route does not close or abandon the scheduler. This does not permit new user
+submissions, synchronous helping, waits or owner pumping from a signal or its
+capture destructor.
 
 Task completion means its invocation and captures settled. Group completion
 means its sealed members settled. Owner callbacks still need an owner pump, and

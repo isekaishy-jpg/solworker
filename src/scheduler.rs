@@ -1653,7 +1653,7 @@ impl OwnedScheduler {
                     class,
                     completed: false,
                 };
-                let Ok(lease) = control.acquire_owned(class) else {
+                let Ok(lease) = control.acquire_handoff(class) else {
                     drop(handoff);
                     self.abandon();
                     break;

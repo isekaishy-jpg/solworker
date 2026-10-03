@@ -743,8 +743,8 @@ impl<O> SWOwner<O> {
         }
     }
 
-    fn next_for(&mut self, phase: SWPhase) -> Option<Notification> {
-        if self.closed || self.faulted || self.transport.is_closed() {
+    fn next_for(&mut self, phase: SWPhase, all_phases: bool) -> Option<Notification> {
+        if all_phases {
             return self.pending.pop_front();
         }
         let index = self.pending.iter().position(|notification| {
@@ -774,11 +774,17 @@ impl<O> SWOwner<O> {
             return Err(SWOwnerError::WrongPhase);
         }
         self.receive();
+        // Batch does not receive new notifications during this pump, and the
+        // phase of each pending callback is immutable. Freezing this predicate
+        // therefore preserves the entry identities without allocating an ID list.
+        // Closure/fault may suppress those entries, but cannot substitute entries
+        // from another phase into their remaining budget.
+        let entry_all_phases = self.closed || self.faulted || self.transport.is_closed();
         let frontier = if budget.mode == SWPumpMode::Batch {
             self.pending
                 .iter()
                 .filter(|notification| {
-                    if self.closed || self.faulted || self.transport.is_closed() {
+                    if entry_all_phases {
                         return true;
                     }
                     self.callbacks
@@ -801,7 +807,12 @@ impl<O> SWOwner<O> {
             if budget.mode == SWPumpMode::Live {
                 self.receive();
             }
-            let Some(notification) = self.next_for(phase) else {
+            let all_phases = if budget.mode == SWPumpMode::Batch {
+                entry_all_phases
+            } else {
+                self.closed || self.faulted || self.transport.is_closed()
+            };
+            let Some(notification) = self.next_for(phase, all_phases) else {
                 break;
             };
             self.process(notification, &mut report);

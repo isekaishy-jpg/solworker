@@ -41,6 +41,35 @@ physical-access policies are opt-in builder settings, described in
 
 Sources: [configuration](../src/runtime/config.rs), [builder](../src/runtime.rs).
 
+### Applying the recovered Forever startup policy
+
+Topology discovery and policy selection belong to the application host (Solapp
+in the base integration). SW does not infer physical cores or reserved threads.
+The recovered Forever initializer computes
+`clamp(physical_core_count - reserved_threads, 2, 64)`, then clamps each nonzero
+class request independently to that maximum, with a minimum of two. This is
+not an aggregate worker cap. Use saturating subtraction when expressing the
+formula with unsigned host values.
+
+The captured settings request six workers per class and reserve one core. They
+produce 5/5/5 on the captured six-core machine and 6/6/6 on a ten-core machine.
+These are observed settings, not universal defaults. To express the latter
+through SW, supply an aggregate budget of at least 18 and request Low/Mid/High
+OS priorities with `SWWorkerConfig::with_priority`: `BelowNormal`, `Normal`,
+and `AboveNormal` map to Windows relative priorities -1/0/+1. Worker startup
+reports a failure if it cannot apply a requested priority. The recovered path
+does not justify adding processor affinity. Native zero-request classes create
+no workers; SW currently requires at least one per class, so that configuration
+cannot be reproduced directly.
+
+Set owned handoff capacities deliberately alongside worker counts. Six workers
+with one handoff slot do not provide six-way owned execution. Provider slots,
+admitted decode count and renderer recording width are separate constraints;
+increasing workers does not increase them. Record all these settings in
+performance captures, and keep the captured policy distinct from workload
+tuning. The observations above concern selected initializer and platform-wrapper
+paths in Forever 1.60.1.69913; they do not establish every native configuration.
+
 ## Choose the lifetime before choosing the operation
 
 | Need | Available API | Boundary |

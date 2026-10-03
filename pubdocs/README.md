@@ -58,6 +58,11 @@ Public crate types use the `SW` prefix. Cache and renderer types belong to their
 own layers; a host can use `SC` and `SR` prefixes for those APIs. Those prefixes
 do not imply that Solworker implements a cache or graphics backend.
 
+Within the cache/source service, Solcache supplies reusable resource coordination.
+The application's provider still supplies file/archive loading and platform
+asynchronous I/O. SW external readiness connects that provider to execution;
+it does not implement the backend. See [asset providers and loading stalls](resources.md#asset-providers-and-loading-stalls).
+
 ## Use completion at the consumer boundary
 
 The primary pattern is **submit, overlap independent work, join the required
