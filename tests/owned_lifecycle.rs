@@ -213,6 +213,61 @@ fn abandonment_settles_unclaimed_work_without_waiting_for_running_work() {
 }
 
 #[test]
+fn abandonment_snapshot_follows_live_work_instead_of_the_configured_record_ceiling() {
+    for accepted_work in [false, true] {
+        let config = SWRuntimeConfig::new(3, [SWWorkerConfig::new(1); 3]).unwrap();
+        let mut runtime = SWRuntime::builder(config)
+            .with_owned_limits(SWOwnedLimits::new(usize::MAX, 0, [1; 3], [1; 3]).unwrap())
+            .build()
+            .unwrap();
+        let lane = runtime.lane(SWExecutionClass::Low);
+        let (entered_send, entered_recv) = mpsc::channel();
+        let (release_send, release_recv) = mpsc::channel();
+        let tasks = if accepted_work {
+            let (running, _) = lane
+                .try_spawn(SWSpawnOptions::default(), move || {
+                    entered_send.send(()).unwrap();
+                    release_recv.recv_timeout(TIMEOUT).unwrap();
+                })
+                .unwrap();
+            entered_recv.recv_timeout(TIMEOUT).unwrap();
+            let (queued, _) = lane
+                .try_spawn(SWSpawnOptions::default(), || {
+                    panic!("abandonment must suppress the unclaimed job");
+                })
+                .unwrap();
+            Some((running, queued))
+        } else {
+            None
+        };
+        runtime.abandon();
+        let _ = release_send.send(());
+        if let Some((running, queued)) = tasks {
+            assert_eq!(
+                running.completion().wait_timeout(TIMEOUT).unwrap(),
+                Some(SWTaskStatus::Succeeded)
+            );
+            assert_eq!(
+                queued.completion().wait_timeout(TIMEOUT).unwrap(),
+                Some(SWTaskStatus::Abandoned)
+            );
+        }
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            let progress = runtime.progress();
+            if progress.active_leases == 0 && progress.scheduler.handoff_wrappers == [0; 3] {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "abandonment did not drain: {progress:?}"
+            );
+            progress.wait_for_change(deadline).unwrap();
+        }
+    }
+}
+
+#[test]
 fn group_helper_claims_handed_off_members_of_only_its_group() {
     let mut runtime = runtime();
     let lane = runtime.lane(SWExecutionClass::Mid);
@@ -301,6 +356,118 @@ fn group_helper_claims_handed_off_members_of_only_its_group() {
     assert!(recycled.is_complete());
     assert!(unrelated.is_complete());
     runtime.shutdown().unwrap();
+}
+
+#[test]
+fn cancellation_and_abandonment_cannot_suppress_a_worker_or_helper_claim() {
+    struct Release(mpsc::Sender<()>);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            let _ = self.0.send(());
+        }
+    }
+    struct CountDrop(Arc<AtomicUsize>);
+    impl Drop for CountDrop {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    for helper_claim in [false, true] {
+        for abandon in [false, true] {
+            let mut runtime = runtime();
+            let lane = runtime.lane(SWExecutionClass::High);
+            let (blocked_send, blocked_recv) = mpsc::channel();
+            let (unblock_send, unblock_recv) = mpsc::channel();
+            let unblock = Release(unblock_send);
+            let (blocker, _) = lane
+                .try_spawn(SWSpawnOptions::default(), move || {
+                    blocked_send.send(()).unwrap();
+                    unblock_recv.recv_timeout(TIMEOUT).unwrap();
+                })
+                .unwrap();
+            blocked_recv.recv_timeout(TIMEOUT).unwrap();
+            let group = lane.group().unwrap();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let drops = Arc::new(AtomicUsize::new(0));
+            let capture = CountDrop(Arc::clone(&drops));
+            let invoked = Arc::clone(&calls);
+            let (entered_send, entered_recv) = mpsc::channel();
+            let (finish_send, finish_recv) = mpsc::channel();
+            let finish = Release(finish_send);
+            let (task, cancel) = lane
+                .try_spawn_in(
+                    &group,
+                    SWSpawnOptions {
+                        eligibility: SWCallerEligibility::CallerEligible,
+                    },
+                    move || {
+                        let _capture = capture;
+                        invoked.fetch_add(1, Ordering::SeqCst);
+                        entered_send.send(()).unwrap();
+                        finish_recv.recv_timeout(TIMEOUT).unwrap();
+                    },
+                )
+                .unwrap();
+            group.seal();
+            let helper = if helper_claim {
+                let target = group.clone();
+                Some(thread::spawn(move || target.help_ready().unwrap()))
+            } else {
+                unblock.0.send(()).unwrap();
+                None
+            };
+            let entered = entered_recv.recv_timeout(TIMEOUT);
+            if entered.is_ok() {
+                if abandon {
+                    runtime.abandon();
+                } else {
+                    cancel.cancel();
+                }
+            }
+            let status_while_running = task.status();
+            let calls_while_running = calls.load(Ordering::SeqCst);
+            let drops_while_running = drops.load(Ordering::SeqCst);
+            let physical_while_running = runtime.progress().scheduler.handoff_wrappers[2];
+            drop(finish);
+            drop(unblock);
+            if let Some(helper) = helper {
+                assert!(helper.join().unwrap());
+            }
+            let task_status = task.completion().wait_timeout(TIMEOUT).unwrap();
+            let blocker_status = blocker.completion().wait_timeout(TIMEOUT).unwrap();
+            let group_status = group.completion().wait_timeout(TIMEOUT).unwrap();
+            assert!(entered.is_ok(), "helper={helper_claim}, abandon={abandon}");
+            assert_eq!(status_while_running, None);
+            assert_eq!(calls_while_running, 1);
+            assert_eq!(drops_while_running, 0);
+            if helper_claim {
+                // Helping a queued wrapper claims its logical job while both
+                // physical slots remain occupied behind the worker blocker.
+                assert_eq!(physical_while_running, 2);
+            }
+            assert_eq!(task_status, Some(SWTaskStatus::Succeeded));
+            assert_eq!(blocker_status, Some(SWTaskStatus::Succeeded));
+            assert_eq!(group_status, Some(SWTaskStatus::Succeeded));
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+            let deadline = Instant::now() + TIMEOUT;
+            loop {
+                let progress = runtime.progress();
+                if progress.scheduler.handoff_wrappers == [0; 3] && progress.active_leases == 0 {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "wrappers did not retire: {progress:?}"
+                );
+                progress.wait_for_change(deadline).unwrap();
+            }
+            if !abandon {
+                runtime.shutdown().unwrap();
+            }
+        }
+    }
 }
 
 #[test]

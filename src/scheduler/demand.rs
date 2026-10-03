@@ -211,7 +211,7 @@ struct Node {
     published_tie: i128,
 }
 
-/// Control-lock-owned graph. Dirty nodes are enqueued once, so outstanding
+/// Independently guarded graph. Dirty nodes are enqueued once, so outstanding
 /// propagation is bounded by the admitted record count. Service does at most
 /// `budget` node visits; no provider hook is called here.
 pub(crate) struct DemandState {
@@ -245,10 +245,6 @@ impl DemandState {
 
     pub(crate) fn contains(&self, priority: SWPriority) -> bool {
         self.bands.binary_search(&priority).is_ok()
-    }
-
-    pub(crate) fn enabled(&self) -> bool {
-        !self.bands.is_empty()
     }
 
     pub(crate) fn register(

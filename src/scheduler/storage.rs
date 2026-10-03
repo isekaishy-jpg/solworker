@@ -11,7 +11,8 @@ use crate::task::{Signal, SignalLease};
 mod tests;
 
 mod jobs;
-pub(super) use jobs::{Job, JobHandle, JobPool};
+pub(super) use jobs::JobPool;
+pub(crate) use jobs::{JobHandle, JobWeak};
 mod buffers;
 pub(crate) use buffers::BufferPool;
 
@@ -114,7 +115,7 @@ impl SignalPool {
         }
     }
 
-    pub(crate) fn acquire(&mut self) -> SignalLease {
+    pub(crate) fn acquire(&self) -> SignalLease {
         let recycled = {
             self.retired
                 .entries

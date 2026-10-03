@@ -1,8 +1,8 @@
 //! Coordination of accepted owned work.
 //!
-//! Own the shared admission, record identity, claiming, and completion transitions
-//! that must commit together. Child modules define policies within those
-//! transactions rather than independent schedulers or unrelated lock domains.
+//! Class gates serialize acceptance, ready selection and claiming. Stable job
+//! controls retain dependency and settlement state. Demand, global charges and
+//! recyclers have separate synchronization domains.
 //! User code, destructors, provider hooks, and backend calls run outside locks.
 
 mod admission;
@@ -15,6 +15,7 @@ pub(crate) mod work_set;
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use crate::execution::ContextGuard;
@@ -35,12 +36,12 @@ pub use admission::{
 };
 use demand::DemandState;
 pub use demand::{SWDemand, SWDemandError, SWDemandSnapshot, SWPriority};
-use ready::ReadyQueues;
+use ready::ReadyQueue;
 use reservation::SWReservationPool;
 pub use reservation::{
     SWByteLease, SWCapacityUsage, SWCost, SWLimitError, SWLimits, SWReservation, SWReservationError,
 };
-use storage::{BufferPool, GroupPool, Job, JobHandle, JobPool, SignalPool};
+use storage::{BufferPool, GroupPool, JobHandle, JobPool, SignalPool};
 use work_set::WorkSetLease;
 pub use work_set::{SWDiscoveryError, SWDiscoveryPermit, SWWorkSet, SWWorkSetProgress};
 
@@ -59,9 +60,16 @@ pub(crate) struct SubmitExtras {
 type Finish = Box<dyn FnOnce() + Send>;
 type Envelope = Box<dyn FnOnce(Decision) -> Finish + Send>;
 
+#[cfg(test)]
+type AttachmentHook = Arc<dyn Fn(JobHandle) + Send + Sync>;
+
+#[cfg(test)]
+#[path = "../tests/unit/scheduler_domains.rs"]
+mod domain_tests;
+
 enum Activation {
-    Prerequisite(Arc<OwnedScheduler>, u64, SWTaskStatus),
-    Finalize(Arc<OwnedScheduler>, u64),
+    Prerequisite(Arc<OwnedScheduler>, JobHandle, SWTaskStatus),
+    Finalize(Arc<OwnedScheduler>, JobHandle),
 }
 
 struct ActivationQueue {
@@ -103,7 +111,7 @@ fn enqueue_activation(activation: Activation) {
         let next = ACTIVATIONS.with(|queue| queue.borrow_mut().pending.pop_front());
         match next {
             Some(Activation::Prerequisite(scheduler, id, status)) => {
-                scheduler.activate_prerequisite(id, status)
+                scheduler.activate_prerequisite(&id, status)
             }
             Some(Activation::Finalize(scheduler, id)) => scheduler.finalize_record(id),
             None => break,
@@ -137,9 +145,9 @@ impl Drop for Handoff {
     fn drop(&mut self) {
         if let Some(scheduler) = self.scheduler.upgrade() {
             scheduler.decrement_handoff(self.class);
-            let abandoned = scheduler.lock().abandoned;
+            let abandoned = scheduler.abandoned.load(Ordering::Acquire);
             if self.completed && !abandoned {
-                scheduler.dispatch();
+                scheduler.dispatch_class(self.class);
             }
         }
     }
@@ -156,16 +164,13 @@ enum Stage {
 }
 
 struct Record {
-    job: JobHandle,
     completion: Option<SWCompletion>,
-    class: SWExecutionClass,
     group: Option<Arc<GroupInner>>,
     pending: usize,
     failed: bool,
     policy: SWDependencyPolicy,
     stage: Stage,
     eligibility: SWCallerEligibility,
-    edges: usize,
     subscriptions: Vec<Subscription>,
     attaching: bool,
     deferred_finish: Option<Finish>,
@@ -173,9 +178,14 @@ struct Record {
     work_set: Option<WorkSetLease>,
     capacity: Option<SWReservation>,
     resource: bool,
+    selection: Option<demand::DemandSelection>,
+    charge: AccountingLease,
 }
 
 struct ExternalRecord {
+    charge: AccountingLease,
+    attaching: bool,
+    deferred_status: Option<SWTaskStatus>,
     settling: bool,
     settle: Arc<dyn Fn(SWTaskStatus) + Send + Sync>,
     admission: ExternalAdmission,
@@ -193,59 +203,123 @@ pub(crate) struct SubmitRequest<'a> {
     pub(crate) allow_inline: bool,
 }
 
-struct State {
-    records: HashMap<u64, Record>,
-    external: HashMap<u64, ExternalRecord>,
-    next_id: u64,
-    next_group: u64,
+/// A charge is acquired before acceptance and retained through strong settlement.
+/// CAS rollback keeps the record/edge limits global across all classes/providers.
+struct Accounting {
+    records: AtomicUsize,
+    edges: AtomicUsize,
+    limits: SWOwnedLimits,
+}
+
+struct AccountingLease {
+    accounting: Arc<Accounting>,
     edges: usize,
-    ready: ReadyQueues,
-    deferred: [VecDeque<u64>; 3],
-    abandoned: bool,
-    demand: DemandState,
-    provider_callbacks: usize,
-    jobs: JobPool,
-    signals: SignalPool,
-    subscriptions: BufferPool<Subscription>,
 }
 
-#[cfg(not(feature = "diagnostics"))]
-type StateGuard<'a> = MutexGuard<'a, State>;
-
-#[cfg(feature = "diagnostics")]
-struct StateGuard<'a> {
-    guard: Option<MutexGuard<'a, State>>,
-    timing: Option<(std::time::Instant, std::time::Instant)>,
-    scheduler: u64,
-    runtime: u64,
-    site: u32,
-    cycles: Option<u64>,
-}
-
-#[cfg(feature = "diagnostics")]
-impl std::ops::Deref for StateGuard<'_> {
-    type Target = State;
-    fn deref(&self) -> &State {
-        self.guard.as_deref().expect("live state guard")
+impl Accounting {
+    fn acquire(self: &Arc<Self>, edges: usize) -> Result<AccountingLease, SWSpawnError> {
+        if edges > self.limits.edges {
+            return Err(SWSpawnError::TooLarge);
+        }
+        self.records
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                (count < self.limits.records).then_some(count + 1)
+            })
+            .map_err(|_| SWSpawnError::Full)?;
+        if edges != 0
+            && self
+                .edges
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                    count
+                        .checked_add(edges)
+                        .filter(|count| *count <= self.limits.edges)
+                })
+                .is_err()
+        {
+            self.records.fetch_sub(1, Ordering::AcqRel);
+            return Err(SWSpawnError::Full);
+        }
+        Ok(AccountingLease {
+            accounting: Arc::clone(self),
+            edges,
+        })
     }
 }
 
-#[cfg(feature = "diagnostics")]
-impl std::ops::DerefMut for StateGuard<'_> {
-    fn deref_mut(&mut self) -> &mut State {
-        self.guard.as_deref_mut().expect("live state guard")
-    }
-}
-
-#[cfg(feature = "diagnostics")]
-impl Drop for StateGuard<'_> {
+impl Drop for AccountingLease {
     fn drop(&mut self) {
+        if self.edges != 0 {
+            self.accounting
+                .edges
+                .fetch_sub(self.edges, Ordering::AcqRel);
+        }
+        self.accounting.records.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Ordinary operations enter exactly one class gate, then a record guard.
+/// No record-only operation enters a class while retaining its record guard.
+struct ClassState {
+    records: HashMap<u64, JobHandle>,
+    ready: ReadyQueue,
+    deferred: VecDeque<u64>,
+}
+
+struct DemandDomain {
+    graph: DemandState,
+    targets: HashMap<u64, SWExecutionClass>,
+}
+
+#[cfg(feature = "diagnostics")]
+#[derive(Default)]
+struct DomainMetrics {
+    acquisitions: AtomicU64,
+    wait_ns: AtomicU64,
+    hold_ns: AtomicU64,
+}
+
+/// Notifications and diagnostic buffering follow the release of every guard.
+struct DomainGuard<'a, T> {
+    guard: Option<MutexGuard<'a, T>>,
+    wake: &'a crate::progress::SWWake,
+    _notification: crate::notification::NotificationScope,
+    #[cfg(feature = "diagnostics")]
+    timing: Option<(std::time::Instant, std::time::Instant)>,
+    #[cfg(feature = "diagnostics")]
+    scheduler: u64,
+    #[cfg(feature = "diagnostics")]
+    runtime: u64,
+    #[cfg(feature = "diagnostics")]
+    domain: u64,
+    #[cfg(feature = "diagnostics")]
+    site: u32,
+    #[cfg(feature = "diagnostics")]
+    cycles: Option<u64>,
+    #[cfg(feature = "diagnostics")]
+    metrics: &'a DomainMetrics,
+}
+
+impl<T> std::ops::Deref for DomainGuard<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        self.guard.as_deref().expect("live domain guard")
+    }
+}
+impl<T> std::ops::DerefMut for DomainGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        self.guard.as_deref_mut().expect("live domain guard")
+    }
+}
+impl<T> Drop for DomainGuard<'_, T> {
+    fn drop(&mut self) {
+        #[cfg(feature = "diagnostics")]
         let cycles = self
             .cycles
             .and_then(|start| crate::diagnostics::cycles().map(|end| end.saturating_sub(start)));
+        #[cfg(feature = "diagnostics")]
         let released = self.timing.map(|_| std::time::Instant::now());
-        // Trace buffering must not extend the scheduler critical section.
         drop(self.guard.take());
+        #[cfg(feature = "diagnostics")]
         if let (Some((started, acquired)), Some(released)) = (self.timing, released) {
             let waiting = acquired
                 .duration_since(started)
@@ -255,11 +329,21 @@ impl Drop for StateGuard<'_> {
                 .duration_since(acquired)
                 .as_nanos()
                 .min(u64::MAX as u128) as u64;
+            self.metrics.acquisitions.fetch_add(1, Ordering::Relaxed);
+            self.metrics.wait_ns.fetch_add(waiting, Ordering::Relaxed);
+            self.metrics.hold_ns.fetch_add(holding, Ordering::Relaxed);
             if waiting >= 50_000 {
                 crate::diagnostics::record_at(
                     "scheduler.lock.slow",
                     self.runtime,
                     self.scheduler,
+                    waiting,
+                    acquired,
+                );
+                crate::diagnostics::record_at(
+                    "scheduler.domain.lock.slow",
+                    self.runtime,
+                    self.domain,
                     waiting,
                     acquired,
                 );
@@ -272,6 +356,20 @@ impl Drop for StateGuard<'_> {
                     holding,
                     released,
                 );
+                crate::diagnostics::record_at(
+                    "scheduler.domain.hold.slow",
+                    self.runtime,
+                    self.domain,
+                    holding,
+                    released,
+                );
+                crate::diagnostics::record_at(
+                    "scheduler.hold.site",
+                    self.runtime,
+                    self.scheduler,
+                    u64::from(self.site),
+                    released,
+                );
                 if let Some(cycles) = cycles {
                     crate::diagnostics::record_at(
                         "scheduler.hold.cycles",
@@ -281,42 +379,8 @@ impl Drop for StateGuard<'_> {
                         released,
                     );
                 }
-                crate::diagnostics::record_at(
-                    "scheduler.hold.site",
-                    self.runtime,
-                    self.scheduler,
-                    u64::from(self.site),
-                    released,
-                );
             }
         }
-    }
-}
-
-/// Publish wake changes after releasing the scheduler lock. Read-only snapshots
-/// use the plain guard and cannot wake themselves.
-struct StateMutation<'a> {
-    state: Option<StateGuard<'a>>,
-    wake: &'a crate::progress::SWWake,
-    _notification: crate::notification::NotificationScope,
-}
-
-impl std::ops::Deref for StateMutation<'_> {
-    type Target = State;
-    fn deref(&self) -> &State {
-        self.state.as_deref().expect("live mutation guard")
-    }
-}
-
-impl std::ops::DerefMut for StateMutation<'_> {
-    fn deref_mut(&mut self) -> &mut State {
-        self.state.as_deref_mut().expect("live mutation guard")
-    }
-}
-
-impl Drop for StateMutation<'_> {
-    fn drop(&mut self) {
-        drop(self.state.take());
         self.wake.notify();
     }
 }
@@ -325,23 +389,46 @@ struct ProviderCallbacks<'a> {
     scheduler: &'a OwnedScheduler,
     count: usize,
 }
-
 impl Drop for ProviderCallbacks<'_> {
     fn drop(&mut self) {
-        self.scheduler.lock_mut().provider_callbacks -= self.count;
+        self.scheduler
+            .provider_callbacks
+            .fetch_sub(self.count, Ordering::AcqRel);
+        self.scheduler.wake.notify();
     }
 }
 
-/// One control domain for admission, dependencies, claims and terminal cleanup.
+/// Stable controls and independently coordinated execution classes.
 pub(crate) struct OwnedScheduler {
     control: Weak<RuntimeControl>,
     #[cfg(feature = "diagnostics")]
     trace_runtime: u64,
+    #[cfg(feature = "diagnostics")]
+    metrics: [DomainMetrics; 5],
     limits: SWOwnedLimits,
-    state: Mutex<State>,
+    classes: [Mutex<ClassState>; 3],
+    external: Mutex<HashMap<u64, ExternalRecord>>,
+    abandoned: AtomicBool,
+    next_id: AtomicU64,
+    next_group: AtomicU64,
+    accounting: Arc<Accounting>,
+    demand: Mutex<DemandDomain>,
+    // Snapshot publication serializes only graph and bounded class mailboxes,
+    // never queue/record gates. Each class applies only its own mailbox.
+    demand_transfer: Mutex<()>,
+    demand_pending: AtomicBool,
+    demand_updates: [Mutex<HashMap<u64, demand::DemandSelection>>; 3],
+    demand_updates_pending: [AtomicBool; 3],
+    demand_enabled: bool,
+    provider_callbacks: AtomicUsize,
+    jobs: JobPool,
+    signals: SignalPool,
+    subscriptions: Mutex<BufferPool<Subscription>>,
     groups: GroupPool,
     pub(crate) capacity: Option<SWReservationPool>,
     wake: Arc<crate::progress::SWWake>,
+    #[cfg(test)]
+    attachment_hook: Mutex<Option<AttachmentHook>>,
 }
 
 impl OwnedScheduler {
@@ -351,17 +438,366 @@ impl OwnedScheduler {
     }
 
     #[cfg(feature = "diagnostics")]
-    fn trace_job(&self, id: u64) -> crate::diagnostics::JobGuard {
-        let group = self
-            .lock()
-            .records
-            .get(&id)
-            .and_then(|record| record.group.as_ref().map(|group| group.id));
+    fn trace_job(&self, job: &JobHandle) -> crate::diagnostics::JobGuard {
         crate::diagnostics::JobGuard::enter(crate::diagnostics::SWTraceJob {
             runtime: self.trace_runtime,
-            id,
-            group,
+            id: job.id(),
+            group: job.group_id(),
         })
+    }
+
+    #[track_caller]
+    fn domain_lock<'a, T>(&'a self, mutex: &'a Mutex<T>, _domain: u64) -> DomainGuard<'a, T> {
+        let notification = self.wake.notification_scope();
+        #[cfg(feature = "diagnostics")]
+        let started = crate::diagnostics::clock();
+        let guard = mutex.lock().unwrap_or_else(|error| error.into_inner());
+        DomainGuard {
+            guard: Some(guard),
+            wake: &self.wake,
+            _notification: notification,
+            #[cfg(feature = "diagnostics")]
+            timing: started.map(|start| (start, std::time::Instant::now())),
+            #[cfg(feature = "diagnostics")]
+            scheduler: self as *const Self as usize as u64,
+            #[cfg(feature = "diagnostics")]
+            runtime: self.trace_runtime,
+            #[cfg(feature = "diagnostics")]
+            domain: _domain,
+            #[cfg(feature = "diagnostics")]
+            site: std::panic::Location::caller().line(),
+            #[cfg(feature = "diagnostics")]
+            cycles: started.and_then(|_| crate::diagnostics::cycles()),
+            #[cfg(feature = "diagnostics")]
+            metrics: &self.metrics[_domain as usize],
+        }
+    }
+
+    #[track_caller]
+    fn class_lock(&self, class: SWExecutionClass) -> DomainGuard<'_, ClassState> {
+        self.domain_lock(&self.classes[class.index()], class.index() as u64)
+    }
+
+    fn allocate_id(counter: &AtomicU64) -> u64 {
+        counter
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .expect("scheduler identity exhausted")
+    }
+
+    pub(crate) fn new(
+        control: Weak<RuntimeControl>,
+        limits: SWOwnedLimits,
+        capacity: Option<SWReservationPool>,
+        priorities: Vec<SWPriority>,
+        demand_leases: usize,
+    ) -> Arc<Self> {
+        let wake = control.upgrade().expect("building live runtime").wake();
+        if let Some(capacity) = &capacity {
+            capacity.set_wake(Arc::clone(&wake));
+        }
+        Arc::new(Self {
+            #[cfg(feature = "diagnostics")]
+            trace_runtime: control.upgrade().expect("building live runtime").identity(),
+            #[cfg(feature = "diagnostics")]
+            metrics: std::array::from_fn(|_| DomainMetrics::default()),
+            control,
+            limits,
+            capacity,
+            wake,
+            classes: std::array::from_fn(|_| {
+                Mutex::new(ClassState {
+                    records: HashMap::new(),
+                    ready: ReadyQueue::with_priorities(&priorities),
+                    deferred: VecDeque::new(),
+                })
+            }),
+            external: Mutex::new(HashMap::new()),
+            abandoned: AtomicBool::new(false),
+            next_id: AtomicU64::new(1),
+            next_group: AtomicU64::new(1),
+            accounting: Arc::new(Accounting {
+                records: AtomicUsize::new(0),
+                edges: AtomicUsize::new(0),
+                limits,
+            }),
+            demand_enabled: !priorities.is_empty(),
+            demand: Mutex::new(DemandDomain {
+                graph: DemandState::new(priorities, demand_leases),
+                targets: HashMap::new(),
+            }),
+            demand_transfer: Mutex::new(()),
+            demand_pending: AtomicBool::new(false),
+            demand_updates: std::array::from_fn(|_| Mutex::new(HashMap::new())),
+            demand_updates_pending: std::array::from_fn(|_| AtomicBool::new(false)),
+            provider_callbacks: AtomicUsize::new(0),
+            jobs: JobPool::new(limits.records),
+            signals: SignalPool::new(limits.records),
+            subscriptions: Mutex::new(BufferPool::new(limits.edges)),
+            groups: GroupPool::new(limits.records),
+            #[cfg(test)]
+            attachment_hook: Mutex::new(None),
+        })
+    }
+
+    pub(crate) fn quiescent(&self) -> bool {
+        self.accounting.records.load(Ordering::Acquire) == 0
+            && self.classes.iter().all(|class| {
+                class
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .ready
+                    .handed_off
+                    == 0
+            })
+            && !self.demand_pending.load(Ordering::Acquire)
+            && self
+                .demand_updates_pending
+                .iter()
+                .all(|pending| !pending.load(Ordering::Acquire))
+            && self.provider_callbacks.load(Ordering::Acquire) == 0
+    }
+
+    pub(crate) fn progress(&self) -> crate::progress::SWSchedulerProgress {
+        #[cfg(feature = "diagnostics")]
+        for (domain, metrics) in self.metrics.iter().enumerate() {
+            self.trace(
+                "scheduler.domain.acquisitions",
+                domain as u64,
+                metrics.acquisitions.load(Ordering::Relaxed),
+            );
+            self.trace(
+                "scheduler.domain.wait_ns",
+                domain as u64,
+                metrics.wait_ns.load(Ordering::Relaxed),
+            );
+            self.trace(
+                "scheduler.domain.hold_ns",
+                domain as u64,
+                metrics.hold_ns.load(Ordering::Relaxed),
+            );
+        }
+        let mut snapshot = crate::progress::SWSchedulerProgress {
+            demand_pending: self.demand_pending.load(Ordering::Acquire)
+                || self
+                    .demand_updates_pending
+                    .iter()
+                    .any(|pending| pending.load(Ordering::Acquire)),
+            provider_callbacks: self.provider_callbacks.load(Ordering::Acquire),
+            records_full: self.accounting.records.load(Ordering::Acquire) >= self.limits.records,
+            edges_full: self.limits.edges != 0
+                && self.accounting.edges.load(Ordering::Acquire) >= self.limits.edges,
+            ..Default::default()
+        };
+        for class in SWExecutionClass::ALL {
+            let state = self.classes[class.index()]
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let index = class.index();
+            snapshot.handoff_wrappers[index] = state.ready.handed_off;
+            snapshot.runnable_full[index] = state.ready.runnable >= self.limits.runnable[index];
+            snapshot.handoff_full[index] = state.ready.handed_off >= self.limits.handoff[index];
+            for job in state.records.values() {
+                if let Some(record) = job.record_lock().as_ref() {
+                    match record.stage {
+                        Stage::Waiting => snapshot.waiting += 1,
+                        Stage::DeferredReady => snapshot.deferred += 1,
+                        Stage::Ready => snapshot.ready += 1,
+                        Stage::Handed => snapshot.handed += 1,
+                        Stage::Running => snapshot.running += 1,
+                        Stage::Finalizing => snapshot.finalizing += 1,
+                    }
+                }
+            }
+        }
+        snapshot
+    }
+
+    fn reserve_group_id(&self, class: SWExecutionClass) -> Result<u64, SWSpawnError> {
+        // Identity reservation uses the group's own acceptance gate.
+        let _gate = self.class_lock(class);
+        if self.abandoned.load(Ordering::Acquire) {
+            return Err(SWSpawnError::Closed);
+        }
+        Ok(Self::allocate_id(&self.next_group))
+    }
+    pub(crate) fn prepare_stage(
+        &self,
+        runtime: u64,
+        options: &crate::execution::SWStageOptions<'_>,
+    ) -> Result<(SubmitExtras, Option<SWByteLease>), SWSpawnError> {
+        if options.work_set.is_some() && options.discovery.is_some() {
+            return Err(SWSpawnError::InvalidContext);
+        }
+        let work_set = match (options.work_set, options.discovery) {
+            (Some(set), _) => Some(set.try_root_lease(runtime)),
+            (_, Some(permit)) => Some(permit.try_child_lease(runtime)),
+            _ => None,
+        }
+        .transpose()
+        .map_err(|error| match error {
+            SWDiscoveryError::Full => SWSpawnError::Full,
+            _ => SWSpawnError::Closed,
+        })?;
+        let cost = SWCost::new(
+            options.cost.records.max(1),
+            options.cost.edges.max(options.prerequisites.len()),
+            options
+                .cost
+                .deliveries
+                .max(usize::from(options.delivery.is_some()))
+                - usize::from(
+                    options
+                        .delivery
+                        .as_ref()
+                        .is_some_and(|ticket| ticket.is_accounted()),
+                ),
+            options.cost.bytes,
+        );
+        if options.retained_bytes > cost.bytes {
+            return Err(SWSpawnError::TooLarge);
+        }
+        let capacity = if let Some(reservation) = options.reservation {
+            if reservation.runtime_identity() != runtime {
+                return Err(SWSpawnError::InvalidReservation);
+            }
+            Some(reservation.stage(cost).map_err(map_reservation_error)?)
+        } else if let Some(pool) = &self.capacity {
+            Some(
+                pool.try_reserve_ordinary(cost)
+                    .map_err(map_reservation_error)?,
+            )
+        } else {
+            if cost.bytes != 0 {
+                return Err(SWSpawnError::Disabled);
+            }
+            None
+        };
+        let bytes = if options.retained_bytes != 0 {
+            Some(
+                capacity
+                    .as_ref()
+                    .expect("retained bytes require capacity")
+                    .retain_bytes(options.retained_bytes)
+                    .map_err(map_reservation_error)?,
+            )
+        } else {
+            None
+        };
+        Ok((
+            SubmitExtras {
+                work_set,
+                capacity,
+                priority: options.priority,
+                reserved: options.reservation.is_some(),
+            },
+            bytes,
+        ))
+    }
+
+    pub(crate) fn group(
+        self: &Arc<Self>,
+        class: SWExecutionClass,
+    ) -> Result<SWGroup, SWSpawnError> {
+        let control = self.control.upgrade().ok_or(SWSpawnError::Closed)?;
+        let admission = control.admit_owned(false).map_err(|error| match error {
+            crate::execution::SWExecutionError::Closed => SWSpawnError::Closed,
+            crate::execution::SWExecutionError::InvalidContext => SWSpawnError::InvalidContext,
+        })?;
+        let id = self.reserve_group_id(class)?;
+        let inner = self.groups.acquire(id, class);
+        inner.set_notification_runtime(control.identity());
+        if let Some(domain) = control.notification_domain() {
+            inner.set_notification_source(domain);
+        }
+        // The reserved ID is the admission point. Keep the runtime admission
+        // alive through checkout even when graceful closure races this call.
+        drop(admission);
+        Ok(SWGroup::new(
+            inner,
+            Arc::downgrade(self),
+            control.identity(),
+        ))
+    }
+
+    pub(crate) fn renew_group(self: &Arc<Self>, group: &mut SWGroup) -> Result<(), SWSpawnError> {
+        let control = self.control.upgrade().ok_or(SWSpawnError::Closed)?;
+        if group.runtime != control.identity()
+            || !Weak::ptr_eq(&group.scheduler, &Arc::downgrade(self))
+        {
+            return Err(SWSpawnError::InvalidGroup);
+        }
+        let admission = control.admit_owned(false).map_err(|error| match error {
+            crate::execution::SWExecutionError::Closed => SWSpawnError::Closed,
+            crate::execution::SWExecutionError::InvalidContext => SWSpawnError::InvalidContext,
+        })?;
+        let id = self.reserve_group_id(group.class())?;
+        if !group.try_reset(id) {
+            let inner = self.groups.acquire(id, group.class());
+            *group = SWGroup::new(inner, Arc::downgrade(self), control.identity());
+        }
+        group.inner.set_notification_runtime(control.identity());
+        if let Some(domain) = control.notification_domain() {
+            group.inner.set_notification_source(domain);
+        }
+        drop(admission);
+        Ok(())
+    }
+
+    pub(crate) fn submit_payload<P, T>(
+        self: &Arc<Self>,
+        request: SubmitRequest<'_>,
+        payload: P,
+        run: fn(P) -> T,
+        application_failed: fn(&T) -> bool,
+    ) -> SWSpawnResult<T, P>
+    where
+        P: Send + 'static,
+        T: Send + 'static,
+    {
+        self.submit_payload_delivering(request, payload, run, application_failed, &mut None)
+    }
+
+    pub(crate) fn submit_payload_delivering<P, T>(
+        self: &Arc<Self>,
+        request: SubmitRequest<'_>,
+        payload: P,
+        run: fn(P) -> T,
+        application_failed: fn(&T) -> bool,
+        delivery: &mut Option<crate::owner::SWDeliveryTicket>,
+    ) -> SWSpawnResult<T, P>
+    where
+        P: Send + 'static,
+        T: Send + 'static,
+    {
+        self.submit_payload_accounted(
+            request,
+            payload,
+            run,
+            application_failed,
+            delivery,
+            SubmitExtras::default(),
+        )
+    }
+
+    pub(crate) fn submit_payload_in_set<P: Send + 'static, T: Send + 'static>(
+        self: &Arc<Self>,
+        request: SubmitRequest<'_>,
+        payload: P,
+        run: fn(P) -> T,
+        application_failed: fn(&T) -> bool,
+        lease: WorkSetLease,
+    ) -> SWSpawnResult<T, P> {
+        self.submit_payload_accounted(
+            request,
+            payload,
+            run,
+            application_failed,
+            &mut None,
+            SubmitExtras {
+                work_set: Some(lease),
+                ..SubmitExtras::default()
+            },
+        )
     }
 
     pub(crate) fn admit_external<'a, T: Send + 'static>(
@@ -451,19 +887,31 @@ impl OwnedScheduler {
         } else {
             None
         };
-        let mut state = self.lock_mut();
-        if state.abandoned {
-            reject!(SWSpawnError::Closed);
-        }
-        if options
-            .priority
-            .is_some_and(|rank| !state.demand.contains(rank))
-            || (options.provider_demand.is_some() && !state.demand.enabled())
+        if options.priority.is_some_and(|rank| {
+            !self
+                .demand
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .graph
+                .contains(rank)
+        }) || (options.provider_demand.is_some() && !self.demand_enabled)
         {
             reject!(SWSpawnError::InvalidPriority);
         }
-        if state.records.len() + state.external.len() >= self.limits.records {
-            reject!(SWSpawnError::Full);
+        let charge = match self.accounting.acquire(0) {
+            Ok(charge) => charge,
+            Err(reason) => reject!(reason),
+        };
+        let id = Self::allocate_id(&self.next_id);
+        let (task, sink) = SWTask::pending_with_signal(self.signals.acquire());
+        task.set_producer(control.identity(), id, Arc::downgrade(self));
+        if let Some(domain) = control.notification_domain() {
+            task.set_notification_source(domain);
+        }
+        let core = Arc::new(ExternalCore::new(sink, bytes));
+        let mut state = self.domain_lock(&self.external, 4);
+        if self.abandoned.load(Ordering::Acquire) {
+            reject!(SWSpawnError::Closed);
         }
         let delivery_capacity = if unaccounted_delivery {
             capacity.as_ref().map(|capacity| {
@@ -486,44 +934,54 @@ impl OwnedScheduler {
                 })
             };
             if let Some(reason) = rejection {
+                drop(state);
                 reject!(reason);
             }
         }
-        let id = state.next_id;
-        state.next_id = id.checked_add(1).expect("owned record identity exhausted");
-        let signal = state.signals.acquire();
-        let (task, sink) = SWTask::pending_with_signal(signal);
-        task.set_producer(control.identity(), id, Arc::downgrade(self));
-        if let Some(domain) = control.notification_domain() {
-            task.set_notification_source(domain);
-        }
-        let core = Arc::new(ExternalCore::new(sink, bytes));
-        if state.demand.enabled() {
-            state
-                .demand
-                .register(id, options.priority, &[], options.provider_demand.take())
-                .expect("external rank validated before commitment");
-        }
-        let bound_ticket = options.delivery.take().inspect(|ticket| {
-            if let Some(charge) = delivery_capacity {
-                ticket.attach_capacity(charge);
-            }
-        });
         let set_registration = work_set.clone();
         let finalizer_core = Arc::clone(&core);
-        state.external.insert(
+        // Attachment retains the accepted external record until graph and
+        // delivery binding finish. Abandonment stages suppression during this
+        // phase, and provider/cancellation controls are exposed afterward.
+        state.insert(
             id,
             ExternalRecord {
                 settling: false,
+                attaching: true,
+                deferred_status: None,
                 settle: Arc::new(move |status| finalizer_core.publish_status(status)),
                 admission,
                 work_set,
                 capacity,
+                charge,
             },
         );
         drop(state);
+        if self.demand_enabled {
+            let mut demand = self.domain_lock(&self.demand, 3);
+            demand
+                .graph
+                .register(id, options.priority, &[], options.provider_demand.take())
+                .expect("external rank validated");
+            self.demand_pending.store(true, Ordering::Release);
+        }
+        let bound_ticket = options.delivery.take();
         if let Some(ticket) = bound_ticket {
+            if let Some(charge) = delivery_capacity {
+                ticket.attach_capacity(charge);
+            }
             ticket.bind(task.completion());
+        }
+        let deferred_status = {
+            let mut state = self.domain_lock(&self.external, 4);
+            let record = state
+                .get_mut(&id)
+                .expect("attachment retains external acceptance");
+            record.attaching = false;
+            record.deferred_status.take()
+        };
+        if let Some(status) = deferred_status {
+            self.settle_external(id, status);
         }
         let weak = Arc::downgrade(self);
         let producer_control = SWProducerControl::new(Box::new(move || {
@@ -539,16 +997,16 @@ impl OwnedScheduler {
             id,
             core,
         };
-        self.service_demand(32);
+        self.service_demand_automatic();
         Ok((producer, task, producer_control))
     }
 
     pub(crate) fn claim_external(&self, id: u64, abandonment: bool) -> bool {
-        let mut state = self.lock_mut();
-        if state.abandoned && !abandonment {
+        let mut state = self.domain_lock(&self.external, 4);
+        if self.abandoned.load(Ordering::Acquire) && !abandonment {
             return false;
         }
-        let Some(record) = state.external.get_mut(&id) else {
+        let Some(record) = state.get_mut(&id) else {
             return false;
         };
         if record.settling {
@@ -561,424 +1019,58 @@ impl OwnedScheduler {
     pub(crate) fn finish_external(&self, id: u64, publish: impl FnOnce()) {
         let _context = context::ControlCallbackGuard::enter();
         let publication = catch_unwind(AssertUnwindSafe(publish));
-        let (record, provider) = {
-            let mut state = self.lock_mut();
-            let record = state.external.remove(&id);
-            let provider = state.demand.remove(id);
-            (record, provider)
-        };
-        crate::cleanup::discard_value(provider);
+        let record = self.domain_lock(&self.external, 4).remove(&id);
+        self.remove_demand(id);
         if let Some(record) = record {
             let ExternalRecord {
                 admission,
                 work_set,
                 capacity,
                 settle,
+                charge,
                 ..
             } = record;
-            drop((settle, capacity, work_set, admission));
+            drop((settle, capacity, work_set, charge, admission));
         }
         if let Err(payload) = publication {
             crate::cleanup::discard_panic(payload);
         }
+        // Completing an external or ordinary CPU graph node can dirty its
+        // ancestors even when no further CPU arrivals occur. Producers retain
+        // an automatic graph route rather than relying on an application pump.
+        self.service_demand_chunk(32);
+        if let Some(control) = self.control.upgrade()
+            && let Ok(scheduler) = control.owned_scheduler()
+        {
+            scheduler.dispatch_ready();
+        }
+        self.wake.notify();
     }
 
     pub(crate) fn settle_external(&self, id: u64, status: SWTaskStatus) {
+        {
+            let mut state = self.domain_lock(&self.external, 4);
+            let Some(record) = state.get_mut(&id) else {
+                return;
+            };
+            if record.attaching {
+                record.deferred_status = Some(status);
+                return;
+            }
+        }
         if !self.claim_external(id, status == SWTaskStatus::Abandoned) {
             return;
         }
-        let settle = {
-            let state = self.lock();
-            state
-                .external
-                .get(&id)
-                .map(|record| Arc::clone(&record.settle))
-        };
+        let settle = self
+            .external
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(&id)
+            .map(|record| Arc::clone(&record.settle));
         if let Some(settle) = settle {
             self.finish_external(id, move || settle(status));
         }
     }
-
-    fn push_ready(&self, state: &mut State, class: SWExecutionClass, id: u64) {
-        #[cfg(feature = "diagnostics")]
-        self.trace("job.ready", id, class.index() as u64);
-        if state.records.get(&id).is_some_and(|record| record.resource) {
-            let selection = state
-                .demand
-                .selection(id)
-                .expect("admitted resource demand");
-            state.ready.push_resource(class, id, selection);
-        } else {
-            state.ready.push(class, id);
-        }
-    }
-
-    pub(crate) fn prepare_stage(
-        &self,
-        runtime: u64,
-        options: &crate::execution::SWStageOptions<'_>,
-    ) -> Result<(SubmitExtras, Option<SWByteLease>), SWSpawnError> {
-        if options.work_set.is_some() && options.discovery.is_some() {
-            return Err(SWSpawnError::InvalidContext);
-        }
-        let work_set = match (options.work_set, options.discovery) {
-            (Some(set), _) => Some(set.try_root_lease(runtime)),
-            (_, Some(permit)) => Some(permit.try_child_lease(runtime)),
-            _ => None,
-        }
-        .transpose()
-        .map_err(|error| match error {
-            SWDiscoveryError::Full => SWSpawnError::Full,
-            _ => SWSpawnError::Closed,
-        })?;
-        let cost = SWCost::new(
-            options.cost.records.max(1),
-            options.cost.edges.max(options.prerequisites.len()),
-            options
-                .cost
-                .deliveries
-                .max(usize::from(options.delivery.is_some()))
-                - usize::from(
-                    options
-                        .delivery
-                        .as_ref()
-                        .is_some_and(|ticket| ticket.is_accounted()),
-                ),
-            options.cost.bytes,
-        );
-        if options.retained_bytes > cost.bytes {
-            return Err(SWSpawnError::TooLarge);
-        }
-        let capacity = if let Some(reservation) = options.reservation {
-            if reservation.runtime_identity() != runtime {
-                return Err(SWSpawnError::InvalidReservation);
-            }
-            Some(reservation.stage(cost).map_err(map_reservation_error)?)
-        } else if let Some(pool) = &self.capacity {
-            Some(
-                pool.try_reserve_ordinary(cost)
-                    .map_err(map_reservation_error)?,
-            )
-        } else {
-            if cost.bytes != 0 {
-                return Err(SWSpawnError::Disabled);
-            }
-            None
-        };
-        let bytes = if options.retained_bytes != 0 {
-            Some(
-                capacity
-                    .as_ref()
-                    .expect("retained bytes require capacity")
-                    .retain_bytes(options.retained_bytes)
-                    .map_err(map_reservation_error)?,
-            )
-        } else {
-            None
-        };
-        Ok((
-            SubmitExtras {
-                work_set,
-                capacity,
-                priority: options.priority,
-                reserved: options.reservation.is_some(),
-            },
-            bytes,
-        ))
-    }
-
-    pub(crate) fn attach_demand(
-        self: &Arc<Self>,
-        id: u64,
-        priority: SWPriority,
-    ) -> Result<SWDemand, SWDemandError> {
-        let lease = {
-            let mut state = self.lock_mut();
-            if state.abandoned {
-                return Err(SWDemandError::Closed);
-            }
-            state.demand.attach(id, priority)?
-        };
-        let scheduler = Arc::downgrade(self);
-        let demand = SWDemand::new(
-            lease,
-            Arc::new(move |id, command| {
-                let scheduler = scheduler.upgrade().ok_or(SWDemandError::Closed)?;
-                scheduler.lock_mut().demand.change(id, command)?;
-                scheduler.service_demand(32);
-                Ok(())
-            }),
-        );
-        self.service_demand(32);
-        Ok(demand)
-    }
-
-    fn service_demand_chunk(&self, budget: usize) {
-        let providers = {
-            let mut state = self.lock_mut();
-            let changes = state.demand.service(budget);
-            let mut providers = Vec::new();
-            for change in changes {
-                if let Some(record) = state.records.get(&change.id)
-                    && record.resource
-                    && record.stage == Stage::Ready
-                {
-                    let class = record.class;
-                    state
-                        .ready
-                        .update_resource(class, change.id, change.selection);
-                }
-                if let Some(provider) = change.provider {
-                    providers.push(provider);
-                }
-            }
-            state.provider_callbacks += providers.len();
-            providers
-        };
-        let _callbacks = ProviderCallbacks {
-            scheduler: self,
-            count: providers.len(),
-        };
-        let _context = context::ControlCallbackGuard::enter();
-        for (provider, snapshot) in providers {
-            // Provider demand is advisory. A panicking hook cannot unwind an
-            // admission or worker dispatch after the record was committed.
-            if let Err(payload) = catch_unwind(AssertUnwindSafe(|| provider(snapshot))) {
-                crate::cleanup::discard_panic(payload);
-            }
-            // Settlement can remove the node during invocation. Keep the last
-            // hook reference outside that unwind, and contain its cleanup too.
-            crate::cleanup::discard_value(provider);
-        }
-    }
-
-    pub(crate) fn service_demand(self: &Arc<Self>, budget: usize) -> bool {
-        self.service_demand_chunk(budget);
-        self.dispatch_ready();
-        self.lock().demand.pending_updates()
-    }
-
-    pub(crate) fn new(
-        control: Weak<RuntimeControl>,
-        limits: SWOwnedLimits,
-        capacity: Option<SWReservationPool>,
-        priorities: Vec<SWPriority>,
-        demand_leases: usize,
-    ) -> Arc<Self> {
-        let wake = control.upgrade().expect("building live runtime").wake();
-        if let Some(capacity) = &capacity {
-            capacity.set_wake(Arc::clone(&wake));
-        }
-        Arc::new(Self {
-            #[cfg(feature = "diagnostics")]
-            trace_runtime: control.upgrade().expect("building live runtime").identity(),
-            control,
-            limits,
-            capacity,
-            wake,
-            groups: GroupPool::new(limits.records),
-            state: Mutex::new(State {
-                records: HashMap::new(),
-                external: HashMap::new(),
-                next_id: 1,
-                next_group: 1,
-                edges: 0,
-                ready: ReadyQueues::with_priorities(&priorities),
-                deferred: std::array::from_fn(|_| VecDeque::new()),
-                abandoned: false,
-                demand: DemandState::new(priorities, demand_leases),
-                provider_callbacks: 0,
-                jobs: JobPool::new(limits.records),
-                signals: SignalPool::new(limits.records),
-                subscriptions: BufferPool::new(limits.edges),
-            }),
-        })
-    }
-
-    #[track_caller]
-    fn lock(&self) -> StateGuard<'_> {
-        #[cfg(feature = "diagnostics")]
-        let started = crate::diagnostics::clock();
-        let guard = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        #[cfg(feature = "diagnostics")]
-        {
-            StateGuard {
-                guard: Some(guard),
-                timing: started.map(|start| (start, std::time::Instant::now())),
-                scheduler: self as *const Self as usize as u64,
-                runtime: self.trace_runtime,
-                site: std::panic::Location::caller().line(),
-                cycles: started.and_then(|_| crate::diagnostics::cycles()),
-            }
-        }
-        #[cfg(not(feature = "diagnostics"))]
-        guard
-    }
-
-    #[track_caller]
-    fn lock_mut(&self) -> StateMutation<'_> {
-        let notification = self.wake.notification_scope();
-        StateMutation {
-            state: Some(self.lock()),
-            wake: &self.wake,
-            _notification: notification,
-        }
-    }
-
-    pub(crate) fn quiescent(&self) -> bool {
-        let state = self.lock();
-        state.records.is_empty()
-            && state.external.is_empty()
-            && state.ready.handed_off.iter().all(|count| *count == 0)
-            && !state.demand.pending_updates()
-            && state.provider_callbacks == 0
-    }
-
-    pub(crate) fn progress(&self) -> crate::progress::SWSchedulerProgress {
-        let state = self.lock();
-        let mut snapshot = crate::progress::SWSchedulerProgress {
-            handoff_wrappers: state.ready.handed_off,
-            demand_pending: state.demand.pending_updates(),
-            provider_callbacks: state.provider_callbacks,
-            records_full: state.records.len() + state.external.len() >= self.limits.records,
-            edges_full: self.limits.edges != 0 && state.edges >= self.limits.edges,
-            runnable_full: std::array::from_fn(|index| {
-                state.ready.runnable[index] >= self.limits.runnable[index]
-            }),
-            handoff_full: std::array::from_fn(|index| {
-                state.ready.handed_off[index] >= self.limits.handoff[index]
-            }),
-            ..Default::default()
-        };
-        for record in state.records.values() {
-            match record.stage {
-                Stage::Waiting => snapshot.waiting += 1,
-                Stage::DeferredReady => snapshot.deferred += 1,
-                Stage::Ready => snapshot.ready += 1,
-                Stage::Handed => snapshot.handed += 1,
-                Stage::Running => snapshot.running += 1,
-                Stage::Finalizing => snapshot.finalizing += 1,
-            }
-        }
-        snapshot
-    }
-
-    pub(crate) fn group(
-        self: &Arc<Self>,
-        class: SWExecutionClass,
-    ) -> Result<SWGroup, SWSpawnError> {
-        let control = self.control.upgrade().ok_or(SWSpawnError::Closed)?;
-        let admission = control.admit_owned(false).map_err(|error| match error {
-            crate::execution::SWExecutionError::Closed => SWSpawnError::Closed,
-            crate::execution::SWExecutionError::InvalidContext => SWSpawnError::InvalidContext,
-        })?;
-        let id = self.reserve_group_id()?;
-        let inner = self.groups.acquire(id, class);
-        inner.set_notification_runtime(control.identity());
-        if let Some(domain) = control.notification_domain() {
-            inner.set_notification_source(domain);
-        }
-        // The reserved ID is the admission point. Keep the runtime admission
-        // alive through checkout even when graceful closure races this call.
-        drop(admission);
-        Ok(SWGroup::new(
-            inner,
-            Arc::downgrade(self),
-            control.identity(),
-        ))
-    }
-
-    pub(crate) fn renew_group(self: &Arc<Self>, group: &mut SWGroup) -> Result<(), SWSpawnError> {
-        let control = self.control.upgrade().ok_or(SWSpawnError::Closed)?;
-        if group.runtime != control.identity()
-            || !Weak::ptr_eq(&group.scheduler, &Arc::downgrade(self))
-        {
-            return Err(SWSpawnError::InvalidGroup);
-        }
-        let admission = control.admit_owned(false).map_err(|error| match error {
-            crate::execution::SWExecutionError::Closed => SWSpawnError::Closed,
-            crate::execution::SWExecutionError::InvalidContext => SWSpawnError::InvalidContext,
-        })?;
-        let id = self.reserve_group_id()?;
-        if !group.try_reset(id) {
-            let inner = self.groups.acquire(id, group.class());
-            *group = SWGroup::new(inner, Arc::downgrade(self), control.identity());
-        }
-        group.inner.set_notification_runtime(control.identity());
-        if let Some(domain) = control.notification_domain() {
-            group.inner.set_notification_source(domain);
-        }
-        drop(admission);
-        Ok(())
-    }
-
-    fn reserve_group_id(&self) -> Result<u64, SWSpawnError> {
-        let mut state = self.lock_mut();
-        if state.abandoned {
-            return Err(SWSpawnError::Closed);
-        }
-        let id = state.next_group;
-        state.next_group = id.checked_add(1).expect("group identity exhausted");
-        Ok(id)
-    }
-
-    pub(crate) fn submit_payload<P, T>(
-        self: &Arc<Self>,
-        request: SubmitRequest<'_>,
-        payload: P,
-        run: fn(P) -> T,
-        application_failed: fn(&T) -> bool,
-    ) -> SWSpawnResult<T, P>
-    where
-        P: Send + 'static,
-        T: Send + 'static,
-    {
-        self.submit_payload_delivering(request, payload, run, application_failed, &mut None)
-    }
-
-    pub(crate) fn submit_payload_delivering<P, T>(
-        self: &Arc<Self>,
-        request: SubmitRequest<'_>,
-        payload: P,
-        run: fn(P) -> T,
-        application_failed: fn(&T) -> bool,
-        delivery: &mut Option<crate::owner::SWDeliveryTicket>,
-    ) -> SWSpawnResult<T, P>
-    where
-        P: Send + 'static,
-        T: Send + 'static,
-    {
-        self.submit_payload_accounted(
-            request,
-            payload,
-            run,
-            application_failed,
-            delivery,
-            SubmitExtras::default(),
-        )
-    }
-
-    pub(crate) fn submit_payload_in_set<P: Send + 'static, T: Send + 'static>(
-        self: &Arc<Self>,
-        request: SubmitRequest<'_>,
-        payload: P,
-        run: fn(P) -> T,
-        application_failed: fn(&T) -> bool,
-        lease: WorkSetLease,
-    ) -> SWSpawnResult<T, P> {
-        self.submit_payload_accounted(
-            request,
-            payload,
-            run,
-            application_failed,
-            &mut None,
-            SubmitExtras {
-                work_set: Some(lease),
-                ..SubmitExtras::default()
-            },
-        )
-    }
-
     pub(crate) fn submit_payload_accounted<P: Send + 'static, T: Send + 'static>(
         self: &Arc<Self>,
         request: SubmitRequest<'_>,
@@ -1028,26 +1120,37 @@ impl OwnedScheduler {
                 Err(error) => return Err(reject(map_reservation_error(error), payload)),
             }
         }
-        let mut state = self.lock_mut();
-        if state.abandoned {
-            return Err(reject(SWSpawnError::Closed, payload));
-        }
-        if extras
-            .priority
-            .is_some_and(|priority| !state.demand.contains(priority))
-        {
+        if extras.priority.is_some_and(|priority| {
+            !self
+                .demand
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .graph
+                .contains(priority)
+        }) {
             return Err(reject(SWSpawnError::InvalidPriority, payload));
         }
-        if prerequisites.len() > self.limits.edges {
-            return Err(reject(SWSpawnError::TooLarge, payload));
+        let charge = match self.accounting.acquire(prerequisites.len()) {
+            Ok(charge) => charge,
+            Err(reason) => return Err(reject(reason, payload)),
+        };
+        let id = Self::allocate_id(&self.next_id);
+        let (task, sink) = SWTask::pending_with_signal(self.signals.acquire());
+        task.set_producer(control.identity(), id, Arc::downgrade(self));
+        if let Some(domain) = control.notification_domain() {
+            task.set_notification_source(domain);
         }
-        if state.records.len() + state.external.len() >= self.limits.records
-            || state
-                .edges
-                .checked_add(prerequisites.len())
-                .is_none_or(|edges| edges > self.limits.edges)
-        {
-            return Err(reject(SWSpawnError::Full, payload));
+        // Prepare recycler storage without capturing the rejectable payload.
+        let mut job = self.jobs.prepare(id, Arc::downgrade(self));
+        let subscriptions = self
+            .subscriptions
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .acquire(prerequisites.len());
+        let set_registration = extras.work_set.clone();
+        let mut state = self.class_lock(class);
+        if self.abandoned.load(Ordering::Acquire) {
+            return Err(reject(SWSpawnError::Closed, payload));
         }
         let group_inner = if let Some(group) = group {
             if group.runtime != control.identity()
@@ -1066,28 +1169,30 @@ impl OwnedScheduler {
         } else {
             None
         };
-        let saturated = prerequisites.is_empty()
-            && state.ready.runnable[class.index()] >= self.limits.runnable_for(class);
+        let saturated =
+            prerequisites.is_empty() && state.ready.runnable >= self.limits.runnable_for(class);
         let inline =
             saturated && allow_inline && options.eligibility == SWCallerEligibility::CallerEligible;
-        if inline
+        let reason = if inline
             && context::current().is_some_and(|current| {
                 current.runtime != control.identity() || current.class != class
-            })
-        {
+            }) {
+            Some(SWSpawnError::InvalidContext)
+        } else if saturated && !inline && !extras.reserved {
+            Some(SWSpawnError::Full)
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
             drop(state);
             if let Some(group) = &group_inner {
                 group.finish(None);
             }
-            return Err(reject(SWSpawnError::InvalidContext, payload));
+            return Err(reject(reason, payload));
         }
-        if saturated && !inline && !extras.reserved {
-            drop(state);
-            if let Some(group) = &group_inner {
-                group.finish(None);
-            }
-            return Err(reject(SWSpawnError::Full, payload));
-        }
+        // Acceptance retains the existing class -> group/owner-route/capacity
+        // order. Their notification scopes defer callbacks beyond the class
+        // guard; rejection unwinds provisional charges after releasing it.
         let delivery_capacity = if delivery
             .as_ref()
             .is_some_and(|ticket| !ticket.is_accounted())
@@ -1119,78 +1224,86 @@ impl OwnedScheduler {
                 return Err(reject(reason, payload));
             }
         }
-        let id = state.next_id;
-        state.next_id = id.checked_add(1).expect("owned record identity exhausted");
-        let signal = state.signals.acquire();
-        let (task, sink) = SWTask::pending_with_signal(signal);
-        task.set_producer(control.identity(), id, Arc::downgrade(self));
-        if let Some(domain) = control.notification_domain() {
-            task.set_notification_source(domain);
-        }
-        if state.demand.enabled() {
-            let parents = prerequisites
-                .iter()
-                .filter_map(|completion| completion.producer_identity())
-                .filter_map(|(runtime, record)| (runtime == control.identity()).then_some(record))
-                .collect::<Vec<_>>();
-            state
-                .demand
-                .register(id, extras.priority, &parents, None)
-                .expect("resource rank validated before commitment");
-        }
-        if let Some(ticket) = delivery.take() {
-            if let Some(capacity) = delivery_capacity {
-                ticket.attach_capacity(capacity);
-            }
-            // This new result cannot complete before the record is published.
-            // Binding registers an internal notifier, never a user callback.
-            // The delivery entitlement was committed before exposing CPU work.
-            ticket.bind(task.completion());
-        }
-        let envelope = make_envelope(payload, run, application_failed, sink);
-        let job = state.jobs.acquire(id, Arc::downgrade(self), envelope);
-        let stage = if !prerequisites.is_empty() {
-            Stage::Waiting
-        } else if saturated && !inline {
-            Stage::DeferredReady
-        } else {
-            Stage::Ready
-        };
-        state.edges += prerequisites.len();
-        let set_registration = extras.work_set.clone();
-        let subscriptions = state.subscriptions.acquire(prerequisites.len());
-        state.records.insert(
-            id,
+        let group_id = group_inner.as_ref().map(|group| group.id);
+        let priority = extras.priority;
+        job.initialize(
+            class,
+            group_id,
+            make_envelope(payload, run, application_failed, sink),
             Record {
-                job: job.clone(),
                 completion: group_inner.as_ref().map(|_| task.completion()),
-                class,
-                group: group_inner,
+                group: group_inner.clone(),
                 pending: prerequisites.len(),
                 failed: false,
                 policy,
-                stage,
+                stage: Stage::Waiting,
                 eligibility: options.eligibility,
-                edges: prerequisites.len(),
                 subscriptions,
-                attaching: !prerequisites.is_empty(),
+                // Every accepted record is visible to abandonment before dependency
+                // and graph attachment. Closure, not a callback, ends this phase.
+                attaching: true,
                 deferred_finish: None,
                 admission,
                 work_set: extras.work_set,
                 capacity: extras.capacity,
-                resource: extras.priority.is_some(),
+                resource: priority.is_some(),
+                selection: None,
+                charge,
             },
         );
-        if stage == Stage::Ready {
-            self.push_ready(&mut state, class, id);
-        } else if stage == Stage::DeferredReady {
-            state.deferred[class.index()].push_back(id);
-        }
+        // This insertion is the acceptance point; all later failures settle the
+        // accepted responsibility and never return the consumed payload.
+        state.records.insert(id, job.clone());
         drop(state);
+        if let Some(ticket) = delivery.take() {
+            if let Some(capacity) = delivery_capacity {
+                ticket.attach_capacity(capacity);
+            }
+            ticket.bind(task.completion());
+        }
+        if let Some(group) = &group_inner {
+            group.register_member(job.downgrade());
+        }
+        if self.demand_enabled {
+            let parents = prerequisites
+                .iter()
+                .filter_map(|completion| completion.producer_identity())
+                .filter_map(|(runtime, id)| (runtime == control.identity()).then_some(id))
+                .collect::<Vec<_>>();
+            let mut demand = self.domain_lock(&self.demand, 3);
+            demand
+                .graph
+                .register(id, priority, &parents, None)
+                .expect("rank checked before acceptance");
+            let selection = demand.graph.selection(id);
+            if priority.is_some() {
+                demand.targets.insert(id, class);
+            }
+            self.demand_pending.store(true, Ordering::Release);
+            drop(demand);
+            if let (Some(record), Some(selection)) = (job.record_lock().as_mut(), selection)
+                && record
+                    .selection
+                    .is_none_or(|previous| previous.version < selection.version)
+            {
+                record.selection = Some(selection);
+            }
+        }
+        #[cfg(test)]
+        {
+            let hook = self
+                .attachment_hook
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone();
+            if let Some(hook) = hook {
+                hook(job.clone());
+            }
+        }
         let weak = Arc::downgrade(self);
         let producer = SWProducerControl::new(Box::new(move || {
             if let Some(scheduler) = weak.upgrade() {
-                scheduler.suppress(id, SWTaskStatus::Cancelled);
+                scheduler.suppress_id(class, id, SWTaskStatus::Cancelled);
             }
         }));
         if let Some(registration) = set_registration {
@@ -1198,93 +1311,126 @@ impl OwnedScheduler {
         }
         for prerequisite in prerequisites {
             let weak = Arc::downgrade(self);
+            let target = job.downgrade();
             let subscription = prerequisite.subscribe_cancelable(Box::new(move |status| {
-                if let Some(scheduler) = weak.upgrade() {
-                    enqueue_activation(Activation::Prerequisite(scheduler, id, status));
+                if let (Some(scheduler), Some(job)) = (weak.upgrade(), target.upgrade()) {
+                    enqueue_activation(Activation::Prerequisite(scheduler, job, status));
                 }
             }));
-            let mut state = self.lock_mut();
-            if let Some(record) = state.records.get_mut(&id) {
+            let mut record = job.record_lock();
+            if let Some(record) = record.as_mut() {
                 record.subscriptions.push(subscription);
             } else {
-                drop(state);
+                drop(record);
                 drop(subscription);
             }
         }
         let deferred_finish = {
-            let mut state = self.lock_mut();
-            state.records.get_mut(&id).and_then(|record| {
+            let _notification = self.wake.notification_scope();
+            let mut record = job.record_lock();
+            record.as_mut().and_then(|record| {
                 record.attaching = false;
                 record.deferred_finish.take()
             })
         };
         if let Some(finish) = deferred_finish {
-            self.finish_record(id, finish);
+            self.finish_record(&job, finish);
+        } else {
+            self.activate_ready(&job, inline);
         }
         if inline {
-            self.claim_and_run(id, true);
+            self.claim_and_run(&job, true);
         } else {
-            self.dispatch();
+            self.dispatch_class(class);
         }
         Ok((task, producer))
     }
-
-    fn activate_prerequisite(self: &Arc<Self>, id: u64, status: SWTaskStatus) {
-        let mut suppress = false;
-        let mut group = None;
-        {
-            let mut state = self.lock_mut();
-            let activation = {
-                let Some(record) = state.records.get_mut(&id) else {
-                    return;
-                };
-                if record.stage != Stage::Waiting || record.pending == 0 {
-                    return;
-                }
-                record.pending -= 1;
-                record.failed |= !status.is_success();
-                if record.pending != 0 {
-                    None
-                } else if record.failed && record.policy == SWDependencyPolicy::SuccessOnly {
-                    suppress = true;
-                    None
-                } else {
-                    Some((record.class, record.group.clone()))
-                }
-            };
-            if let Some((class, ready_group)) = activation {
-                let has_slot =
-                    state.ready.runnable[class.index()] < self.limits.runnable_for(class);
-                let record = state
-                    .records
-                    .get_mut(&id)
-                    .expect("activation retains record");
-                if has_slot {
-                    record.stage = Stage::Ready;
-                    self.push_ready(&mut state, class, id);
-                    group = ready_group;
-                } else {
-                    record.stage = Stage::DeferredReady;
-                    state.deferred[class.index()].push_back(id);
-                }
-            }
+    fn push_ready(&self, state: &mut ClassState, job: &JobHandle, record: &Record) {
+        #[cfg(feature = "diagnostics")]
+        self.trace("job.ready", job.id(), job.class().index() as u64);
+        if record.resource {
+            state.ready.push_resource(
+                job.id(),
+                record
+                    .selection
+                    .expect("resource graph attached before activation"),
+            );
+        } else {
+            state.ready.push(job.id());
         }
+    }
+
+    fn activate_prerequisite(self: &Arc<Self>, job: &JobHandle, status: SWTaskStatus) {
+        {
+            let _notification = self.wake.notification_scope();
+            let mut record = job.record_lock();
+            let Some(record) = record.as_mut() else {
+                return;
+            };
+            if record.stage != Stage::Waiting || record.pending == 0 {
+                return;
+            }
+            record.pending -= 1;
+            record.failed |= !status.is_success();
+        }
+        self.activate_ready(job, false);
+        self.dispatch_class(job.class());
+    }
+
+    fn activate_ready(self: &Arc<Self>, job: &JobHandle, inline: bool) {
+        let class = job.class();
+        let (suppress, group) = {
+            let mut state = self.class_lock(class);
+            let mut record = job.record_lock();
+            let Some(record) = record.as_mut() else {
+                return;
+            };
+            if record.stage != Stage::Waiting || record.pending != 0 || record.attaching {
+                return;
+            }
+            if self.abandoned.load(Ordering::Acquire) {
+                (Some(SWTaskStatus::Abandoned), None)
+            } else if record.failed && record.policy == SWDependencyPolicy::SuccessOnly {
+                (Some(SWTaskStatus::PrerequisiteFailed), None)
+            } else if inline || state.ready.runnable < self.limits.runnable_for(class) {
+                record.stage = Stage::Ready;
+                self.push_ready(&mut state, job, record);
+                (None, record.group.clone())
+            } else {
+                record.stage = Stage::DeferredReady;
+                state.deferred.push_back(job.id());
+                (None, None)
+            }
+        };
         if let Some(group) = group {
             group.notify_ready();
         }
-        if suppress {
-            self.suppress(id, SWTaskStatus::PrerequisiteFailed);
+        if let Some(status) = suppress {
+            self.suppress(job, status);
         }
-        self.dispatch();
     }
 
-    fn suppress(self: &Arc<Self>, id: u64, mut status: SWTaskStatus) {
-        let job = {
-            let mut state = self.lock_mut();
-            if state.abandoned {
+    fn suppress_id(self: &Arc<Self>, class: SWExecutionClass, id: u64, status: SWTaskStatus) {
+        let job = self.classes[class.index()]
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .records
+            .get(&id)
+            .cloned();
+        if let Some(job) = job {
+            self.suppress(&job, status);
+        }
+    }
+
+    fn suppress(self: &Arc<Self>, job: &JobHandle, mut status: SWTaskStatus) {
+        let class = job.class();
+        let promoted = {
+            let mut state = self.class_lock(class);
+            if self.abandoned.load(Ordering::Acquire) {
                 status = SWTaskStatus::Abandoned;
             }
-            let Some(record) = state.records.get_mut(&id) else {
+            let mut guard = job.record_lock();
+            let Some(record) = guard.as_mut() else {
                 return;
             };
             let stage = record.stage;
@@ -1294,124 +1440,115 @@ impl OwnedScheduler {
                 Stage::Running | Stage::Finalizing => return,
             };
             record.stage = Stage::Finalizing;
-            let class = record.class;
-            let job = record.job.clone();
             match stage {
-                Stage::Ready => state.ready.remove(class, id),
-                Stage::DeferredReady => {
-                    state.deferred[class.index()].retain(|queued| *queued != id)
-                }
+                Stage::Ready => state.ready.remove(job.id()),
+                Stage::DeferredReady => state.deferred.retain(|id| *id != job.id()),
                 _ => {}
             }
+            drop(guard);
             if decrement {
-                state.ready.runnable[class.index()] -= 1;
-                self.promote_locked(&mut state, class);
+                state.ready.runnable -= 1;
+                self.promote_locked(&mut state, class)
+            } else {
+                Vec::new()
             }
-            job
         };
+        for group in promoted {
+            group.notify_ready();
+        }
         self.settle(job, Decision::Suppress(status));
     }
 
-    fn claim_and_run(self: &Arc<Self>, id: u64, caller: bool) -> bool {
+    fn claim_and_run(self: &Arc<Self>, job: &JobHandle, caller: bool) -> bool {
         let Some(control) = self.control.upgrade() else {
             return false;
         };
-        let class = {
-            let state = self.lock();
-            let Some(record) = state.records.get(&id) else {
-                return false;
-            };
-            record.class
-        };
+        let class = job.class();
+        // Notification capture cleanup cannot obtain an execution lease. A
+        // handoff lease is deliberately weaker and never substitutes for this.
         let Ok(_lease) = control.acquire_owned(class) else {
             return false;
         };
-        let (job, class, group_id) = {
-            let mut state = self.lock_mut();
-            // A lease obtained just before abandonment is not itself a claim.
-            // Serialize the actual claim with the scheduler's abandonment cut.
-            if state.abandoned {
+        let promoted = {
+            let mut state = self.class_lock(class);
+            if self.abandoned.load(Ordering::Acquire) {
                 return false;
             }
-            let Some(record) = state.records.get_mut(&id) else {
+            let mut guard = job.record_lock();
+            let Some(record) = guard.as_mut() else {
                 return false;
             };
-            if !matches!(record.stage, Stage::Ready | Stage::Handed) {
-                return false;
-            }
-            if caller && record.eligibility != SWCallerEligibility::CallerEligible {
+            if !matches!(record.stage, Stage::Ready | Stage::Handed)
+                || (caller && record.eligibility != SWCallerEligibility::CallerEligible)
+            {
                 return false;
             }
             let was_ready = record.stage == Stage::Ready;
+            // Claim and suppression compete under this actual class gate.
             record.stage = Stage::Running;
-            let class = record.class;
-            let job = record.job.clone();
-            let group_id = record.group.as_ref().map(|group| group.id);
-            // Dispatch already unlinked handed-off jobs. Only an inline or
-            // helper claim of a still-ready job needs to scan/remove it here.
+            drop(guard);
             if was_ready {
-                state.ready.remove(class, id);
+                state.ready.remove(job.id());
             }
-            state.ready.runnable[class.index()] -= 1;
-            self.promote_locked(&mut state, class);
-            (job, class, group_id)
+            state.ready.runnable -= 1;
+            self.promote_locked(&mut state, class)
         };
+        for group in promoted {
+            group.notify_ready();
+        }
         #[cfg(feature = "diagnostics")]
-        self.trace("job.claimed", id, group_id.unwrap_or(0));
-        let _context = ContextGuard::enter_owned(control.identity(), class, group_id);
+        self.trace("job.claimed", job.id(), job.group_id().unwrap_or(0));
+        let _context = ContextGuard::enter_owned(control.identity(), class, job.group_id());
         self.settle(job, Decision::Run);
         true
     }
 
-    fn run_job(self: &Arc<Self>, job: &Job) {
-        // The claim obtains a temporary backend lease before running. Queued
-        // records retain only admission credit and never own a backend Arc.
+    fn run_job(self: &Arc<Self>, job: &JobHandle) {
         #[cfg(feature = "diagnostics")]
         self.trace("job.backend_entry", job.id(), 0);
-        self.claim_and_run(job.id(), false);
+        self.claim_and_run(job, false);
     }
 
     fn decrement_handoff(&self, class: SWExecutionClass) {
-        let mut state = self.lock_mut();
-        state.ready.handed_off[class.index()] -= 1;
+        self.class_lock(class).ready.handed_off -= 1;
     }
 
-    fn promote_locked(&self, state: &mut State, class: SWExecutionClass) {
-        if !state.deferred[class.index()].is_empty() {
-            // Ready and deferred-ready are both unhanded work. Refill the
-            // bounded runnable window from both so capacity pressure cannot
-            // freeze a background resource ahead of newly urgent work.
-            // Keep previously-ready ordinary entries before deferred ordinary
-            // entries, preserving their FIFO activation order.
+    fn promote_locked(
+        &self,
+        state: &mut ClassState,
+        class: SWExecutionClass,
+    ) -> Vec<Arc<GroupInner>> {
+        self.apply_demand_updates(state, class);
+        let mut notifications = Vec::new();
+        if !state.deferred.is_empty() {
             let mut pending = VecDeque::new();
-            while let Some(id) = state.ready.pop(class) {
-                state
-                    .records
-                    .get_mut(&id)
-                    .expect("ready record exists")
-                    .stage = Stage::DeferredReady;
-                state.ready.runnable[class.index()] -= 1;
+            while let Some(id) = state.ready.pop() {
+                let job = state.records.get(&id).expect("ready record exists");
+                if let Some(record) = job.record_lock().as_mut() {
+                    record.stage = Stage::DeferredReady;
+                }
+                state.ready.runnable -= 1;
                 pending.push_back(id);
             }
-            pending.append(&mut state.deferred[class.index()]);
-            state.deferred[class.index()] = pending;
+            pending.append(&mut state.deferred);
+            state.deferred = pending;
         }
-        while state.ready.runnable[class.index()] < self.limits.runnable_for(class) {
-            let queue = &state.deferred[class.index()];
-            let ordinary = queue
-                .iter()
-                .enumerate()
-                .find(|(_, id)| state.records.get(id).is_some_and(|record| !record.resource))
-                .map(|(index, id)| (index, *id));
-            let resource = queue
+        while state.ready.runnable < self.limits.runnable_for(class) {
+            let ordinary = state.deferred.iter().enumerate().find_map(|(index, id)| {
+                let record = state.records.get(id)?.record_lock();
+                (!record.as_ref()?.resource).then_some((index, *id))
+            });
+            let resource = state
+                .deferred
                 .iter()
                 .enumerate()
                 .filter_map(|(index, id)| {
-                    let record = state.records.get(id)?;
+                    let record = state.records.get(id)?.record_lock();
+                    let record = record.as_ref()?;
                     if !record.resource {
                         return None;
                     }
-                    let selection = state.demand.selection(*id)?;
+                    let selection = record.selection?;
                     Some((
                         index,
                         *id,
@@ -1424,31 +1561,34 @@ impl OwnedScheduler {
                 (_, Some((index, _, _))) | (Some((index, _)), None) => Some(index),
                 (None, None) => None,
             };
-            let Some(id) = index.and_then(|index| state.deferred[class.index()].remove(index))
-            else {
+            let Some(id) = index.and_then(|index| state.deferred.remove(index)) else {
                 break;
             };
-            let Some(record) = state.records.get_mut(&id) else {
-                continue;
-            };
+            let job = state.records.get(&id).expect("deferred record exists");
+            let mut record = job.record_lock();
+            let record = record.as_mut().expect("deferred record remains live");
             if record.stage != Stage::DeferredReady {
                 continue;
             }
             record.stage = Stage::Ready;
             if let Some(group) = &record.group {
-                group.notify_ready();
+                notifications.push(Arc::clone(group));
             }
-            self.push_ready(state, class, id);
+            // Borrow fields directly; no owning job handle is dropped under gate.
+            if record.resource {
+                state
+                    .ready
+                    .push_resource(id, record.selection.expect("attached resource"));
+            } else {
+                state.ready.push(id);
+            }
         }
+        notifications
     }
 
-    fn cleanup_context(&self, id: u64) -> Option<ContextGuard> {
+    fn cleanup_context(&self, job: &JobHandle) -> Option<ContextGuard> {
         let control = self.control.upgrade()?;
-        let (class, group) = {
-            let state = self.lock();
-            let record = state.records.get(&id)?;
-            (record.class, record.group.as_ref().map(|group| group.id))
-        };
+        let (class, group) = (job.class(), job.group_id());
         match context::current() {
             None => Some(ContextGuard::enter_owned(control.identity(), class, group)),
             Some(current)
@@ -1458,24 +1598,17 @@ impl OwnedScheduler {
             {
                 Some(ContextGuard::enter_owned(control.identity(), class, group))
             }
-            // Preserve a different execution route: nested scoped calls must
-            // still reject cross-pool entry before touching backend TLS.
             Some(_) => None,
         }
     }
 
-    fn settle(self: &Arc<Self>, job: JobHandle, decision: Decision) {
+    fn settle(self: &Arc<Self>, job: &JobHandle, decision: Decision) {
         let Some(envelope) = job.take_envelope() else {
             return;
         };
         #[cfg(feature = "diagnostics")]
-        let _trace_job = self.trace_job(job.id());
-        // Cancellation and abandonment may be initiated by a host caller.
-        // Destructors and terminal callbacks remain participating CPU work,
-        // so a shutdown requested from either must not join this runtime.
-        let _context = self.cleanup_context(job.id());
-        // Capture cleanup executes outside the control lock. The admission
-        // token stays live through result publication and group completion.
+        let _trace_job = self.trace_job(job);
+        let _context = self.cleanup_context(job);
         #[cfg(feature = "diagnostics")]
         self.trace(
             if matches!(&decision, Decision::Run) {
@@ -1496,24 +1629,27 @@ impl OwnedScheduler {
         #[cfg(feature = "diagnostics")]
         self.trace("job.body_returned", job.id(), 0);
         {
-            let mut state = self.lock_mut();
-            if let Some(record) = state.records.get_mut(&job.id()) {
+            let _notification = self.wake.notification_scope();
+            if let Some(record) = job.record_lock().as_mut() {
                 record.stage = Stage::Finalizing;
             }
         }
-        self.finish_record(job.id(), finish);
+        self.finish_record(job, finish);
     }
 
-    fn finish_record(self: &Arc<Self>, id: u64, finish: Finish) {
+    fn finish_record(self: &Arc<Self>, job: &JobHandle, finish: Finish) {
         #[cfg(feature = "diagnostics")]
         let _trace_job = match crate::diagnostics::SWTrace::current_job() {
-            Some(job) if job.runtime == self.trace_runtime && job.id == id => None,
-            _ => Some(self.trace_job(id)),
+            Some(current) if current.runtime == self.trace_runtime && current.id == job.id() => {
+                None
+            }
+            _ => Some(self.trace_job(job)),
         };
-        let _context = self.cleanup_context(id);
+        let _context = self.cleanup_context(job);
         let mut subscriptions = {
-            let mut state = self.lock_mut();
-            let Some(record) = state.records.get_mut(&id) else {
+            let _notification = self.wake.notification_scope();
+            let mut record = job.record_lock();
+            let Some(record) = record.as_mut() else {
                 return;
             };
             if record.attaching {
@@ -1523,155 +1659,355 @@ impl OwnedScheduler {
             std::mem::take(&mut record.subscriptions)
         };
         subscriptions.clear();
-        self.lock_mut().subscriptions.release(subscriptions);
+        self.subscriptions
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .release(subscriptions);
         #[cfg(feature = "diagnostics")]
-        self.trace("job.result_publish.begin", id, 0);
+        self.trace("job.result_publish.begin", job.id(), 0);
         if let Err(payload) = catch_unwind(AssertUnwindSafe(finish)) {
             crate::cleanup::discard_panic(payload);
         }
-        // A terminal publication can activate another edge, which can itself
-        // publish a terminal outcome. Drain those callbacks without recursing,
-        // and retain this record's credits until its callbacks have run.
         #[cfg(feature = "diagnostics")]
-        self.trace("job.result_publish.end", id, 0);
-        enqueue_activation(Activation::Finalize(Arc::clone(self), id));
+        self.trace("job.result_publish.end", job.id(), 0);
+        enqueue_activation(Activation::Finalize(Arc::clone(self), job.clone()));
     }
 
-    fn finalize_record(self: &Arc<Self>, id: u64) {
-        let (record, provider) = {
-            let mut state = self.lock_mut();
-            let Some(record) = state.records.remove(&id) else {
-                return;
-            };
-            state.edges -= record.edges;
-            let provider = state.demand.remove(id);
-            (record, provider)
+    fn finalize_record(self: &Arc<Self>, job: JobHandle) {
+        let record = {
+            let _notification = self.wake.notification_scope();
+            job.record_lock().take()
         };
-        crate::cleanup::discard_value(provider);
-        // Strong settlement follows capacity return, not just result readiness.
+        let Some(record) = record else {
+            return;
+        };
+        let removed = self.class_lock(job.class()).records.remove(&job.id());
+        drop(removed);
+        self.remove_demand(job.id());
+        if let Some(group) = &record.group {
+            group.retire_member(job.id());
+        }
+        // Strong settlement remains capacity -> work set -> group -> runtime.
         drop(record.capacity);
         drop(record.work_set);
+        drop(record.charge);
         if let Some(group) = record.group {
             let status = record
                 .completion
                 .expect("group member retains its completion")
                 .status()
-                .expect("settled member has an outcome");
+                .expect("settled member outcome");
             #[cfg(feature = "diagnostics")]
-            self.trace("job.group_finish", id, group.id);
+            self.trace("job.group_finish", job.id(), group.id);
             group.finish(Some(status));
         }
-        // Keep runtime closure accounted through group-trigger publication,
-        // including inline executions with no backend wrapper retaining a lease.
         drop(record.admission);
-        self.dispatch();
+        self.dispatch_class(job.class());
     }
 
-    pub(crate) fn help_group(self: &Arc<Self>, group_id: u64) -> bool {
-        let id = {
-            let state = self.lock();
-            state
-                .records
-                .iter()
-                .filter(|(_, record)| {
-                    record
-                        .group
-                        .as_ref()
-                        .is_some_and(|group| group.id == group_id)
-                        && matches!(record.stage, Stage::Ready | Stage::Handed)
-                        && record.eligibility == SWCallerEligibility::CallerEligible
-                })
-                .map(|(id, _)| *id)
-                .min()
-        };
-        id.is_some_and(|id| self.claim_and_run(id, true))
+    pub(crate) fn help_group(self: &Arc<Self>, group: &Arc<GroupInner>) -> bool {
+        let mut after = 0;
+        while let Some(job) = group.member_after(after) {
+            after = job.id();
+            if self.claim_and_run(&job, true) {
+                return true;
+            }
+        }
+        false
     }
 
     pub(crate) fn abandon(self: &Arc<Self>) {
-        let (ids, external) = {
-            let mut state = self.lock_mut();
-            state.abandoned = true;
-            let ids = state
-                .records
-                .iter()
-                .filter(|(_, record)| record.stage != Stage::Running)
-                .map(|(id, _)| *id)
-                .collect::<Vec<_>>();
-            let external = state.external.keys().copied().collect::<Vec<_>>();
-            (ids, external)
-        };
-        for id in ids {
-            self.suppress(id, SWTaskStatus::Abandoned);
+        // Size the snapshot from live charges, never the configured ceiling. No
+        // allocation, backend operation, callback or final handle drop occurs
+        // under the rare fixed Low/Mid/High/external cut.
+        let mut jobs = Vec::new();
+        let mut external_ids = Vec::new();
+        let mut required = self.accounting.records.load(Ordering::Acquire);
+        loop {
+            jobs.reserve(required);
+            external_ids.reserve(required);
+            let _notification = self.wake.notification_scope();
+            let low = self.classes[0]
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let mid = self.classes[1]
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let high = self.classes[2]
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let external = self
+                .external
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let owned_count = low.records.len() + mid.records.len() + high.records.len();
+            if owned_count > jobs.capacity() || external.len() > external_ids.capacity() {
+                required = owned_count.max(external.len());
+                // No claim cut has been published. Releasing all guards before
+                // retrying permits the next allocation and admission callbacks.
+                continue;
+            }
+            self.abandoned.store(true, Ordering::Release);
+            for state in [&*low, &*mid, &*high] {
+                jobs.extend(state.records.values().cloned());
+            }
+            external_ids.extend(external.keys().copied());
+            break;
         }
-        for id in external {
+        self.wake.notify();
+        for job in jobs {
+            self.suppress(&job, SWTaskStatus::Abandoned);
+        }
+        for id in external_ids {
             self.settle_external(id, SWTaskStatus::Abandoned);
         }
     }
 
-    fn dispatch(self: &Arc<Self>) {
+    fn dispatch_class(self: &Arc<Self>, class: SWExecutionClass) {
         self.service_demand_chunk(32);
-        self.dispatch_ready();
+        self.dispatch_class_ready(class);
     }
 
-    fn dispatch_ready(self: &Arc<Self>) {
+    fn dispatch_class_ready(self: &Arc<Self>, class: SWExecutionClass) {
         let Some(control) = self.control.upgrade() else {
             return;
         };
-        for class in SWExecutionClass::ALL {
-            loop {
-                let job = {
-                    let mut state = self.lock_mut();
-                    if state.abandoned {
-                        break;
+        loop {
+            let (job, promoted) = {
+                let mut state = self.class_lock(class);
+                if self.abandoned.load(Ordering::Acquire) {
+                    break;
+                }
+                let promoted = self.promote_locked(&mut state, class);
+                if state.ready.handed_off >= self.limits.handoff_for(class) {
+                    drop(state);
+                    for group in promoted {
+                        group.notify_ready();
                     }
-                    self.promote_locked(&mut state, class);
-                    if state.ready.handed_off[class.index()] >= self.limits.handoff_for(class) {
-                        break;
+                    break;
+                }
+                let Some(id) = state.ready.pop() else {
+                    drop(state);
+                    for group in promoted {
+                        group.notify_ready();
                     }
-                    let Some(id) = state.ready.pop(class) else {
-                        break;
-                    };
-                    let Some(record) = state.records.get_mut(&id) else {
-                        continue;
-                    };
-                    if record.stage != Stage::Ready {
-                        continue;
-                    }
+                    break;
+                };
+                let job = state
+                    .records
+                    .get(&id)
+                    .expect("ready record remains indexed");
+                {
+                    let mut record = job.record_lock();
+                    let record = record.as_mut().expect("ready record is live");
+                    debug_assert!(record.stage == Stage::Ready);
                     record.stage = Stage::Handed;
-                    #[cfg(feature = "diagnostics")]
-                    self.trace(
-                        "job.handed",
-                        id,
-                        record.group.as_ref().map_or(0, |group| group.id),
-                    );
-                    let job = record.job.clone();
-                    state.ready.handed_off[class.index()] += 1;
-                    job
-                };
-                let handoff = Handoff {
-                    scheduler: Arc::downgrade(self),
-                    class,
-                    completed: false,
-                };
-                let Ok(lease) = control.acquire_handoff(class) else {
-                    drop(handoff);
-                    self.abandon();
-                    break;
-                };
-                let rejected_job = job.clone();
-                let offered = lease.pool().try_spawn_owned(move || handoff.run(job));
-                if let Err(wrapper) = offered {
-                    // Checked handoff returned the intact wrapper after stop.
-                    drop(wrapper);
-                    self.abandon();
-                    drop(rejected_job);
-                    break;
+                }
+                #[cfg(feature = "diagnostics")]
+                self.trace("job.handed", id, job.group_id().unwrap_or(0));
+                let job = job.clone();
+                state.ready.handed_off += 1;
+                (job, promoted)
+            };
+            for group in promoted {
+                group.notify_ready();
+            }
+            let handoff = Handoff {
+                scheduler: Arc::downgrade(self),
+                class,
+                completed: false,
+            };
+            let Ok(lease) = control.acquire_handoff(class) else {
+                drop(handoff);
+                self.abandon();
+                break;
+            };
+            let offered = lease.pool().try_spawn_owned(move || handoff.run(job));
+            if let Err(wrapper) = offered {
+                drop(wrapper);
+                self.abandon();
+                break;
+            }
+        }
+    }
+
+    fn dispatch_ready(self: &Arc<Self>) {
+        for class in SWExecutionClass::ALL {
+            self.dispatch_class_ready(class);
+        }
+    }
+    pub(crate) fn attach_demand(
+        self: &Arc<Self>,
+        id: u64,
+        priority: SWPriority,
+    ) -> Result<SWDemand, SWDemandError> {
+        let lease = {
+            let mut demand = self.domain_lock(&self.demand, 3);
+            if self.abandoned.load(Ordering::Acquire) {
+                return Err(SWDemandError::Closed);
+            }
+            let lease = demand.graph.attach(id, priority)?;
+            self.demand_pending.store(true, Ordering::Release);
+            lease
+        };
+        let weak = Arc::downgrade(self);
+        let demand = SWDemand::new(
+            lease,
+            Arc::new(move |id, command| {
+                let scheduler = weak.upgrade().ok_or(SWDemandError::Closed)?;
+                {
+                    let mut demand = scheduler.domain_lock(&scheduler.demand, 3);
+                    demand.graph.change(id, command)?;
+                    scheduler.demand_pending.store(true, Ordering::Release);
+                }
+                scheduler.service_demand_automatic();
+                Ok(())
+            }),
+        );
+        self.service_demand_automatic();
+        Ok(demand)
+    }
+
+    fn remove_demand(&self, id: u64) {
+        if !self.demand_enabled {
+            return;
+        }
+        let provider = {
+            let _notification = self.wake.notification_scope();
+            let transfer = self
+                .demand_transfer
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let (provider, class) = {
+                let mut demand = self.domain_lock(&self.demand, 3);
+                let class = demand.targets.remove(&id);
+                let provider = demand.graph.remove(id);
+                self.demand_pending
+                    .store(demand.graph.pending_updates(), Ordering::Release);
+                (provider, class)
+            };
+            if let Some(class) = class {
+                let mut updates = self.demand_updates[class.index()]
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                updates.remove(&id);
+                self.demand_updates_pending[class.index()]
+                    .store(!updates.is_empty(), Ordering::Release);
+            }
+            drop(transfer);
+            provider
+        };
+        crate::cleanup::discard_value(provider);
+    }
+
+    fn apply_demand_updates(&self, state: &mut ClassState, class: SWExecutionClass) {
+        if !self.demand_updates_pending[class.index()].load(Ordering::Acquire) {
+            return;
+        }
+        let updates = {
+            let mut mailbox = self.demand_updates[class.index()]
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let updates = mailbox.drain().collect::<Vec<_>>();
+            // Publish the clear before releasing the mailbox, then release it
+            // before any record wait. Graph publication cannot wait on records
+            // indirectly through a mailbox retained by this class consumer.
+            self.demand_updates_pending[class.index()].store(false, Ordering::Release);
+            updates
+        };
+        for (id, selection) in updates {
+            let Some(job) = state.records.get(&id) else {
+                continue;
+            };
+            let mut guard = job.record_lock();
+            if let Some(record) = guard.as_mut()
+                && record
+                    .selection
+                    .is_none_or(|previous| previous.version < selection.version)
+            {
+                record.selection = Some(selection);
+                if record.stage == Stage::Ready {
+                    state.ready.update_resource(id, selection);
                 }
             }
         }
     }
-}
 
+    fn service_demand_chunk(&self, budget: usize) {
+        if !self.demand_pending.load(Ordering::Acquire) {
+            return;
+        }
+        let mut providers = Vec::new();
+        {
+            let _notification = self.wake.notification_scope();
+            let transfer = self
+                .demand_transfer
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let changes = {
+                let mut demand = self.domain_lock(&self.demand, 3);
+                let changes = demand.graph.service(budget);
+                let mut updates = Vec::with_capacity(changes.len());
+                for change in changes {
+                    if let Some(class) = demand.targets.get(&change.id) {
+                        updates.push((*class, change.id, change.selection));
+                    }
+                    if let Some(provider) = change.provider {
+                        providers.push(provider);
+                    }
+                }
+                self.provider_callbacks
+                    .fetch_add(providers.len(), Ordering::AcqRel);
+                updates
+            };
+            // One coalesced entry per live resource node. Removal serializes
+            // with this publication and erases its mailbox entry before credits
+            // return. IDs never repeat even when control storage is reused.
+            for (class, id, selection) in changes {
+                let mut updates = self.demand_updates[class.index()]
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                let entry = updates.entry(id).or_insert(selection);
+                if entry.version < selection.version {
+                    *entry = selection;
+                }
+                self.demand_updates_pending[class.index()].store(true, Ordering::Release);
+            }
+            {
+                let demand = self.domain_lock(&self.demand, 3);
+                self.demand_pending
+                    .store(demand.graph.pending_updates(), Ordering::Release);
+            }
+            drop(transfer);
+        }
+        let _callbacks = ProviderCallbacks {
+            scheduler: self,
+            count: providers.len(),
+        };
+        let _context = context::ControlCallbackGuard::enter();
+        for (provider, snapshot) in providers {
+            if let Err(payload) = catch_unwind(AssertUnwindSafe(|| provider(snapshot))) {
+                crate::cleanup::discard_panic(payload);
+            }
+            crate::cleanup::discard_value(provider);
+        }
+    }
+
+    pub(crate) fn service_demand(self: &Arc<Self>, budget: usize) -> bool {
+        self.service_demand_chunk(budget);
+        self.dispatch_ready();
+        self.demand_pending.load(Ordering::Acquire)
+            || self
+                .demand_updates_pending
+                .iter()
+                .any(|pending| pending.load(Ordering::Acquire))
+    }
+
+    fn service_demand_automatic(self: &Arc<Self>) {
+        self.service_demand_chunk(32);
+        self.dispatch_ready();
+    }
+}
 pub(crate) fn map_reservation_error(error: SWReservationError) -> SWSpawnError {
     match error {
         SWReservationError::Full | SWReservationError::InsufficientCredits => SWSpawnError::Full,

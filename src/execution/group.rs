@@ -21,6 +21,7 @@ pub(crate) struct GroupInner {
     completion: SWCompletion,
     public_handles: AtomicUsize,
     retirement: Weak<crate::scheduler::storage::GroupRetirement>,
+    members: Mutex<Vec<crate::scheduler::storage::JobWeak>>,
 }
 
 struct GroupState {
@@ -53,6 +54,7 @@ impl GroupInner {
             completion: SWCompletion::pending(),
             public_handles: AtomicUsize::new(1),
             retirement: Weak::new(),
+            members: Mutex::new(Vec::new()),
         }
     }
 
@@ -81,6 +83,12 @@ impl GroupInner {
         };
         // Retained tokens keep their old signal; only an exclusive signal resets.
         self.completion.reset();
+        debug_assert!(
+            self.members
+                .get_mut()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_empty()
+        );
     }
 
     pub(crate) fn completion(&self) -> SWCompletion {
@@ -107,6 +115,38 @@ impl GroupInner {
         state.generation = state.generation.wrapping_add(1);
         self.changed.notify_all();
         true
+    }
+
+    pub(crate) fn register_member(&self, job: crate::scheduler::storage::JobWeak) {
+        self.members
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push(job);
+    }
+
+    pub(crate) fn retire_member(&self, id: u64) {
+        self.members
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .retain(|job| job.id() != id);
+    }
+
+    pub(crate) fn member_after(&self, after: u64) -> Option<crate::scheduler::storage::JobHandle> {
+        let members = self
+            .members
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let mut after = after;
+        loop {
+            let job = members
+                .iter()
+                .filter(|job| job.id() > after)
+                .min_by_key(|job| job.id())?;
+            after = job.id();
+            if let Some(job) = job.upgrade() {
+                return Some(job);
+            }
+        }
     }
 
     pub(crate) fn finish(&self, status: Option<SWTaskStatus>) {
@@ -286,7 +326,7 @@ impl SWGroup {
         let Some(scheduler) = self.scheduler.upgrade() else {
             return Ok(false);
         };
-        Ok(scheduler.help_group(self.inner.id))
+        Ok(scheduler.help_group(&self.inner))
     }
 
     /// Helps caller-eligible members of this exact group, then parks until it

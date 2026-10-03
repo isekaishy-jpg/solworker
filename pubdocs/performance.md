@@ -105,6 +105,20 @@ notification-source locks. This limits propagation of contention through that
 mutex; it does not guarantee immediate publication or OS scheduling. Separate
 time blocked on a lock from time a runnable thread spends waiting for CPU.
 
+Owned queue selection, claiming and handoff accounting use separate Low, Mid
+and High coordination. Jobs retain their own execution and dependency state;
+group helping follows that group's membership. This separates unrelated class
+queue contention, while jobs within one class still share its queue and workers.
+Route work by its execution requirements; a subsystem name alone does not create
+a separate pool or a latency guarantee.
+
+Global admission ceilings, runtime lifetime, demand propagation, notifications
+and storage recycling remain shared responsibilities. Demand ordering updates
+are coalesced per class and applied before resource selection; explicit host
+demand service remains budgeted. Class separation does not imply zero scheduler
+cost or zero frame-time impact. Measure same-class frame work and mixed resource
+work independently, including resource completion and physical drain.
+
 ## Use benchmarks and flamegraphs together
 
 Benchmarks quantify time and variation. CPU flamegraphs locate sampled CPU costs
@@ -144,6 +158,10 @@ intervals are buffered after unlocking. These timings include preemption and
 instrumentation, so they do not alone establish contention or production cost.
 On Windows, slow holds also record execution-cycle deltas when available. Cycle
 queries add probe cost and cycles are not a portable elapsed-time conversion.
+Scheduler domain events identify Low, Mid, High, demand and external bookkeeping
+as domain IDs 0 through 4. Progress snapshots emit cumulative acquisition, wait
+and hold counters for those instrumented guards. These counters do not cover
+every job, recycler, runtime, provider or operating-system wait.
 This observes transitions; it does not replace completion/count APIs or establish
 an OS scheduling cause. Record IDs are runtime-local; each event carries a
 process-local runtime identity, so correlate the pair rather than a record ID

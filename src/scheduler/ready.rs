@@ -2,8 +2,6 @@
 
 use std::collections::VecDeque;
 
-use crate::runtime::config::SWExecutionClass;
-
 use super::demand::{DemandSelection, SWPriority};
 
 struct Bucket {
@@ -15,21 +13,21 @@ struct Bucket {
 /// Ready records remain within the scheduler's admitted record bound. The
 /// resource buckets are allocated from the runtime's fixed rank list; relinking
 /// removes the old entry, so no stale heap copies accumulate.
-pub(super) struct ReadyQueues {
-    ordinary: [VecDeque<u64>; 3],
-    resource: [Vec<Bucket>; 3],
-    pub(super) runnable: [usize; 3],
-    pub(super) handed_off: [usize; 3],
+pub(super) struct ReadyQueue {
+    ordinary: VecDeque<u64>,
+    resource: Vec<Bucket>,
+    pub(super) runnable: usize,
+    pub(super) handed_off: usize,
 }
 
-impl ReadyQueues {
+impl ReadyQueue {
     pub(super) fn with_priorities(priorities: &[SWPriority]) -> Self {
         let mut ranks = priorities.to_vec();
         ranks.sort_unstable();
         ranks.dedup();
         Self {
-            ordinary: std::array::from_fn(|_| VecDeque::new()),
-            resource: std::array::from_fn(|_| {
+            ordinary: VecDeque::new(),
+            resource: {
                 ranks
                     .iter()
                     .map(|priority| Bucket {
@@ -38,38 +36,28 @@ impl ReadyQueues {
                         deferred: VecDeque::new(),
                     })
                     .collect()
-            }),
-            runnable: [0; 3],
-            handed_off: [0; 3],
+            },
+            runnable: 0,
+            handed_off: 0,
         }
     }
 
-    pub(super) fn push(&mut self, class: SWExecutionClass, id: u64) {
-        self.ordinary[class.index()].push_back(id);
-        self.runnable[class.index()] += 1;
+    pub(super) fn push(&mut self, id: u64) {
+        self.ordinary.push_back(id);
+        self.runnable += 1;
     }
 
-    pub(super) fn push_resource(
-        &mut self,
-        class: SWExecutionClass,
-        id: u64,
-        selection: DemandSelection,
-    ) {
-        self.insert_resource(class, id, selection);
-        self.runnable[class.index()] += 1;
+    pub(super) fn push_resource(&mut self, id: u64, selection: DemandSelection) {
+        self.insert_resource(id, selection);
+        self.runnable += 1;
     }
 
-    pub(super) fn update_resource(
-        &mut self,
-        class: SWExecutionClass,
-        id: u64,
-        selection: DemandSelection,
-    ) {
-        self.unlink_resource(class, id);
-        self.insert_resource(class, id, selection);
+    pub(super) fn update_resource(&mut self, id: u64, selection: DemandSelection) {
+        self.unlink_resource(id);
+        self.insert_resource(id, selection);
     }
 
-    fn insert_resource(&mut self, class: SWExecutionClass, id: u64, selection: DemandSelection) {
+    fn insert_resource(&mut self, id: u64, selection: DemandSelection) {
         debug_assert!(
             selection.priority.is_some(),
             "resource work requires a rank"
@@ -77,7 +65,8 @@ impl ReadyQueues {
         let Some(priority) = selection.priority else {
             return;
         };
-        let Some(bucket) = self.resource[class.index()]
+        let Some(bucket) = self
+            .resource
             .iter_mut()
             .find(|bucket| bucket.priority == priority)
         else {
@@ -95,8 +84,8 @@ impl ReadyQueues {
         queue.insert(position, (selection.tie, id));
     }
 
-    fn unlink_resource(&mut self, class: SWExecutionClass, id: u64) {
-        for bucket in &mut self.resource[class.index()] {
+    fn unlink_resource(&mut self, id: u64) {
+        for bucket in &mut self.resource {
             bucket.active.retain(|(_, queued)| *queued != id);
             bucket.deferred.retain(|(_, queued)| *queued != id);
         }
@@ -105,31 +94,29 @@ impl ReadyQueues {
     /// The two routes interleave by admission identity. Within the resource
     /// route active ranks precede deferred ranks, with lower ranks first; the
     /// ordinary route retains FIFO. Neither route imposes rank on the other.
-    pub(super) fn pop(&mut self, class: SWExecutionClass) -> Option<u64> {
-        let index = class.index();
-        let resource = self.resource[index]
+    pub(super) fn pop(&mut self) -> Option<u64> {
+        let resource = self
+            .resource
             .iter()
             .find_map(|bucket| bucket.active.front().map(|(_, id)| *id))
             .or_else(|| {
-                self.resource[index]
+                self.resource
                     .iter()
                     .find_map(|bucket| bucket.deferred.front().map(|(_, id)| *id))
             });
-        match (self.ordinary[index].front().copied(), resource) {
-            (Some(ordinary), Some(resource)) if ordinary < resource => {
-                self.ordinary[index].pop_front()
-            }
+        match (self.ordinary.front().copied(), resource) {
+            (Some(ordinary), Some(resource)) if ordinary < resource => self.ordinary.pop_front(),
             (Some(_), Some(resource)) | (None, Some(resource)) => {
-                self.unlink_resource(class, resource);
+                self.unlink_resource(resource);
                 Some(resource)
             }
-            (Some(_), None) => self.ordinary[index].pop_front(),
+            (Some(_), None) => self.ordinary.pop_front(),
             (None, None) => None,
         }
     }
 
-    pub(super) fn remove(&mut self, class: SWExecutionClass, id: u64) {
-        self.ordinary[class.index()].retain(|queued| *queued != id);
-        self.unlink_resource(class, id);
+    pub(super) fn remove(&mut self, id: u64) {
+        self.ordinary.retain(|queued| *queued != id);
+        self.unlink_resource(id);
     }
 }

@@ -2,8 +2,8 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use solworker::{
-    SWExecutionClass, SWOwnedLimits, SWPriority, SWRuntime, SWRuntimeConfig, SWSpawnOptions,
-    SWStageOptions, SWTaskStatus, SWWorkerConfig,
+    SWDependencyPolicy, SWExecutionClass, SWExternalOptions, SWOwnedLimits, SWPriority, SWRuntime,
+    SWRuntimeConfig, SWSpawnOptions, SWStageOptions, SWTaskStatus, SWWorkerConfig,
 };
 
 const TIMEOUT: Duration = Duration::from_secs(10);
@@ -77,7 +77,9 @@ fn resource_rank_and_promotion_order_pending_work_without_changing_ordinary_fifo
         .unwrap();
     let demand = promoted.completion().demand(SWPriority::new(1)).unwrap();
     demand.promote().unwrap();
-    service_all(&runtime);
+
+    // Demand producers and the next affected dispatch preserve ordering without
+    // requiring another application pump or another ordinary submission.
 
     release_send.send(()).unwrap();
     let observed: Vec<_> = (0..3)
@@ -226,7 +228,6 @@ fn consumer_demand_reaches_unresolved_resource_prerequisite() {
         )
         .unwrap();
     let _demand = child.completion().demand(SWPriority::new(0)).unwrap();
-    service_all(&runtime);
 
     release_send.send(()).unwrap();
     let observed: Vec<_> = (0..3)
@@ -245,5 +246,73 @@ fn consumer_demand_reaches_unresolved_resource_prerequisite() {
             Some(SWTaskStatus::Succeeded)
         );
     }
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn settling_ordinary_dependency_releases_provider_demand_without_another_pump() {
+    let mut runtime = runtime();
+    let lane = runtime.lane(SWExecutionClass::Mid);
+    let (advisory_send, advisory_recv) = mpsc::channel();
+    let (producer, parent, _) = runtime
+        .external::<()>(SWExternalOptions {
+            provider_demand: Some(std::sync::Arc::new(move |snapshot| {
+                advisory_send.send(snapshot).unwrap();
+            })),
+            ..Default::default()
+        })
+        .unwrap();
+    let (ordinary, cancel) = lane
+        .try_spawn_after(
+            SWSpawnOptions::default(),
+            &[parent.completion()],
+            SWDependencyPolicy::SuccessOnly,
+            || panic!("cancelled dependency must not execute"),
+        )
+        .unwrap();
+    let prerequisites = [ordinary.completion()];
+    let (resource, _) = lane
+        .try_spawn_stage(
+            SWStageOptions {
+                prerequisites: &prerequisites,
+                priority: Some(SWPriority::new(5)),
+                ..Default::default()
+            },
+            || panic!("failed dependency must suppress its resource successor"),
+        )
+        .unwrap();
+    let _demand = resource.completion().demand(SWPriority::new(0)).unwrap();
+    // Read until the active advisory: registration may also publish an initial
+    // empty snapshot. A deadline bounds failure without driving scheduler work.
+    let deadline = std::time::Instant::now() + TIMEOUT;
+    loop {
+        let snapshot = advisory_recv
+            .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+            .unwrap();
+        if snapshot.priority == Some(SWPriority::new(0)) && snapshot.active {
+            break;
+        }
+    }
+
+    cancel.cancel();
+    assert_eq!(
+        ordinary.completion().wait_timeout(TIMEOUT).unwrap(),
+        Some(SWTaskStatus::Cancelled)
+    );
+    assert_eq!(
+        resource.completion().wait_timeout(TIMEOUT).unwrap(),
+        Some(SWTaskStatus::PrerequisiteFailed)
+    );
+    let deadline = std::time::Instant::now() + TIMEOUT;
+    loop {
+        let snapshot = advisory_recv
+            .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+            .unwrap();
+        if snapshot.priority.is_none() && !snapshot.active {
+            break;
+        }
+    }
+    assert_eq!(parent.status(), None);
+    producer.complete(()).unwrap();
     runtime.shutdown().unwrap();
 }

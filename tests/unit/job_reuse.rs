@@ -90,3 +90,29 @@ fn concurrent_final_releases_return_one_exclusive_control() {
     assert_eq!(Arc::as_ptr(reused.job.as_ref().unwrap()), address);
     settle(&reused);
 }
+
+#[test]
+fn weak_membership_does_not_retain_settled_jobs_or_retarget_their_identity() {
+    let pool = JobPool::new(1);
+    let first = pool.acquire(1, Weak::new(), empty_envelope());
+    let old_address = Arc::as_ptr(first.job.as_ref().unwrap());
+    let membership = first.downgrade();
+    assert_eq!(membership.upgrade().unwrap().id(), 1);
+    settle(&first);
+    drop(first);
+    assert!(membership.upgrade().is_none());
+    assert!(pool.recycled.lock().unwrap().free.is_empty());
+
+    let next = pool.acquire(2, Weak::new(), empty_envelope());
+    let new_address = Arc::as_ptr(next.job.as_ref().unwrap());
+    assert_ne!(new_address, old_address);
+    assert!(membership.upgrade().is_none());
+    assert_eq!(next.id(), 2);
+    settle(&next);
+    drop(next);
+    drop(membership);
+    let reused = pool.acquire(3, Weak::new(), empty_envelope());
+    assert_eq!(Arc::as_ptr(reused.job.as_ref().unwrap()), new_address);
+    assert_eq!(reused.id(), 3);
+    settle(&reused);
+}

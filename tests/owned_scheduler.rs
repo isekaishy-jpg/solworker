@@ -27,18 +27,25 @@ const TIMEOUT: Duration = Duration::from_secs(10);
 
 #[test]
 fn runnable_saturation_inline_is_explicit_and_try_spawn_never_runs_inline() {
+    struct Release(mpsc::Sender<()>);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            let _ = self.0.send(());
+        }
+    }
     let mut runtime = runtime(1, 1);
     let lane = runtime.lane(SWExecutionClass::High);
     let (started_send, started_recv) = mpsc::channel();
     let (release_send, release_recv) = mpsc::channel();
+    let release = Release(release_send);
     let (mut first, _) = lane
         .try_spawn(SWSpawnOptions::default(), move || {
             started_send.send(()).unwrap();
-            release_recv.recv().unwrap();
+            release_recv.recv_timeout(TIMEOUT).unwrap();
             1
         })
         .unwrap();
-    started_recv.recv().unwrap();
+    started_recv.recv_timeout(TIMEOUT).unwrap();
 
     let (mut queued, _) = lane.try_spawn(caller_eligible(), || 2).unwrap();
     let rejected = lane
@@ -70,7 +77,12 @@ fn runnable_saturation_inline_is_explicit_and_try_spawn_never_runs_inline() {
         .unwrap();
     assert_eq!(succeeded.status(), Some(SWTaskStatus::Succeeded));
     assert_eq!(succeeded.try_take(), Some(SWOutcome::Success(Ok(4))));
-    release_send.send(()).unwrap();
+    let saturated = runtime.progress().scheduler;
+    assert_eq!(saturated.ready, 1);
+    assert_eq!(saturated.running, 1);
+    assert_eq!(saturated.handoff_wrappers, [0, 0, 1]);
+    assert!(saturated.runnable_full[2]);
+    drop(release);
     assert_eq!(first.completion().wait().unwrap(), SWTaskStatus::Succeeded);
     assert_eq!(queued.completion().wait().unwrap(), SWTaskStatus::Succeeded);
     assert_eq!(first.try_take(), Some(SWOutcome::Success(1)));
@@ -110,10 +122,24 @@ fn full_handoff_window_does_not_mean_runnable_saturation() {
 
 #[test]
 fn repeated_cancelled_ready_jobs_leave_no_queue_entries() {
+    struct Release(mpsc::Sender<()>);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            let _ = self.0.send(());
+        }
+    }
+    struct CountDrop(Arc<AtomicUsize>);
+    impl Drop for CountDrop {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
     let mut runtime = runtime(1, 1);
     let lane = runtime.lane(SWExecutionClass::Mid);
     let (started_send, started_recv) = mpsc::channel();
     let (release_send, release_recv) = mpsc::channel();
+    let release = Release(release_send);
     let (running, _) = lane
         .try_spawn(SWSpawnOptions::default(), move || {
             started_send.send(()).unwrap();
@@ -121,15 +147,43 @@ fn repeated_cancelled_ready_jobs_leave_no_queue_entries() {
         })
         .unwrap();
     started_recv.recv_timeout(TIMEOUT).unwrap();
-    for _ in 0..2048 {
-        let (task, control) = lane.try_spawn(SWSpawnOptions::default(), || ()).unwrap();
+    let drops = Arc::new(AtomicUsize::new(0));
+    let calls = Arc::new(AtomicUsize::new(0));
+    for iteration in 0..2048 {
+        let capture = CountDrop(Arc::clone(&drops));
+        let invoked = Arc::clone(&calls);
+        let (task, control) = lane
+            .try_spawn(SWSpawnOptions::default(), move || {
+                let _capture = capture;
+                invoked.fetch_add(1, Ordering::SeqCst);
+            })
+            .unwrap();
         control.cancel();
         assert_eq!(
             task.completion().wait_timeout(TIMEOUT).unwrap(),
             Some(SWTaskStatus::Cancelled)
         );
+        assert_eq!(drops.load(Ordering::SeqCst), iteration + 1);
+        let progress = runtime.progress().scheduler;
+        assert_eq!(progress.ready, 0);
+        assert_eq!(progress.deferred, 0);
+        assert_eq!(progress.handoff_wrappers, [0, 1, 0]);
+        assert!(!progress.records_full);
+        assert!(!progress.runnable_full[1]);
     }
-    release_send.send(()).unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    let (sentinel_send, sentinel_recv) = mpsc::channel();
+    let (sentinel, _) = lane
+        .try_spawn(SWSpawnOptions::default(), move || {
+            sentinel_send.send(()).unwrap();
+        })
+        .unwrap();
+    drop(release);
+    sentinel_recv.recv_timeout(TIMEOUT).unwrap();
+    assert_eq!(
+        sentinel.completion().wait_timeout(TIMEOUT).unwrap(),
+        Some(SWTaskStatus::Succeeded)
+    );
     assert_eq!(
         running.completion().wait().unwrap(),
         SWTaskStatus::Succeeded

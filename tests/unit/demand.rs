@@ -1,6 +1,5 @@
 use super::demand::{DemandCommand, DemandState, SWDemandError, SWPriority};
-use super::ready::ReadyQueues;
-use crate::runtime::config::SWExecutionClass;
+use super::ready::ReadyQueue;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -73,16 +72,15 @@ fn resource_rank_and_explicit_tie_promotion_do_not_reorder_ordinary_fifo() {
     state.change(lease, DemandCommand::Promote).unwrap();
     state.service(8);
 
-    let mut ready = ReadyQueues::with_priorities(&[urgent, normal]);
-    let class = SWExecutionClass::Mid;
-    ready.push(class, 1);
+    let mut ready = ReadyQueue::with_priorities(&[urgent, normal]);
+    ready.push(1);
     for id in [2, 3, 4] {
-        ready.push_resource(class, id, state.selection(id).unwrap());
+        ready.push_resource(id, state.selection(id).unwrap());
     }
-    assert_eq!(ready.pop(class), Some(1));
-    assert_eq!(ready.pop(class), Some(4));
-    assert_eq!(ready.pop(class), Some(2));
-    assert_eq!(ready.pop(class), Some(3));
+    assert_eq!(ready.pop(), Some(1));
+    assert_eq!(ready.pop(), Some(4));
+    assert_eq!(ready.pop(), Some(2));
+    assert_eq!(ready.pop(), Some(3));
 }
 
 #[test]

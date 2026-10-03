@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 #[test]
 fn retired_signal_reuses_only_after_result_and_observers_release() {
-    let mut signals = SignalPool::new(2);
+    let signals = SignalPool::new(2);
     let first = signals.acquire();
     let address = &*first as *const _;
     let (task, sink) = SWTask::pending_with_signal(first);
@@ -79,7 +79,7 @@ fn retired_group_waits_for_seal_settlement_and_public_release() {
 
 #[test]
 fn simultaneous_final_signal_observers_return_one_reusable_allocation() {
-    let mut signals = SignalPool::new(1);
+    let signals = SignalPool::new(1);
     let signal = signals.acquire();
     let address = &*signal as *const _;
     let (task, sink) = SWTask::pending_with_signal(signal);
@@ -146,6 +146,7 @@ fn group_checkout_does_not_hold_scheduler_state() {
     use crate::runtime::SWRuntime;
     use crate::runtime::config::{SWRuntimeConfig, SWWorkerConfig};
     use crate::scheduler::SWOwnedLimits;
+    use std::sync::atomic::Ordering;
 
     let config = SWRuntimeConfig::new(3, [SWWorkerConfig::new(1); 3]).unwrap();
     let limits = SWOwnedLimits::new(1, 0, [1; 3], [1; 3]).unwrap();
@@ -153,22 +154,23 @@ fn group_checkout_does_not_hold_scheduler_state() {
         .with_owned_limits(limits)
         .build()
         .unwrap();
-    let lane = runtime.lane(SWExecutionClass::High);
+    let class = SWExecutionClass::High;
+    let lane = runtime.lane(class);
     let seed = lane.group().unwrap();
     let scheduler = seed.scheduler.upgrade().unwrap();
     seed.seal();
     drop(seed);
-    let previous_id = scheduler.lock().next_group;
+    let previous_id = scheduler.next_group.load(Ordering::Relaxed);
     let retired_guard = scheduler.groups.retired.entries.lock().unwrap();
     let checkout = std::thread::spawn(move || lane.group());
 
     // Observe reservation through the actual public admission path. A checkout
-    // holding scheduler state while blocked on the recycler fails this check.
+    // holding the class gate while blocked on the recycler fails this check.
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut state_available = false;
     while Instant::now() < deadline {
-        if let Ok(state) = scheduler.state.try_lock()
-            && state.next_group > previous_id
+        if scheduler.next_group.load(Ordering::Relaxed) > previous_id
+            && scheduler.classes[class.index()].try_lock().is_ok()
         {
             state_available = true;
             break;
@@ -196,7 +198,7 @@ fn signal_publication_detachment_and_final_release_can_overlap_teardown() {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     for teardown in [false, true] {
-        let mut signals = SignalPool::new(1);
+        let signals = SignalPool::new(1);
         let (task, sink) = SWTask::pending_with_signal(signals.acquire());
         let completion = task.completion();
         let calls = Arc::new(AtomicUsize::new(0));
@@ -230,7 +232,7 @@ fn signal_publication_detachment_and_final_release_can_overlap_teardown() {
             }
         });
         assert!(calls.load(Ordering::SeqCst) <= 1);
-        if let Some(mut signals) = pool {
+        if let Some(signals) = pool {
             let (next, sink) = SWTask::<()>::pending_with_signal(signals.acquire());
             assert_eq!(next.status(), None);
             let previous_calls = calls.load(Ordering::SeqCst);
