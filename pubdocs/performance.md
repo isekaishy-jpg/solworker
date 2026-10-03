@@ -21,12 +21,37 @@ decode scratch or recording contexts is still a domain responsibility. Retained
 observers may prevent metadata reuse. Do not promise allocation-free execution
 merely because a batch object itself is reused.
 
+Group membership grows on demand in fixed pages of 64 metadata slots. A live
+member or provisional reservation keeps its page in use. When the last live or
+reserved slot retires, an empty non-anchor page is released, with at most one
+page released per member retirement. One anchor page remains for reuse. After
+all members and reservations retire, trimming the directory still takes work
+proportional to its peak page count. A later large wave must regrow the released
+pages and directory. Measure growth, drain and final-member latency alongside
+warm helping; this reclamation policy does not guarantee constant-time settlement.
+
+Internal control and subscription caches have finite retention limits;
+cached batch-preparation scratch also has entry and byte caps. Concurrent or
+nested submissions use independent scratch, and only empty metadata buffers
+return to that cache. Successful shutdown releases cached preparation scratch
+even if lane handles remain retained.
+
+Owned task/result storage, invocation envelopes, successful receipt vectors and
+cold metadata growth can still allocate. These caches do not retain application
+payloads or replace the application's output and scratch budgets. Retained
+results keep their own storage alive after logical settlement or shutdown.
+
 Use `try_spawn_batch` to pass an already formed owned wave through bounded bulk
 admission. Keep the useful operations and chunk widths fixed when comparing it
 with single submission. Measure admission CPU and consumer latency separately
 from GPU/frame cadence. Singleton input, shared-prerequisite release and small
 same-class work competing with a large wave need separate checks; fewer class
 acquisitions alone do not establish a useful speedup.
+
+Bound each submitted wave to useful work at its consumer boundary. Internal
+portions bound preparation and publication width, not the caller's input vector,
+capture sizes or the duration of an individual operation. Admission limits do
+not partition an oversized application phase automatically.
 
 Bulk admission has preparation overhead and publishes ready jobs in bursts.
 It can reduce producer CPU while increasing the time before unrelated small
@@ -41,20 +66,21 @@ internal operation reductions, not a guarantee of fewer total wakes: result,
 group and host notifications still have their existing contracts. Keep measuring
 total CPU, settlement and unrelated consumer latency alongside admission.
 
-Exact-group helping uses an ordered membership index. Finding the next member
-and removing a completed member each take logarithmic lookup work; an
-unsuccessful pass over a large waiting group can still take O(n log n) work.
-The membership lock is released before claiming or executing a job. Avoid
-treating a larger batch as free helping, and measure large retained groups at
-their actual consumer boundary.
+Exact-group helping uses reusable membership storage and a linked index containing
+only caller-eligible Ready or Handed members. Waiting, deferred and worker-only
+members are absent from that index, so a no-ready pass does not walk the waiting
+membership. Selection retains a checked job identity and releases membership
+protection before the class claim or user execution. Claiming, cancellation and
+demotion revoke readiness under the authoritative scheduler transition.
 
-A successful `help_ready` call also searches from the start of the live
-membership index. If a small runnable window becomes ready in a different order
-from member IDs, repeated calls can revisit deferred members and accumulate
-quadratic member visits across a drain. Shared-prerequisite callbacks do not
-promise admission-order activation. Keep this search cost separate from queue
-promotion when measuring large groups; one successful job per call does not
-mean constant scheduler work per call.
+Maintaining eligibility and retiring membership add bookkeeping even when a
+worker executes every job. Fewer allocations and faster large-group searches
+therefore do not guarantee lower small-job latency or frame CPU cost.
+Helpers and workers can still compete for the same candidate. Group index order
+is not a public FIFO guarantee, and shared-prerequisite callbacks do not promise
+admission-order activation. Measure concurrent helping and large retained groups
+at their actual consumer boundary; one successful job per call does not mean
+constant total scheduler work or a latency bound.
 
 Ready and deferred selection use keyed indexes, so promoting the next job or
 removing an indexed entry does not scan the deferred backlog. Ordering changes

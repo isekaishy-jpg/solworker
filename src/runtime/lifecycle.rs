@@ -601,20 +601,33 @@ impl RuntimeControl {
 
     /// Linearizes one bounded portion against root closure. Every returned
     /// token retires its own responsibility, independently of its siblings.
+    #[cfg(test)]
     pub(crate) fn admit_owned_many(
         self: &Arc<Self>,
         accounted: bool,
         count: usize,
     ) -> Result<Vec<OwnedAdmission>, SWExecutionError> {
+        let mut admissions = Vec::new();
+        self.admit_owned_many_into(accounted, count, &mut admissions)?;
+        Ok(admissions)
+    }
+
+    pub(crate) fn admit_owned_many_into(
+        self: &Arc<Self>,
+        accounted: bool,
+        count: usize,
+        admissions: &mut Vec<OwnedAdmission>,
+    ) -> Result<(), SWExecutionError> {
+        assert!(admissions.is_empty());
         if count == 0 {
-            return Ok(Vec::new());
+            return Ok(());
         }
         if crate::notification::invocation_active() {
             return Err(SWExecutionError::InvalidContext);
         }
         // Allocate before the closure cut. The caller limits this to the
         // current portion, never the entire uncommitted input suffix.
-        let mut admissions = Vec::with_capacity(count);
+        admissions.reserve(count);
         let descendant = current().is_some_and(|context| context.runtime == self.id);
         let mut state = self.lock();
         if state.phase != SWRuntimeState::Running
@@ -633,7 +646,7 @@ impl RuntimeControl {
         }
         state.mark_progress();
         drop(state);
-        Ok(admissions)
+        Ok(())
     }
 
     /// Temporary backend ownership for an accepted handoff or execution.

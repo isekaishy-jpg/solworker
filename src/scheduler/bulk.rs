@@ -3,9 +3,8 @@
 use super::{
     Accounting, AccountingLease, Activation, CompletionSink, Decision, Envelope, Finish,
     JobEnvelope, JobHandle, OwnedScheduler, Record, SWBatchSpawnOptions, SWBatchSpawnRejected,
-    SWBatchSpawnResult, SWCost, SWDependencyPolicy, SWProducerControl, SWSpawnError, SWTask,
-    SWTaskStatus, Stage, SubmitExtras, SubmitRequest, enqueue_activation, finish_payload,
-    map_reservation_error,
+    SWBatchSpawnResult, SWDependencyPolicy, SWProducerControl, SWSpawnError, SWTask, SWTaskStatus,
+    Stage, SubmitExtras, SubmitRequest, enqueue_activation, finish_payload, map_reservation_error,
 };
 use crate::runtime::{RuntimeControl, config::SWExecutionClass};
 use std::collections::VecDeque;
@@ -96,11 +95,25 @@ impl<P, T: Send + 'static> Prepared<P, T> {
 impl Accounting {
     // Reserve an available positive prefix in two independently rolled-back
     // atomic domains. Each resulting token refunds exactly one member.
+    #[cfg(test)]
     fn acquire_many(
         self: &Arc<Self>,
         edges: usize,
         maximum: usize,
     ) -> Result<Vec<AccountingLease>, SWSpawnError> {
+        let mut charges = Vec::new();
+        self.acquire_many_into(edges, maximum, &mut charges)?;
+        Ok(charges)
+    }
+
+    fn acquire_many_into(
+        self: &Arc<Self>,
+        edges: usize,
+        maximum: usize,
+        charges: &mut Vec<AccountingLease>,
+    ) -> Result<(), SWSpawnError> {
+        assert!(charges.is_empty());
+        charges.reserve(maximum);
         if edges > self.limits.edges {
             return Err(SWSpawnError::TooLarge);
         }
@@ -128,12 +141,11 @@ impl Accounting {
             },
         };
         self.records.fetch_sub(reserved - members, Ordering::AcqRel);
-        Ok((0..members)
-            .map(|_| AccountingLease {
-                accounting: Arc::clone(self),
-                edges,
-            })
-            .collect())
+        charges.extend((0..members).map(|_| AccountingLease {
+            accounting: Arc::clone(self),
+            edges,
+        }));
+        Ok(())
     }
 }
 
@@ -175,6 +187,10 @@ impl OwnedScheduler {
             return Err(reject(SWSpawnError::TooLarge, Vec::new(), operations));
         }
         if operations.len() == 1 {
+            // Reserve the public receipt before scalar membership commitment.
+            // A rejected singleton pays one bounded slot; larger rejections
+            // remain proportional only to plausible admitted portions.
+            let mut accepted = Vec::with_capacity(1);
             let notification = self.wake.notification_scope();
             let operation = operations.pop().expect("singleton input exists");
             let result = self.submit_payload_accounted(
@@ -197,7 +213,10 @@ impl OwnedScheduler {
                 },
             );
             let result = match result {
-                Ok(receipt) => Ok(vec![receipt]),
+                Ok(receipt) => {
+                    accepted.push(receipt);
+                    Ok(accepted)
+                }
                 Err(rejected) => {
                     operations.push(rejected.operation);
                     Err(reject(rejected.reason, Vec::new(), operations))
@@ -207,34 +226,49 @@ impl OwnedScheduler {
             return result;
         }
         let mut remaining: VecDeque<P> = operations.into();
-        let mut accepted = Vec::with_capacity(remaining.len());
+        let mut accepted = Vec::new();
+        let mut scratch = self.scratch[class.index()].acquire();
+        // Application-sized captures/results stay on the heap and are retained
+        // only by this invocation, never by the fixed-type metadata cache.
+        let mut prepared = Vec::new();
         while !remaining.is_empty() {
             // Native adapter notifications coalesce on this submitting thread,
             // then flush before the next portion. Other threads' completion
             // publications retain their independent notification scopes.
             let notification = self.wake.notification_scope();
             let maximum = QUANTUM.min(remaining.len());
-            let mut admissions = match control.admit_owned_many(false, maximum) {
-                Ok(admissions) => admissions,
-                Err(error) => {
-                    drop(notification);
-                    return Err(reject(
-                        match error {
-                            crate::execution::SWExecutionError::Closed => SWSpawnError::Closed,
-                            crate::execution::SWExecutionError::InvalidContext => {
-                                SWSpawnError::InvalidContext
-                            }
-                            crate::execution::SWExecutionError::ClassDisabled(class) => {
-                                SWSpawnError::ClassDisabled(class)
-                            }
-                        },
-                        accepted,
-                        remaining.into(),
-                    ));
-                }
-            };
+            let super::scratch::Buffers {
+                admissions,
+                capacities,
+                charges,
+                jobs,
+                job_checkouts,
+                signals,
+                signal_checkouts,
+                subscriptions,
+                portion,
+                parents,
+                finishes,
+                suppressed,
+            } = &mut *scratch;
+            if let Err(error) = control.admit_owned_many_into(false, maximum, admissions) {
+                drop(notification);
+                return Err(reject(
+                    match error {
+                        crate::execution::SWExecutionError::Closed => SWSpawnError::Closed,
+                        crate::execution::SWExecutionError::InvalidContext => {
+                            SWSpawnError::InvalidContext
+                        }
+                        crate::execution::SWExecutionError::ClassDisabled(class) => {
+                            SWSpawnError::ClassDisabled(class)
+                        }
+                    },
+                    accepted,
+                    remaining.into(),
+                ));
+            }
             if options.group.is_some_and(|group| !group.inner.is_open()) {
-                drop(admissions);
+                admissions.clear();
                 drop(notification);
                 return Err(reject(
                     SWSpawnError::InvalidGroup,
@@ -242,67 +276,77 @@ impl OwnedScheduler {
                     remaining.into(),
                 ));
             }
-            let mut capacities = if let Some(pool) = &self.capacity {
-                match pool.try_reserve_ordinary_many(
-                    SWCost::new(1, options.prerequisites.len(), 0, 0),
+            let capacity_count = if let Some(pool) = &self.capacity {
+                if let Err(reason) = pool.try_charge_owned_many_into(
+                    options.prerequisites.len(),
                     maximum,
+                    capacities,
                 ) {
-                    Ok(capacities) => capacities.into_iter().map(Some).collect::<Vec<_>>(),
-                    Err(reason) => {
-                        drop(admissions);
-                        drop(notification);
-                        return Err(reject(
-                            map_reservation_error(reason),
-                            accepted,
-                            remaining.into(),
-                        ));
-                    }
-                }
-            } else {
-                (0..maximum).map(|_| None).collect()
-            };
-            let mut charges = match self
-                .accounting
-                .acquire_many(options.prerequisites.len(), capacities.len())
-            {
-                Ok(charges) => charges,
-                Err(reason) => {
-                    drop(capacities);
-                    drop(admissions);
+                    admissions.clear();
                     drop(notification);
-                    return Err(reject(reason, accepted, remaining.into()));
+                    return Err(reject(
+                        map_reservation_error(reason),
+                        accepted,
+                        remaining.into(),
+                    ));
                 }
+                capacities.len()
+            } else {
+                maximum
             };
+            if let Err(reason) = self.accounting.acquire_many_into(
+                options.prerequisites.len(),
+                capacity_count,
+                charges,
+            ) {
+                capacities.clear();
+                admissions.clear();
+                drop(notification);
+                return Err(reject(reason, accepted, remaining.into()));
+            }
             capacities.truncate(charges.len());
             admissions.truncate(charges.len());
             let count = charges.len();
-            let ids: Vec<_> = (0..count)
-                .map(|_| Self::allocate_id(&self.next_id))
-                .collect();
-            let jobs = self.jobs.prepare_many(&ids, Arc::downgrade(self));
-            let signals = self.signals.acquire_many(count);
+            // Storage is proportional to plausible admission, with Vec's normal
+            // bounded growth allowance, and always prepared before group commit.
+            accepted.reserve(count);
+            prepared.reserve(count);
+            portion.reserve(count);
+            finishes.reserve(count);
+            suppressed.reserve(count);
+            self.jobs.prepare_many_into(
+                (0..count).map(|_| Self::allocate_id(&self.next_id)),
+                Arc::downgrade(self),
+                jobs,
+                job_checkouts,
+            );
+            self.signals
+                .acquire_many_into(count, signals, signal_checkouts);
             let range_release = count >= 2 && options.prerequisites.len() == 1;
-            let subscriptions = self
-                .subscriptions
+            subscriptions.reserve(count);
+            self.subscriptions
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
-                .acquire_many(
+                .acquire_many_into(
                     count,
                     if range_release {
                         0
                     } else {
                         options.prerequisites.len()
                     },
+                    subscriptions,
                 );
             let group = options.group.map(|group| Arc::clone(&group.inner));
-            let mut prepared = Vec::with_capacity(count);
-            for ((((job, signal), subscriptions), admission), (capacity, charge)) in jobs
-                .into_iter()
-                .zip(signals)
-                .zip(subscriptions)
-                .zip(admissions)
-                .zip(capacities.into_iter().zip(charges.drain(..)))
+            let mut membership = group.as_ref().map(|group| group.reserve_members(count));
+            let mut capacity_entries = capacities.drain(..);
+            for ((((job, signal), subscriptions), admission), charge) in jobs
+                .drain(..)
+                .zip(signals.drain(..))
+                .zip(subscriptions.drain(..))
+                .zip(admissions.drain(..))
+                .zip(charges.drain(..))
             {
+                let capacity = capacity_entries.next();
                 let (task, sink) = SWTask::pending_with_signal(signal);
                 task.set_producer(control.identity(), job.id(), Arc::downgrade(self));
                 if let Some(domain) = control.notification_domain() {
@@ -310,11 +354,11 @@ impl OwnedScheduler {
                 }
                 let weak = Arc::downgrade(self);
                 let id = job.id();
-                let producer = SWProducerControl::new(Box::new(move || {
+                let producer = SWProducerControl::new(move || {
                     if let Some(scheduler) = weak.upgrade() {
                         scheduler.suppress_id(class, id, SWTaskStatus::Cancelled);
                     }
-                }));
+                });
                 prepared.push(Prepared {
                     job,
                     envelope: Box::new(PreparedEnvelope {
@@ -326,6 +370,7 @@ impl OwnedScheduler {
                     record: Record {
                         completion: group.as_ref().map(|_| task.completion()),
                         group: group.clone(),
+                        membership: None,
                         pending: options.prerequisites.len(),
                         failed: false,
                         policy: options.dependency_policy,
@@ -346,7 +391,7 @@ impl OwnedScheduler {
                     receipt: (task, producer),
                 });
             }
-            let mut portion = Vec::with_capacity(count);
+            drop(capacity_entries);
             let failure = {
                 let mut state = self.class_lock(class);
                 let selected = if options.prerequisites.is_empty() {
@@ -399,34 +444,43 @@ impl OwnedScheduler {
             };
             // Recover every precommit payload before dropping provisional result
             // sinks and charges. None of these drops occurs under a class guard.
-            for item in prepared.into_iter().rev() {
+            for item in prepared.drain(..).rev() {
                 remaining.push_front(item.recover());
             }
             if let Some(reason) = failure {
                 drop(notification);
                 return Err(reject(reason, accepted, remaining.into()));
             }
-            if let Some(group) = &group {
-                group.register_members(portion.iter().map(JobHandle::downgrade).collect());
+            if let Some(membership) = &mut membership {
+                let keys = membership.register_many(portion.iter().map(JobHandle::downgrade));
+                for (job, key) in portion.iter().zip(keys) {
+                    job.record_lock()
+                        .as_mut()
+                        .expect("attachment retains accepted record")
+                        .membership = key;
+                }
             }
+            drop(membership);
             if self.demand_enabled {
-                let parents: Vec<_> = options
-                    .prerequisites
-                    .iter()
-                    .filter_map(|completion| completion.producer_identity())
-                    .filter_map(|(runtime, id)| (runtime == control.identity()).then_some(id))
-                    .collect();
+                parents.clear();
+                parents.extend(
+                    options
+                        .prerequisites
+                        .iter()
+                        .filter_map(|completion| completion.producer_identity())
+                        .filter_map(|(runtime, id)| (runtime == control.identity()).then_some(id)),
+                );
                 let mut demand = self.domain_lock(&self.demand, 3);
-                for job in &portion {
+                for job in portion.iter() {
                     demand
                         .graph
-                        .register(job.id(), None, &parents, None)
+                        .register(job.id(), None, parents, None)
                         .expect("ordinary demand registration");
                 }
                 self.demand_pending.store(true, Ordering::Release);
             }
             let range = range_release
-                .then(|| super::prerequisite_range::PrerequisiteRange::new(self, &portion));
+                .then(|| super::prerequisite_range::PrerequisiteRange::new(self, portion));
             if let Some(range) = &range {
                 for (slot, job) in portion.iter().enumerate() {
                     let token = range.member(slot);
@@ -443,7 +497,7 @@ impl OwnedScheduler {
                     drop(unused);
                 }
             }
-            for job in &portion {
+            for job in portion.iter() {
                 #[cfg(test)]
                 {
                     let hook = self
@@ -476,9 +530,10 @@ impl OwnedScheduler {
             if let Some(range) = &range {
                 range.subscribe(&options.prerequisites[0]);
             }
-            self.publish_portion(class, &portion);
+            self.publish_portion_collected(class, portion, finishes, suppressed);
             self.dispatch_class(class);
-            drop(portion);
+            portion.clear();
+            parents.clear();
             drop(notification);
             #[cfg(test)]
             {
@@ -496,12 +551,52 @@ impl OwnedScheduler {
     }
 
     pub(super) fn publish_portion(self: &Arc<Self>, class: SWExecutionClass, jobs: &[JobHandle]) {
-        let mut finishes = Vec::with_capacity(jobs.len());
-        let mut suppressed = Vec::with_capacity(jobs.len());
+        if jobs.len() <= 1 {
+            self.publish_portion_controls(class, jobs, Controls::One(None), Controls::One(None));
+        } else {
+            let mut scratch = self.scratch[class.index()].acquire();
+            let super::scratch::Buffers {
+                finishes,
+                suppressed,
+                ..
+            } = &mut *scratch;
+            finishes.reserve(jobs.len());
+            suppressed.reserve(jobs.len());
+            self.publish_portion_collected(class, jobs, finishes, suppressed);
+        }
+    }
+
+    fn publish_portion_collected(
+        self: &Arc<Self>,
+        class: SWExecutionClass,
+        jobs: &[JobHandle],
+        finishes: &mut Vec<(usize, Finish)>,
+        suppressed: &mut Vec<(usize, SWTaskStatus)>,
+    ) {
+        self.publish_portion_controls(
+            class,
+            jobs,
+            Controls::Many(finishes),
+            Controls::Many(suppressed),
+        );
+    }
+
+    fn publish_portion_controls(
+        self: &Arc<Self>,
+        class: SWExecutionClass,
+        jobs: &[JobHandle],
+        mut finishes: Controls<'_, Finish>,
+        mut suppressed: Controls<'_, SWTaskStatus>,
+    ) {
+        // Callers publish one accepted portion of a single batch/group. A
+        // shared range likewise snapshots only that original portion.
         let mut ready_group = None;
+        let mut ready_keys = [None; QUANTUM];
+        let mut ready_count = 0;
+        assert!(jobs.len() <= QUANTUM);
         {
             let mut state = self.class_lock(class);
-            for job in jobs {
+            for (index, job) in jobs.iter().enumerate() {
                 let mut guard = job.record_lock();
                 let record = guard.as_mut().expect("attachment retains accepted record");
                 record.attaching = false;
@@ -510,7 +605,7 @@ impl OwnedScheduler {
                     record.runnable_reserved = false;
                 }
                 if let Some(finish) = record.deferred_finish.take() {
-                    finishes.push((job, finish));
+                    finishes.push((index, finish));
                     continue;
                 }
                 if record.stage != Stage::Waiting || record.pending != 0 {
@@ -524,34 +619,83 @@ impl OwnedScheduler {
                     None
                 };
                 if let Some(status) = status {
-                    suppressed.push((job, status));
+                    suppressed.push((index, status));
                 } else if state.ready.runnable + state.attaching_runnable
                     < self.limits.runnable_for(class)
                 {
                     record.stage = Stage::Ready;
-                    self.push_ready(&mut state, job, record);
+                    self.push_ready_unindexed(&mut state, job, record);
+                    if record.eligibility == super::SWCallerEligibility::CallerEligible
+                        && record.group.is_some()
+                    {
+                        ready_keys[ready_count] =
+                            Some(record.membership.expect("registered group member"));
+                        ready_count += 1;
+                    }
                     ready_group = record.group.clone();
                 } else {
                     record.stage = Stage::DeferredReady;
                     self.push_deferred(&mut state, job, record);
                 }
             }
+            if let Some(group) = &ready_group {
+                // Class authority prevents claims/demotion until the complete
+                // bounded index update is visible; records are unlocked here.
+                group.mark_ready_many(&ready_keys[..ready_count]);
+            }
         }
         if let Some(group) = ready_group {
             group.notify_ready();
         }
-        for (job, finish) in finishes {
+        finishes.for_each(|(index, finish)| {
             if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                self.finish_record(job, finish)
+                self.finish_record(&jobs[index], finish)
             })) {
                 crate::cleanup::discard_panic(payload);
             }
-        }
-        for (job, status) in suppressed {
+        });
+        suppressed.for_each(|(index, status)| {
             if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                self.suppress(job, status)
+                self.suppress(&jobs[index], status)
             })) {
                 crate::cleanup::discard_panic(payload);
+            }
+        });
+    }
+}
+
+// Only control-sized metadata goes inline. Multi-member backing was reserved
+// before transition guards and belongs exclusively to the current invocation.
+enum Controls<'a, T> {
+    One(Option<(usize, T)>),
+    Many(&'a mut Vec<(usize, T)>),
+}
+
+impl<T> Controls<'_, T> {
+    fn push(&mut self, entry: (usize, T)) {
+        match self {
+            Self::One(slot) => {
+                assert!(slot.is_none(), "singleton publication has one member");
+                *slot = Some(entry);
+            }
+            Self::Many(entries) => {
+                assert!(
+                    entries.len() < entries.capacity(),
+                    "publication storage is prepared"
+                );
+                entries.push(entry);
+            }
+        }
+    }
+
+    fn for_each(self, mut visit: impl FnMut((usize, T))) {
+        match self {
+            Self::One(Some(entry)) => visit(entry),
+            Self::One(None) => {}
+            Self::Many(entries) => {
+                for entry in entries.drain(..) {
+                    visit(entry);
+                }
             }
         }
     }

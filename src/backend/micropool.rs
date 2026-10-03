@@ -19,11 +19,9 @@ impl MicropoolBackend {
     where
         F: FnOnce() + Send + 'static,
     {
-        self.pool.try_spawn_owned(f).map(|task| {
-            // The private queue retains the callable. SW owns its completion
-            // and does not expose micropool's eager-helping task handle.
-            drop(task);
-        })
+        // SW owns completion and helping. The backend stores only the callable
+        // and its once-only claim cell, with no unused result handle.
+        self.pool.try_spawn_detached(f)
     }
 
     /// Prepares a wrapper outside backend queue and scheduler bookkeeping locks.

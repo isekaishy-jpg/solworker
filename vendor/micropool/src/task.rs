@@ -4,6 +4,10 @@ use takecell::TakeOwnCell;
 
 use crate::ThreadPoolState;
 
+#[cfg(test)]
+#[path = "../tests/unit/fire_and_forget.rs"]
+mod fire_and_forget_tests;
+
 /// An independently owned callable prepared for checked range publication.
 /// This internal integration type exposes no eager execution or result handle.
 #[doc(hidden)]
@@ -14,12 +18,46 @@ pub struct PreparedOwnedTask(
 
 impl PreparedOwnedTask {
     /// Allocates the callable before entering the pool's queue critical section.
-    pub(crate) fn new(pool: &Arc<ThreadPoolState>, f: impl FnOnce() + Send + 'static) -> Self {
-        Self(Arc::new(TypedTaskInner {
-            func: TakeOwnCell::new(Box::new(f)),
-            pool: Arc::downgrade(pool),
-            result: spin::Once::new(),
+    pub(crate) fn new(f: impl FnOnce() + Send + 'static) -> Self {
+        Self(Arc::new(FireAndForgetTask {
+            func: TakeOwnCell::new(f),
         }))
+    }
+}
+
+/// Internal callable and its once-only claim cell share one task allocation.
+/// Solworker owns completion, so no backend result or pool association is needed.
+pub(crate) struct FireAndForgetTask<F: FnOnce() + Send + 'static> {
+    /// Taking transfers the entire capture to one executor or disposer.
+    func: TakeOwnCell<F>,
+}
+
+impl<F: FnOnce() + Send + 'static> FireAndForgetTask<F> {
+    /// Prepares before locking; refusal retains the concrete callable type.
+    pub(crate) fn try_spawn(pool: &ThreadPoolState, f: F) -> Result<(), F> {
+        let task = Arc::new(Self {
+            func: TakeOwnCell::new(f),
+        });
+        pool.try_push_detached(task).map_err(|task| {
+            task.func
+                .take()
+                .expect("refused unpublished callable remains owned")
+        })
+    }
+}
+
+impl<F: FnOnce() + Send + 'static> TaskInner for FireAndForgetTask<F> {
+    fn run(&self) -> bool {
+        if let Some(f) = self.func.take() {
+            f();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn discard(&self) {
+        drop(self.func.take());
     }
 }
 

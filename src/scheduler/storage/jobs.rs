@@ -184,6 +184,25 @@ pub(in crate::scheduler) struct JobPool {
     recycled: Arc<Mutex<Recycled>>,
 }
 
+/// Raw, exclusive returned controls. Checkout moves these under the recycler
+/// gate; identity reset and any former weak-owner release happen afterward.
+#[derive(Default)]
+pub(in crate::scheduler) struct JobCheckouts {
+    entries: Vec<Arc<Job>>,
+}
+
+impl JobCheckouts {
+    pub(in crate::scheduler) fn clear(&mut self) {
+        for entry in self.entries.drain(..) {
+            crate::cleanup::discard_value(entry);
+        }
+    }
+
+    pub(in crate::scheduler) fn bytes(&self) -> usize {
+        self.entries.capacity() * std::mem::size_of::<Arc<Job>>()
+    }
+}
+
 impl JobPool {
     pub(in crate::scheduler) fn new(limit: usize) -> Self {
         Self {
@@ -212,28 +231,50 @@ impl JobPool {
         self.acquire_slot(id, scheduler, None)
     }
 
+    #[cfg(test)]
     pub(in crate::scheduler) fn prepare_many(
         &self,
         ids: &[u64],
         scheduler: Weak<OwnedScheduler>,
     ) -> Vec<JobHandle> {
-        let mut returned = Vec::with_capacity(ids.len());
+        let mut jobs = Vec::new();
+        self.prepare_many_into(
+            ids.iter().copied(),
+            scheduler,
+            &mut jobs,
+            &mut JobCheckouts::default(),
+        );
+        jobs
+    }
+
+    pub(in crate::scheduler) fn prepare_many_into(
+        &self,
+        ids: impl ExactSizeIterator<Item = u64>,
+        scheduler: Weak<OwnedScheduler>,
+        jobs: &mut Vec<JobHandle>,
+        checkouts: &mut JobCheckouts,
+    ) {
+        assert!(jobs.is_empty());
+        assert!(checkouts.entries.is_empty());
+        let count = ids.len();
+        jobs.reserve(count);
+        checkouts.entries.reserve(count);
         {
             let mut recycled = self
                 .recycled
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
-            for _ in ids {
+            for _ in 0..count {
                 let Some(job) = recycled.free.pop() else {
                     break;
                 };
-                returned.push(job);
+                checkouts.entries.push(job);
             }
         }
-        let mut returned = returned.into_iter();
-        ids.iter()
-            .map(|&id| self.prepare_slot(returned.next(), id, scheduler.clone(), None))
-            .collect()
+        let mut returned = checkouts.entries.drain(..);
+        for id in ids {
+            jobs.push(self.prepare_slot(returned.next(), id, scheduler.clone(), None));
+        }
     }
 
     fn acquire_slot(

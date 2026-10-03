@@ -12,6 +12,7 @@ use paralight::iter::{Accumulator, ExactSizeAccumulator, GenericThreadPool, Sour
 use smallvec::SmallVec;
 
 pub(crate) use self::private::JoinAll;
+use crate::task::FireAndForgetTask;
 use crate::util::*;
 use crate::{OwnedTask, PreparedOwnedTask, SharedTask, TaskInner};
 
@@ -289,7 +290,14 @@ impl ThreadPool {
     /// it before publication releases its capture on the dropping thread.
     #[doc(hidden)]
     pub fn prepare_owned(&self, f: impl FnOnce() + Send + 'static) -> PreparedOwnedTask {
-        PreparedOwnedTask::new(&self.state, f)
+        PreparedOwnedTask::new(f)
+    }
+
+    /// Publishes an internal result-free callable without a separate closure
+    /// allocation. Refusal returns its original typed capture outside locks.
+    #[doc(hidden)]
+    pub fn try_spawn_detached<F: FnOnce() + Send + 'static>(&self, f: F) -> Result<(), F> {
+        FireAndForgetTask::try_spawn(&self.state, f)
     }
 
     /// Publishes one caller-bounded portion under the checked admission lock.
@@ -893,6 +901,25 @@ impl ThreadPoolState {
         for task in prepared.into_iter().flatten() {
             tasks.push_back(task.0);
         }
+        drop(tasks);
+        self.on_change.notify();
+        Ok(())
+    }
+
+    /// Checks one already-allocated internal task against stop before erasure.
+    /// Rejection leaves the concrete task exclusively owned by its caller.
+    pub(crate) fn try_push_detached<F: FnOnce() + Send + 'static>(
+        &self,
+        task: Arc<FireAndForgetTask<F>>,
+    ) -> Result<(), Arc<FireAndForgetTask<F>>> {
+        let mut tasks = self.tasks.lock();
+        if self.should_stop.load(Ordering::Relaxed) {
+            return Err(task);
+        }
+        // Growth precedes moving the task. Unwinding releases the guard before
+        // the caller-owned capture; insertion itself performs only an Arc move.
+        tasks.reserve(1);
+        tasks.push_back(task);
         drop(tasks);
         self.on_change.notify();
         Ok(())

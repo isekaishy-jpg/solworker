@@ -6,7 +6,7 @@ use crate::runtime::{
     config::{SWRuntimeConfig, SWWorkerConfig},
 };
 use crate::scheduler::SWOwnedLimits;
-use crate::scheduler::reservation::SWLimits;
+use crate::scheduler::reservation::{SWCost, SWLimits};
 use std::num::NonZeroUsize;
 use std::sync::mpsc;
 use std::sync::{
@@ -17,6 +17,155 @@ use std::thread;
 use std::time::Duration;
 
 const TIMEOUT: Duration = Duration::from_secs(10);
+
+#[test]
+fn same_class_attachment_callback_can_submit_a_nested_portion() {
+    let config = SWRuntimeConfig::new(3, [SWWorkerConfig::new(1); 3]).unwrap();
+    let mut runtime = SWRuntime::builder(config)
+        .with_owned_limits(SWOwnedLimits::new(16, 16, [16; 3], [4; 3]).unwrap())
+        .build()
+        .unwrap();
+    let lane = runtime.lane(SWExecutionClass::High);
+    let gate = lane.group().unwrap();
+    let scheduler = gate.scheduler.upgrade().unwrap();
+    let prerequisite = gate.completion();
+    let nested_lane = lane.clone();
+    let nested_prerequisite = prerequisite.clone();
+    let first = AtomicBool::new(true);
+    let (send, recv) = mpsc::channel();
+    *scheduler.attachment_hook.lock().unwrap() = Some(Arc::new(move |_| {
+        if first.swap(false, Ordering::SeqCst) {
+            let prerequisites = [nested_prerequisite.clone()];
+            let members = nested_lane
+                .try_spawn_batch(
+                    SWBatchSpawnOptions {
+                        prerequisites: &prerequisites,
+                        ..Default::default()
+                    },
+                    (0..3).map(|value| move || value + 10).collect(),
+                )
+                .unwrap();
+            send.send(members).unwrap();
+        }
+    }));
+    let prerequisites = [prerequisite];
+    let outer = lane
+        .try_spawn_batch(
+            SWBatchSpawnOptions {
+                prerequisites: &prerequisites,
+                ..Default::default()
+            },
+            (0..4).map(|value| move || value).collect(),
+        )
+        .unwrap();
+    *scheduler.attachment_hook.lock().unwrap() = None;
+    let nested = recv.recv_timeout(TIMEOUT).unwrap();
+    assert!(
+        outer
+            .iter()
+            .chain(&nested)
+            .all(|(task, _)| task.status().is_none())
+    );
+    gate.seal();
+    for (expected, (mut task, _)) in (0..4).zip(outer).chain((10..13).zip(nested)) {
+        assert_eq!(
+            task.completion().wait_timeout(TIMEOUT).unwrap(),
+            Some(SWTaskStatus::Succeeded)
+        );
+        assert!(
+            matches!(task.try_take(), Some(crate::task::SWOutcome::Success(value)) if value == expected)
+        );
+    }
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn immediate_full_and_closed_rejection_leave_large_zst_receipts_unallocated() {
+    for closed in [false, true] {
+        let config = SWRuntimeConfig::new(3, [SWWorkerConfig::new(1); 3]).unwrap();
+        let mut runtime = SWRuntime::builder(config)
+            .with_owned_limits(SWOwnedLimits::new(1, 1, [1; 3], [1; 3]).unwrap())
+            .build()
+            .unwrap();
+        let lane = runtime.lane(SWExecutionClass::High);
+        let gate = lane.group().unwrap();
+        let (blocker, _) = lane
+            .try_spawn_after(
+                Default::default(),
+                &[gate.completion()],
+                SWDependencyPolicy::SuccessOnly,
+                || (),
+            )
+            .unwrap();
+        if closed {
+            runtime.begin_shutdown();
+        }
+        let rejected = lane
+            .try_spawn_batch(Default::default(), vec![|| (); 65_536])
+            .err()
+            .unwrap();
+        assert_eq!(
+            rejected.reason,
+            if closed {
+                SWSpawnError::Closed
+            } else {
+                SWSpawnError::Full
+            }
+        );
+        assert_eq!(rejected.accepted.capacity(), 0);
+        assert_eq!(rejected.remaining.len(), 65_536);
+        gate.seal();
+        assert_eq!(
+            blocker.completion().wait_timeout(TIMEOUT).unwrap(),
+            Some(SWTaskStatus::Succeeded)
+        );
+        runtime.shutdown().unwrap();
+    }
+}
+
+#[test]
+fn application_sized_batch_preparation_stays_heap_backed_on_a_small_stack() {
+    let config = SWRuntimeConfig::new(3, [SWWorkerConfig::new(1); 3]).unwrap();
+    let mut runtime = SWRuntime::builder(config)
+        .with_owned_limits(SWOwnedLimits::new(128, 128, [64; 3], [4; 3]).unwrap())
+        .build()
+        .unwrap();
+    let lane = runtime.lane(SWExecutionClass::High);
+    let gate = lane.group().unwrap();
+    let prerequisite = gate.completion();
+    let operations = (0..64)
+        .map(|value| {
+            let bytes = [value as u8; 16 * 1024];
+            move || std::hint::black_box(bytes)[0]
+        })
+        .collect();
+    let members = thread::Builder::new()
+        .stack_size(512 * 1024)
+        .spawn(move || {
+            lane.try_spawn_batch(
+                SWBatchSpawnOptions {
+                    prerequisites: &[prerequisite],
+                    ..Default::default()
+                },
+                operations,
+            )
+            .unwrap()
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+    gate.seal();
+    for (expected, (mut task, _)) in (0..64).zip(members) {
+        assert_eq!(
+            task.completion().wait_timeout(TIMEOUT).unwrap(),
+            Some(SWTaskStatus::Succeeded)
+        );
+        assert!(
+            matches!(task.try_take(), Some(crate::task::SWOutcome::Success(value)) if value == expected)
+        );
+    }
+    runtime.shutdown().unwrap();
+}
 
 struct Release(mpsc::Sender<()>);
 
@@ -236,6 +385,7 @@ fn provisional_rollback_refunds_accounting_before_the_final_runtime_wake() {
         record: Record {
             completion: None,
             group: None,
+            membership: None,
             pending: 0,
             failed: false,
             policy: SWDependencyPolicy::SuccessOnly,
@@ -253,7 +403,7 @@ fn provisional_rollback_refunds_accounting_before_the_final_runtime_wake() {
             selection: None,
             charge,
         },
-        receipt: (task, SWProducerControl::new(Box::new(|| {}))),
+        receipt: (task, SWProducerControl::new(|| {})),
     };
     assert_eq!(control.active_leases(), 1);
     assert_eq!(scheduler.accounting.records.load(Ordering::Acquire), 1);
@@ -280,6 +430,41 @@ fn provisional_rollback_refunds_accounting_before_the_final_runtime_wake() {
     while wake_recv.try_recv().is_ok() {}
     route.prepare_wait().unwrap();
     assert_eq!(prepared.recover(), 23);
+    assert_eq!(wake_recv.recv_timeout(TIMEOUT).unwrap(), (0, 0));
+    // Exercise the invocation lease's exceptional cleanup too: a retained
+    // captured value panics while being discarded. Credits must already be
+    // refunded, but its runtime responsibility must remain live until afterward.
+    struct CleanupPanic(
+        Arc<RuntimeControl>,
+        Arc<OwnedScheduler>,
+        mpsc::Sender<(usize, usize)>,
+    );
+    impl Drop for CleanupPanic {
+        fn drop(&mut self) {
+            self.2
+                .send((
+                    self.0.active_leases(),
+                    self.1.accounting.records.load(Ordering::Acquire),
+                ))
+                .unwrap();
+            panic!("captured cleanup failure");
+        }
+    }
+    let mut scratch = scheduler.scratch[SWExecutionClass::High.index()].acquire();
+    scratch
+        .admissions
+        .extend(control.admit_owned_many(true, 1).unwrap());
+    scheduler
+        .accounting
+        .acquire_many_into(0, 1, &mut scratch.charges)
+        .unwrap();
+    let (cleanup_send, cleanup_recv) = mpsc::channel();
+    let capture = CleanupPanic(Arc::clone(&control), Arc::clone(&scheduler), cleanup_send);
+    scratch.finishes.push((0, Box::new(move || drop(capture))));
+    while wake_recv.try_recv().is_ok() {}
+    route.prepare_wait().unwrap();
+    drop(scratch);
+    assert_eq!(cleanup_recv.recv_timeout(TIMEOUT).unwrap(), (1, 0));
     assert_eq!(wake_recv.recv_timeout(TIMEOUT).unwrap(), (0, 0));
     route.close().unwrap();
     drop(binding);

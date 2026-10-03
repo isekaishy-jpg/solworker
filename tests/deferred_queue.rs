@@ -122,10 +122,19 @@ fn out_of_order_resource_removal_repairs_the_helpable_window() {
         urgent.seal();
         // Resource work fills the first window. Ordinary arrivals must then
         // repair it, even though both initially encounter runnable saturation.
-        for index in [4, 0, 1, 3, 2] {
+        for index in [4, 0, 1] {
+            inputs[index].take().unwrap().complete(()).unwrap();
+        }
+        // All three released resource jobs, including the sole member of
+        // `second`, are Ready while the physical worker remains blocked.
+        assert_eq!(runtime.progress().scheduler.ready, 3);
+        assert_eq!(runtime.progress().scheduler.deferred, 0);
+        for index in [3, 2] {
             inputs[index].take().unwrap().complete(()).unwrap();
         }
         assert_eq!(runtime.progress().scheduler.deferred, 2);
+        assert_eq!(receipts[1].0.status(), None);
+        // Ordinary arrivals demote the previously Ready grouped resource.
         assert!(!second.help_ready().unwrap());
         if cancel {
             receipts[4].1.cancel();

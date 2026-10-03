@@ -11,6 +11,7 @@ mod demand;
 mod prerequisite_range;
 mod ready;
 pub(crate) mod reservation;
+mod scratch;
 pub(crate) mod storage;
 pub(crate) mod work_set;
 
@@ -41,7 +42,7 @@ pub use admission::{
 use demand::DemandState;
 pub use demand::{SWDemand, SWDemandError, SWDemandSnapshot, SWPriority};
 use ready::{PendingQueue, ReadyQueue};
-use reservation::SWReservationPool;
+use reservation::{OwnedCapacity, SWReservationPool};
 pub use reservation::{
     SWByteLease, SWCapacityUsage, SWCost, SWLimitError, SWLimits, SWReservation, SWReservationError,
 };
@@ -56,7 +57,7 @@ mod demand_tests;
 #[derive(Default)]
 pub(crate) struct SubmitExtras {
     work_set: Option<WorkSetLease>,
-    capacity: Option<SWReservation>,
+    capacity: Option<OwnedCapacity>,
     priority: Option<SWPriority>,
     reserved: bool,
     batch_member: bool,
@@ -89,7 +90,7 @@ enum Activation {
     Prerequisite(Arc<OwnedScheduler>, JobHandle, SWTaskStatus),
     PrerequisiteRange(
         Arc<OwnedScheduler>,
-        Arc<prerequisite_range::PrerequisiteRange>,
+        prerequisite_range::PrerequisiteRange,
         SWTaskStatus,
     ),
     Finalize(Arc<OwnedScheduler>, JobHandle),
@@ -180,6 +181,12 @@ enum Decision {
     Suppress(SWTaskStatus),
 }
 
+enum ClaimOutcome {
+    Ran,
+    Lost,
+    Unavailable,
+}
+
 /// A backend wrapper occupies its handoff slot even if its logical job has
 /// already settled. Discard during stop must release the slot without running
 /// scheduler callbacks under the backend's queue lock.
@@ -237,6 +244,7 @@ enum Stage {
 struct Record {
     completion: Option<SWCompletion>,
     group: Option<Arc<GroupInner>>,
+    membership: Option<crate::execution::group::MembershipKey>,
     pending: usize,
     failed: bool,
     policy: SWDependencyPolicy,
@@ -248,7 +256,7 @@ struct Record {
     deferred_finish: Option<Finish>,
     admission: OwnedAdmission,
     work_set: Option<WorkSetLease>,
-    capacity: Option<SWReservation>,
+    capacity: Option<OwnedCapacity>,
     resource: bool,
     runnable_reserved: bool,
     selection: Option<demand::DemandSelection>,
@@ -498,6 +506,7 @@ pub(crate) struct OwnedScheduler {
     provider_callbacks: AtomicUsize,
     jobs: JobPool,
     signals: SignalPool,
+    scratch: [scratch::ScratchPool; 3],
     subscriptions: Mutex<BufferPool<Subscription>>,
     groups: GroupPool,
     pub(crate) capacity: Option<SWReservationPool>,
@@ -617,6 +626,7 @@ impl OwnedScheduler {
             provider_callbacks: AtomicUsize::new(0),
             jobs: JobPool::new(limits.records),
             signals: SignalPool::new(limits.records),
+            scratch: std::array::from_fn(|_| scratch::ScratchPool::new()),
             subscriptions: Mutex::new(BufferPool::new(limits.edges)),
             groups: GroupPool::new(limits.records),
             #[cfg(test)]
@@ -630,6 +640,12 @@ impl OwnedScheduler {
             #[cfg(test)]
             range_delivery_hook: Mutex::new(None),
         })
+    }
+
+    pub(crate) fn retire_scratch(&self) {
+        for pool in &self.scratch {
+            pool.retire();
+        }
     }
 
     pub(crate) fn quiescent(&self) -> bool {
@@ -780,7 +796,7 @@ impl OwnedScheduler {
         Ok((
             SubmitExtras {
                 work_set,
-                capacity,
+                capacity: capacity.map(OwnedCapacity::Reservation),
                 priority: options.priority,
                 reserved: options.reservation.is_some(),
                 batch_member: false,
@@ -1088,11 +1104,11 @@ impl OwnedScheduler {
             self.settle_external(id, status);
         }
         let weak = Arc::downgrade(self);
-        let producer_control = SWProducerControl::new(Box::new(move || {
+        let producer_control = SWProducerControl::new(move || {
             if let Some(scheduler) = weak.upgrade() {
                 scheduler.settle_external(id, SWTaskStatus::Cancelled);
             }
-        }));
+        });
         if let Some(registration) = set_registration {
             registration.register_producer(producer_control.clone());
         }
@@ -1219,16 +1235,17 @@ impl OwnedScheduler {
         if extras.capacity.is_none()
             && let Some(capacity) = &self.capacity
         {
-            match capacity.try_reserve_ordinary(SWCost::new(
-                1,
-                prerequisites.len(),
-                usize::from(
-                    delivery
-                        .as_ref()
-                        .is_some_and(|ticket| !ticket.is_accounted()),
-                ),
-                0,
-            )) {
+            let charge = if delivery
+                .as_ref()
+                .is_some_and(|ticket| !ticket.is_accounted())
+            {
+                capacity
+                    .try_reserve_ordinary(SWCost::new(1, prerequisites.len(), 1, 0))
+                    .map(OwnedCapacity::Reservation)
+            } else {
+                capacity.try_charge_owned(prerequisites.len())
+            };
+            match charge {
                 Ok(charge) => extras.capacity = Some(charge),
                 Err(error) => return Err(reject(map_reservation_error(error), payload)),
             }
@@ -1261,6 +1278,7 @@ impl OwnedScheduler {
             .unwrap_or_else(|error| error.into_inner())
             .acquire(prerequisites.len());
         let set_registration = extras.work_set.clone();
+        let mut membership = group.map(|group| group.inner.reserve_members(1));
         let mut state = self.class_lock(class);
         if self.abandoned.load(Ordering::Acquire) {
             return Err(reject(SWSpawnError::Closed, payload));
@@ -1351,6 +1369,7 @@ impl OwnedScheduler {
             Record {
                 completion: group_inner.as_ref().map(|_| task.completion()),
                 group: group_inner.clone(),
+                membership: None,
                 pending: prerequisites.len(),
                 failed: false,
                 policy,
@@ -1385,8 +1404,17 @@ impl OwnedScheduler {
             ticket.bind(task.completion());
         }
         if let Some(group) = &group_inner {
-            group.register_member(job.downgrade());
+            let key = membership
+                .as_mut()
+                .expect("group capacity prepared")
+                .register(job.downgrade());
+            job.record_lock()
+                .as_mut()
+                .expect("attachment remains open")
+                .membership = Some(key);
+            debug_assert_eq!(group.id, job.group_id().expect("group identity"));
         }
+        drop(membership);
         if self.demand_enabled {
             let parents = prerequisites
                 .iter()
@@ -1424,11 +1452,11 @@ impl OwnedScheduler {
             }
         }
         let weak = Arc::downgrade(self);
-        let producer = SWProducerControl::new(Box::new(move || {
+        let producer = SWProducerControl::new(move || {
             if let Some(scheduler) = weak.upgrade() {
                 scheduler.suppress_id(class, id, SWTaskStatus::Cancelled);
             }
-        }));
+        });
         if let Some(registration) = set_registration {
             registration.register_producer(producer.clone());
         }
@@ -1474,6 +1502,11 @@ impl OwnedScheduler {
         Ok((task, producer))
     }
     fn push_ready(&self, state: &mut ClassState, job: &JobHandle, record: &Record) {
+        Self::index_group(record);
+        self.push_ready_unindexed(state, job, record);
+    }
+
+    fn push_ready_unindexed(&self, state: &mut ClassState, job: &JobHandle, record: &Record) {
         state.rebalance = true;
         #[cfg(feature = "diagnostics")]
         self.trace("job.ready", job.id(), job.class().index() as u64);
@@ -1486,6 +1519,26 @@ impl OwnedScheduler {
             );
         } else {
             state.ready.push(job.id());
+        }
+    }
+
+    fn index_group(record: &Record) {
+        if record.eligibility == SWCallerEligibility::CallerEligible
+            && let Some(group) = &record.group
+        {
+            group.mark_ready(
+                record
+                    .membership
+                    .expect("activation follows membership registration"),
+            );
+        }
+    }
+
+    fn unindex_group(record: &Record) {
+        if record.eligibility == SWCallerEligibility::CallerEligible
+            && let (Some(group), Some(key)) = (&record.group, record.membership)
+        {
+            group.mark_unready(key);
         }
     }
 
@@ -1544,6 +1597,8 @@ impl OwnedScheduler {
         let mut detached = Vec::with_capacity(jobs.len());
         let mut suppressed = Vec::with_capacity(jobs.len());
         let mut ready_group = None;
+        let mut ready_keys = [None; bulk::QUANTUM];
+        let mut ready_count = 0;
         {
             let mut state = self.class_lock(class);
             for job in &jobs {
@@ -1568,12 +1623,24 @@ impl OwnedScheduler {
                     < self.limits.runnable_for(class)
                 {
                     record.stage = Stage::Ready;
-                    self.push_ready(&mut state, job, record);
+                    self.push_ready_unindexed(&mut state, job, record);
+                    if record.eligibility == SWCallerEligibility::CallerEligible
+                        && record.group.is_some()
+                    {
+                        ready_keys[ready_count] =
+                            Some(record.membership.expect("registered group member"));
+                        ready_count += 1;
+                    }
                     ready_group = record.group.clone();
                 } else {
                     record.stage = Stage::DeferredReady;
                     self.push_deferred(&mut state, job, record);
                 }
+            }
+            if let Some(group) = &ready_group {
+                // This descriptor contains one bounded same-group portion.
+                // Class authority remains held until all ready keys are visible.
+                group.mark_ready_many(&ready_keys[..ready_count]);
             }
         }
         drop(detached);
@@ -1653,6 +1720,7 @@ impl OwnedScheduler {
                 Stage::Running | Stage::Finalizing => return,
             };
             record.stage = Stage::Finalizing;
+            Self::unindex_group(record);
             let range_member = record.prerequisite_range.take();
             match stage {
                 Stage::Ready => Self::remove_ready(&mut state, job.id()),
@@ -1680,33 +1748,34 @@ impl OwnedScheduler {
         self.settle(job, Decision::Suppress(status));
     }
 
-    fn claim_and_run(self: &Arc<Self>, job: &JobHandle, caller: bool) -> bool {
+    fn claim_and_run(self: &Arc<Self>, job: &JobHandle, caller: bool) -> ClaimOutcome {
         let Some(control) = self.control.upgrade() else {
-            return false;
+            return ClaimOutcome::Unavailable;
         };
         let class = job.class();
         // Notification capture cleanup cannot obtain an execution lease. A
         // handoff lease is deliberately weaker and never substitutes for this.
         let Ok(_lease) = control.acquire_owned(class) else {
-            return false;
+            return ClaimOutcome::Unavailable;
         };
         let promoted = {
             let mut state = self.class_lock(class);
             if self.abandoned.load(Ordering::Acquire) {
-                return false;
+                return ClaimOutcome::Unavailable;
             }
             let mut guard = job.record_lock();
             let Some(record) = guard.as_mut() else {
-                return false;
+                return ClaimOutcome::Lost;
             };
             if !matches!(record.stage, Stage::Ready | Stage::Handed)
                 || (caller && record.eligibility != SWCallerEligibility::CallerEligible)
             {
-                return false;
+                return ClaimOutcome::Lost;
             }
             let was_ready = record.stage == Stage::Ready;
             // Claim and suppression compete under this actual class gate.
             record.stage = Stage::Running;
+            Self::unindex_group(record);
             drop(guard);
             if was_ready {
                 Self::remove_ready(&mut state, job.id());
@@ -1721,7 +1790,7 @@ impl OwnedScheduler {
         self.trace("job.claimed", job.id(), job.group_id().unwrap_or(0));
         let _context = ContextGuard::enter_owned(control.identity(), class, job.group_id());
         self.settle(job, Decision::Run);
-        true
+        ClaimOutcome::Ran
     }
 
     fn run_job(self: &Arc<Self>, job: &JobHandle) {
@@ -1763,6 +1832,7 @@ impl OwnedScheduler {
                 let record = guard.as_mut().expect("ready record remains live");
                 record.stage = Stage::DeferredReady;
                 state.ready.runnable -= 1;
+                Self::unindex_group(record);
                 pending.push((
                     id,
                     record
@@ -1786,6 +1856,7 @@ impl OwnedScheduler {
                 continue;
             }
             record.stage = Stage::Ready;
+            Self::index_group(record);
             if let Some(group) = &record.group {
                 notifications.push(Arc::clone(group));
             }
@@ -1913,7 +1984,7 @@ impl OwnedScheduler {
         drop(removed);
         self.remove_demand(job.id());
         if let Some(group) = &record.group {
-            group.retire_member(job.id());
+            group.retire_member(record.membership.expect("group member registered"));
         }
         // Strong settlement remains capacity -> work set -> group -> runtime.
         drop(record.capacity);
@@ -1934,11 +2005,13 @@ impl OwnedScheduler {
     }
 
     pub(crate) fn help_group(self: &Arc<Self>, group: &Arc<GroupInner>) -> bool {
-        let mut after = 0;
-        while let Some(job) = group.member_after(after) {
-            after = job.id();
-            if self.claim_and_run(&job, true) {
-                return true;
+        while let Some(job) = group.ready_member() {
+            match self.claim_and_run(&job, true) {
+                ClaimOutcome::Ran => return true,
+                // The class-authoritative transition already unlinked this key.
+                ClaimOutcome::Lost => {}
+                // Failed leases/abandonment leave a live head; do not spin.
+                ClaimOutcome::Unavailable => return false,
             }
         }
         false
@@ -1982,6 +2055,7 @@ impl OwnedScheduler {
             external_ids.extend(external.keys().copied());
             break;
         }
+        self.retire_scratch();
         self.wake.notify();
         for job in jobs {
             self.suppress(&job, SWTaskStatus::Abandoned);

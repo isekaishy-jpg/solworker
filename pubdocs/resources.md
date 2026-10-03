@@ -163,6 +163,22 @@ worker execution in a class despite several workers. Increasing it blindly can
 also change pressure and latency; measure the actual workload and scoped/owned
 mixture.
 
+Caller helping can settle a job while its queued backend wrapper remains live.
+That wrapper occupies handoff capacity until its invocation returns or it is
+destroyed; task or group completion alone does not prove physical wrapper
+retirement or runtime drain. Each settled member releases its own logical
+admission capacity while unsettled siblings retain theirs.
+
+Reusable membership and preparation storage do not change these limits or the
+Low/Mid/High execution routes. The ready-only group helper index also does not
+replace ordinary FIFO or resource ranking. Bound useful batch work and domain
+storage separately from scheduler metadata; finite internal caches do not bound
+capture sizes, retained results or provider memory.
+
+Membership storage retains one anchor page after drain and regrows for later
+large waves. Page reclamation and the remaining directory-trim cost are described
+in the [performance guidance](performance.md#optimize-the-complete-work-arrangement).
+
 Optional `SWLimits` and `SWCost` add declared records, edges, promised deliveries
 and payload bytes. Ordinary work has a target; required pipelines have a
 protected allowance and a concurrency bound. Required byte usage may exceed the

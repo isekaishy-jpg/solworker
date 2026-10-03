@@ -29,9 +29,9 @@ pub struct SWProducerControl {
 }
 
 impl SWProducerControl {
-    pub(crate) fn new(cancel: Box<dyn Fn() + Send + Sync + 'static>) -> Self {
+    pub(crate) fn new(cancel: impl Fn() + Send + Sync + 'static) -> Self {
         Self {
-            cancel: Arc::from(cancel),
+            cancel: Arc::new(cancel),
         }
     }
 

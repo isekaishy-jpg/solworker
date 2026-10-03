@@ -3,12 +3,21 @@
 
 use super::{ThreadPoolBuilder, ThreadPoolState};
 use crate::util::event_tests::Point;
+use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Mutex, Weak, mpsc};
 use std::thread;
 use std::time::Duration;
 
 const DEADLINE: Duration = Duration::from_secs(5);
+
+struct CountDrop(Arc<AtomicUsize>);
+
+impl Drop for CountDrop {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
 
 struct Capture {
     id: usize,
@@ -35,6 +44,48 @@ impl Drop for Capture {
             state.request_stop();
         }
         self.dropped.send((self.id, unlocked)).unwrap();
+    }
+}
+
+#[test]
+fn detached_singleton_executes_on_worker_or_returns_original_capture_on_stop() {
+    for stopped in [false, true] {
+        let pool = ThreadPoolBuilder::default().num_threads(1).build();
+        if stopped {
+            pool.begin_stop();
+        }
+        let drops = Arc::new(AtomicUsize::new(0));
+        let capture = CountDrop(drops.clone());
+        let value = Box::new(Cell::new(37usize));
+        let identity = &*value as *const Cell<usize> as usize;
+        let (sent, received) = mpsc::channel();
+        let result = pool.try_spawn_detached(move || {
+            let _capture = capture;
+            value.set(value.get() + 4);
+            sent.send((
+                &*value as *const Cell<usize> as usize,
+                value.get(),
+                thread::current().id(),
+            ))
+            .unwrap();
+        });
+        if stopped {
+            let refused = result
+                .err()
+                .expect("stopped pool must return typed callable");
+            assert_eq!(drops.load(Ordering::SeqCst), 0);
+            assert!(received.try_recv().is_err());
+            // This is the original closure, recovered without capture cleanup.
+            refused();
+        } else {
+            assert!(result.is_ok());
+        }
+        let (actual, value, executor) = received.recv_timeout(DEADLINE).unwrap();
+        assert_eq!((actual, value), (identity, 41));
+        assert_eq!(executor == thread::current().id(), stopped);
+        pool.stop_and_join();
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert!(received.try_recv().is_err());
     }
 }
 

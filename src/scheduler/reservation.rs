@@ -197,7 +197,79 @@ pub(crate) struct SWReservationPool {
     ledger: Arc<Ledger>,
 }
 
+/// Plain owned records never split delivery credits or detach result bytes.
+/// Their charge needs no separately allocated pipeline or credit bank.
+pub(crate) enum OwnedCapacity {
+    Reservation(SWReservation),
+    Ordinary { _charge: OwnedCharge },
+}
+
+pub(crate) struct OwnedCharge {
+    ledger: Arc<Ledger>,
+    edges: usize,
+}
+
+impl Drop for OwnedCharge {
+    fn drop(&mut self) {
+        self.ledger
+            .release(SWCost::new(1, self.edges, 0, 0), Kind::Ordinary, false);
+    }
+}
+
+impl OwnedCapacity {
+    pub(crate) fn stage(&self, cost: SWCost) -> Result<SWReservation, SWReservationError> {
+        match self {
+            Self::Reservation(reservation) => reservation.stage(cost),
+            // Only full reservations can promise a delivery child. Plain owned
+            // admission selects this representation only without that promise.
+            Self::Ordinary { .. } => Err(SWReservationError::InsufficientCredits),
+        }
+    }
+}
+
 impl SWReservationPool {
+    pub(crate) fn try_charge_owned(
+        &self,
+        edges: usize,
+    ) -> Result<OwnedCapacity, SWReservationError> {
+        self.ledger
+            .claim(SWCost::new(1, edges, 0, 0), Kind::Ordinary, false)?;
+        Ok(OwnedCapacity::Ordinary {
+            _charge: OwnedCharge {
+                ledger: Arc::clone(&self.ledger),
+                edges,
+            },
+        })
+    }
+
+    /// The caller owns the empty buffer throughout preparation and rollback.
+    /// Every member independently releases its charge even if siblings survive.
+    pub(crate) fn try_charge_owned_many_into(
+        &self,
+        edges: usize,
+        maximum: usize,
+        output: &mut Vec<OwnedCapacity>,
+    ) -> Result<(), SWReservationError> {
+        debug_assert!(output.is_empty());
+        if maximum == 0 {
+            return Ok(());
+        }
+        output.reserve(maximum);
+        let accepted = self
+            .ledger
+            .claim_ordinary_many(SWCost::new(1, edges, 0, 0), maximum)?;
+        for _ in 0..accepted {
+            output.push(OwnedCapacity::Ordinary {
+                _charge: OwnedCharge {
+                    ledger: Arc::clone(&self.ledger),
+                    edges,
+                },
+            });
+        }
+        self.ledger.notify();
+        Ok(())
+    }
+
     pub(crate) fn new(runtime_identity: u64, limits: SWLimits) -> Self {
         Self {
             ledger: Arc::new(Ledger {
@@ -236,6 +308,7 @@ impl SWReservationPool {
 
     /// Claims the available prefix under one ledger lock. Each returned member
     /// owns a separate pipeline so settling it releases its global charge.
+    #[cfg(test)]
     pub(crate) fn try_reserve_ordinary_many(
         &self,
         cost: SWCost,

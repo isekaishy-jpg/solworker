@@ -20,6 +20,12 @@ wrapper moves; accepted nonempty portions issue one normal event notification
 after unlocking. Refusal retains prepared wrappers for outside-lock disposal.
 The original checked single-task handoff still returns its typed closure on
 refusal. Event representation and wake-all semantics are unchanged.
+Solworker's internal singleton and prepared-range callables now share one task
+allocation with their once-only take cell. This result-free representation has
+no separate closure Box, result Once or weak pool association. Singleton refusal
+keeps its concrete task type until the original capture is recovered outside
+the queue lock. Public result-bearing and borrowed/scoped execution retain
+their prior representation and contracts.
 The event listener now re-arms its waiter flag on every wait retry. A delayed
 notifier can clear a newer listener's flag without changing that listener's
 saved version; the upstream one-time arm then repeatedly returns from the OS

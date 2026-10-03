@@ -1,7 +1,5 @@
 //! Retained, classed batches and exact-group helping.
 
-use std::collections::BTreeMap;
-use std::ops::Bound::{Excluded, Unbounded};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 
@@ -11,13 +9,97 @@ use crate::runtime::config::SWExecutionClass;
 use crate::scheduler::OwnedScheduler;
 use crate::task::{SWCompletion, SWTaskStatus};
 
+mod members;
+pub(crate) use members::MembershipKey;
+use members::{Growth, Members, PAGE_SLOTS, Page};
+
+// The existing admission and prerequisite portions contain at most 64 jobs.
+// Keys are inert metadata; no ownership or record guard crosses this scratch.
+pub(crate) type MembershipKeys = [Option<MembershipKey>; PAGE_SLOTS];
+
+pub(crate) struct MembershipReservation<'a> {
+    group: &'a GroupInner,
+    remaining: usize,
+    head: Option<usize>,
+}
+
+impl MembershipReservation<'_> {
+    // The private caller maps job handles through intrinsic downgrade only.
+    // Advancing this iterator must not lock, call application code or drop
+    // payload ownership while the membership guard is held.
+    pub(crate) fn register_many(
+        &mut self,
+        jobs: impl ExactSizeIterator<Item = crate::scheduler::storage::JobWeak>,
+    ) -> MembershipKeys {
+        assert!(jobs.len() <= PAGE_SLOTS && jobs.len() <= self.remaining);
+        let mut keys = [None; PAGE_SLOTS];
+        let mut members = self
+            .group
+            .members
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        for (job, key) in jobs.zip(&mut keys) {
+            let (registered, next) =
+                members.register(self.group.id, self.head.expect("reserved slot exists"), job);
+            *key = Some(registered);
+            self.head = next;
+            self.remaining -= 1;
+        }
+        keys
+    }
+
+    pub(crate) fn register(&mut self, job: crate::scheduler::storage::JobWeak) -> MembershipKey {
+        assert!(self.remaining > 0, "reserved member count");
+        let (key, next) = self
+            .group
+            .members
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .register(self.group.id, self.head.expect("reserved slot exists"), job);
+        self.head = next;
+        self.remaining -= 1;
+        key
+    }
+}
+
+impl Drop for MembershipReservation<'_> {
+    fn drop(&mut self) {
+        if self.remaining == 0 {
+            return;
+        }
+        let trim = loop {
+            // Pointer-sized owning page boxes only; no application capture
+            // storage goes on this bounded release stack.
+            let mut removed: [Option<Box<Page>>; PAGE_SLOTS] = std::array::from_fn(|_| None);
+            let trim = {
+                let mut members = self
+                    .group
+                    .members
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                for removed in removed.iter_mut().take(self.remaining.min(PAGE_SLOTS)) {
+                    let (next, page) =
+                        members.release_reserved(self.head.expect("reserved slot exists"));
+                    self.head = next;
+                    self.remaining -= 1;
+                    *removed = page;
+                }
+                members.needs_trim()
+            };
+            drop(removed);
+            if self.remaining == 0 {
+                break trim;
+            }
+        };
+        if trim {
+            self.group.trim_members();
+        }
+    }
+}
+
 #[cfg(test)]
 #[path = "../../tests/unit/group.rs"]
 mod tests;
-
-#[cfg(test)]
-#[path = "../../tests/unit/group_membership.rs"]
-mod membership_tests;
 
 pub(crate) struct GroupInner {
     pub(crate) id: u64,
@@ -27,7 +109,7 @@ pub(crate) struct GroupInner {
     completion: SWCompletion,
     public_handles: AtomicUsize,
     retirement: Weak<crate::scheduler::storage::GroupRetirement>,
-    members: Mutex<BTreeMap<u64, crate::scheduler::storage::JobWeak>>,
+    members: Mutex<Members>,
 }
 
 struct GroupState {
@@ -60,7 +142,7 @@ impl GroupInner {
             completion: SWCompletion::pending(),
             public_handles: AtomicUsize::new(1),
             retirement: Weak::new(),
-            members: Mutex::new(BTreeMap::new()),
+            members: Mutex::new(Members::new()),
         }
     }
 
@@ -136,51 +218,100 @@ impl GroupInner {
         true
     }
 
-    pub(crate) fn register_member(&self, job: crate::scheduler::storage::JobWeak) {
-        let previous = self
-            .members
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .insert(job.id(), job);
-        debug_assert!(previous.is_none(), "group member identities are unique");
+    pub(crate) fn reserve_members(&self, count: usize) -> MembershipReservation<'_> {
+        loop {
+            let plan = {
+                let mut members = self
+                    .members
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                if let Some(head) = members.reserve(count) {
+                    return MembershipReservation {
+                        group: self,
+                        remaining: count,
+                        head,
+                    };
+                }
+                members.growth(count)
+            };
+            let mut growth = Growth::new(plan.0, plan.1);
+            let reserved = {
+                let mut members = self
+                    .members
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                members.install(&mut growth, count);
+                members.reserve(count)
+            };
+            // Unused pages and directory storage are released outside the guard.
+            drop(growth);
+            if let Some(head) = reserved {
+                return MembershipReservation {
+                    group: self,
+                    remaining: count,
+                    head,
+                };
+            }
+        }
     }
 
-    pub(crate) fn register_members(&self, jobs: Vec<crate::scheduler::storage::JobWeak>) {
+    pub(crate) fn mark_ready(&self, key: MembershipKey) {
+        self.members
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .ready(self.id, key);
+    }
+
+    pub(crate) fn mark_ready_many(&self, keys: &[Option<MembershipKey>]) {
+        if keys.is_empty() {
+            return;
+        }
         let mut members = self
             .members
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        for job in jobs {
-            let previous = members.insert(job.id(), job);
-            debug_assert!(previous.is_none(), "group member identities are unique");
+        for key in keys.iter().flatten() {
+            members.ready(self.id, *key);
         }
     }
 
-    pub(crate) fn retire_member(&self, id: u64) {
-        // Release the association after the membership guard; its recycler
-        // ownership never becomes a lock-held cleanup boundary.
-        let removed = self
-            .members
+    pub(crate) fn mark_unready(&self, key: MembershipKey) {
+        self.members
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .remove(&id);
+            .unready(self.id, key);
+    }
+
+    pub(crate) fn retire_member(&self, key: MembershipKey) {
+        let (removed, trim) = {
+            let mut members = self
+                .members
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let removed = members.retire(self.id, key);
+            (removed, members.needs_trim())
+        };
         drop(removed);
+        if trim {
+            self.trim_members();
+        }
     }
 
-    pub(crate) fn member_after(&self, after: u64) -> Option<crate::scheduler::storage::JobHandle> {
-        let members = self
-            .members
+    fn trim_members(&self) {
+        let mut replacement = Members::trim_storage();
+        self.members
             .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        // The cursor starts at its stable ID in logarithmic time. Expired weak
-        // associations are skipped in one ordered pass, never by rescanning
-        // the full live group for each next member. The returned control leaves
-        // this guard before the scheduler claims or invokes anything.
-        members
-            .range((Excluded(after), Unbounded))
-            .find_map(|(_, job)| job.upgrade())
+            .unwrap_or_else(|error| error.into_inner())
+            .trim(&mut replacement);
+        drop(replacement);
     }
 
+    pub(crate) fn ready_member(&self) -> Option<crate::scheduler::storage::JobHandle> {
+        self.members
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .candidate(self.id)
+    }
     pub(crate) fn finish(&self, status: Option<SWTaskStatus>) {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         state.pending -= 1;

@@ -37,45 +37,74 @@ fn inline_delivery_reconciles_once_after_every_member_attachment_closes() {
     // A range must not inflate every ordinary prerequisite/finalization entry
     // by embedding its fixed slot table in the common activation queue.
     assert!(std::mem::size_of::<super::super::Activation>() <= 4 * std::mem::size_of::<usize>());
+    assert_eq!(
+        std::mem::size_of::<PrerequisiteRange>(),
+        2 * std::mem::size_of::<usize>()
+    );
+    assert!(
+        std::mem::size_of::<Descriptor<SMALL_RANGE>>() < std::mem::size_of::<Descriptor<QUANTUM>>()
+    );
+    eprintln!(
+        "descriptor bytes: small={}, large={}, member={}, activation={}, record={}",
+        std::mem::size_of::<Descriptor<SMALL_RANGE>>(),
+        std::mem::size_of::<Descriptor<QUANTUM>>(),
+        std::mem::size_of::<RangeMember>(),
+        std::mem::size_of::<super::super::Activation>(),
+        std::mem::size_of::<super::super::Record>(),
+    );
     for policy in [
         SWDependencyPolicy::SuccessOnly,
         SWDependencyPolicy::OutcomeAware,
     ] {
-        let mut runtime = runtime();
-        let scheduler = scheduler(&runtime);
-        let (input, sink) = SWTask::<()>::pending_pair();
-        sink.finish(SWOutcome::Cancelled, false);
-        let registrations = Arc::new(AtomicUsize::new(0));
-        let count = Arc::clone(&registrations);
-        *scheduler.range_install_hook.lock().unwrap() = Some(Arc::new(move || {
-            count.fetch_add(1, Ordering::SeqCst);
-        }));
-        let members = runtime
-            .lane(SWExecutionClass::High)
-            .try_spawn_batch(
-                SWBatchSpawnOptions {
-                    prerequisites: &[input.completion()],
-                    dependency_policy: policy,
-                    ..Default::default()
-                },
-                vec![|| 31usize; 3],
-            )
-            .unwrap();
-        let expected = if policy == SWDependencyPolicy::SuccessOnly {
-            SWTaskStatus::PrerequisiteFailed
-        } else {
-            SWTaskStatus::Succeeded
-        };
-        for (task, _) in members {
+        for count in [1, 2, 8, 9, 32, 63, 64, 65, 128, 257] {
+            let mut runtime = runtime();
+            let scheduler = scheduler(&runtime);
+            let (input, sink) = SWTask::<()>::pending_pair();
+            sink.finish(SWOutcome::Cancelled, false);
+            let registrations = Arc::new(AtomicUsize::new(0));
+            let observed_registrations = Arc::clone(&registrations);
+            *scheduler.range_install_hook.lock().unwrap() = Some(Arc::new(move || {
+                observed_registrations.fetch_add(1, Ordering::SeqCst);
+            }));
+            let members = runtime
+                .lane(SWExecutionClass::High)
+                .try_spawn_batch(
+                    SWBatchSpawnOptions {
+                        prerequisites: &[input.completion()],
+                        dependency_policy: policy,
+                        ..Default::default()
+                    },
+                    vec![|| 31usize; count],
+                )
+                .unwrap();
+            let expected = if policy == SWDependencyPolicy::SuccessOnly {
+                SWTaskStatus::PrerequisiteFailed
+            } else {
+                SWTaskStatus::Succeeded
+            };
+            for (mut task, _) in members {
+                assert_eq!(
+                    task.completion().wait_timeout(TIMEOUT).unwrap(),
+                    Some(expected)
+                );
+                assert_eq!(
+                    task.try_take(),
+                    Some(if policy == SWDependencyPolicy::SuccessOnly {
+                        SWOutcome::PrerequisiteFailed
+                    } else {
+                        SWOutcome::Success(31)
+                    })
+                );
+            }
+            runtime.shutdown().unwrap();
             assert_eq!(
-                task.completion().wait_timeout(TIMEOUT).unwrap(),
-                Some(expected)
+                registrations.load(Ordering::SeqCst),
+                count / QUANTUM + usize::from(count % QUANTUM >= 2),
+                "member count {count}"
             );
+            assert_eq!(scheduler.accounting.edges.load(Ordering::Acquire), 0);
+            assert_eq!(scheduler.accounting.records.load(Ordering::Acquire), 0);
         }
-        runtime.shutdown().unwrap();
-        assert_eq!(registrations.load(Ordering::SeqCst), 1);
-        assert_eq!(scheduler.accounting.edges.load(Ordering::Acquire), 0);
-        assert_eq!(scheduler.accounting.records.load(Ordering::Acquire), 0);
     }
 }
 
@@ -132,6 +161,12 @@ fn cancellation_before_subscription_install_refunds_members_and_releases_signal_
 
 #[test]
 fn cancelled_control_recycles_while_sibling_waits_and_old_authority_is_stale() {
+    for count in [2, 8, 9, 32, 63, 64, 65, 128, 257] {
+        check_cancelled_control_recycling(count);
+    }
+}
+
+fn check_cancelled_control_recycling(count: usize) {
     let mut runtime = runtime();
     let scheduler = scheduler(&runtime);
     let (input, sink) = SWTask::<()>::pending_pair();
@@ -147,13 +182,16 @@ fn cancelled_control_recycles_while_sibling_waits_and_old_authority_is_stale() {
                 prerequisites: &[input.completion()],
                 ..Default::default()
             },
-            vec![|| 53usize; 2],
+            vec![|| 53usize; count],
         )
         .unwrap();
     members[0].1.cancel();
     assert_eq!(members[0].0.status(), Some(SWTaskStatus::Cancelled));
     assert_eq!(members[1].0.status(), None);
-    assert_eq!(scheduler.accounting.edges.load(Ordering::Acquire), 1);
+    assert_eq!(
+        scheduler.accounting.edges.load(Ordering::Acquire),
+        count - 1
+    );
     let (replacement, _) = runtime
         .lane(SWExecutionClass::High)
         .try_spawn_after(
@@ -164,15 +202,18 @@ fn cancelled_control_recycles_while_sibling_waits_and_old_authority_is_stale() {
         )
         .unwrap();
     let addresses = addresses.lock().unwrap();
-    assert_eq!(addresses[0], addresses[2]);
+    assert_eq!(addresses[0], addresses[count]);
     drop(addresses);
     members[0].1.cancel();
     assert_eq!(replacement.status(), None);
     sink.finish(SWOutcome::Success(()), false);
-    assert_eq!(
-        members[1].0.completion().wait_timeout(TIMEOUT).unwrap(),
-        Some(SWTaskStatus::Succeeded)
-    );
+    for (mut task, _) in members.into_iter().skip(1) {
+        assert_eq!(
+            task.completion().wait_timeout(TIMEOUT).unwrap(),
+            Some(SWTaskStatus::Succeeded)
+        );
+        assert_eq!(task.try_take(), Some(SWOutcome::Success(53)));
+    }
     assert_eq!(
         replacement.completion().wait_timeout(TIMEOUT).unwrap(),
         Some(SWTaskStatus::Succeeded)

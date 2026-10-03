@@ -1,6 +1,34 @@
 use super::{SWCost, SWLimits, SWReservationError, SWReservationPool};
 
 #[test]
+fn direct_owned_charges_refund_independently_and_reuse_empty_output() {
+    let limits = SWLimits::new(SWCost::new(4, 6, 0, 0), SWCost::default(), 0, None).unwrap();
+    let pool = SWReservationPool::new(42, limits);
+    let mut output = Vec::new();
+    pool.try_charge_owned_many_into(2, 64, &mut output).unwrap();
+    assert_eq!(output.len(), 3);
+    assert_eq!(pool.snapshot().ordinary, SWCost::new(3, 6, 0, 0));
+    assert!(matches!(
+        pool.try_charge_owned(1),
+        Err(SWReservationError::Full)
+    ));
+    drop(output.remove(1));
+    assert_eq!(pool.snapshot().ordinary, SWCost::new(2, 4, 0, 0));
+    let replacement = pool.try_charge_owned(2).unwrap();
+    output.clear();
+    assert_eq!(pool.snapshot().ordinary, SWCost::new(1, 2, 0, 0));
+    pool.close();
+    assert_eq!(pool.try_charge_owned_many_into(0, 0, &mut output), Ok(()));
+    assert_eq!(
+        pool.try_charge_owned_many_into(0, 1, &mut output),
+        Err(SWReservationError::Closed)
+    );
+    assert!(output.is_empty());
+    drop(replacement);
+    assert_eq!(pool.snapshot().ordinary, SWCost::default());
+}
+
+#[test]
 fn ordinary_portions_shrink_and_members_release_independently() {
     let limits = SWLimits::new(SWCost::new(5, 7, 0, 0), SWCost::new(1, 1, 0, 0), 1, None).unwrap();
     let pool = SWReservationPool::new(1, limits);

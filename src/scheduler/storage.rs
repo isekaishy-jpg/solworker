@@ -11,7 +11,7 @@ use crate::task::{Signal, SignalLease};
 mod tests;
 
 mod jobs;
-pub(super) use jobs::JobPool;
+pub(super) use jobs::{JobCheckouts, JobPool};
 pub(crate) use jobs::{JobHandle, JobWeak};
 mod buffers;
 pub(crate) use buffers::BufferPool;
@@ -44,7 +44,7 @@ impl GroupPool {
         Self {
             retired: Arc::new(GroupRetirement {
                 entries: Mutex::new(Vec::new()),
-                limit,
+                limit: limit.min(32),
             }),
         }
     }
@@ -105,6 +105,23 @@ pub(crate) struct SignalPool {
     retired: Arc<SignalRetirement>,
 }
 
+#[derive(Default)]
+pub(super) struct SignalCheckouts {
+    entries: Vec<Arc<Signal>>,
+}
+
+impl SignalCheckouts {
+    pub(super) fn clear(&mut self) {
+        for entry in self.entries.drain(..) {
+            crate::cleanup::discard_value(entry);
+        }
+    }
+
+    pub(super) fn bytes(&self) -> usize {
+        self.entries.capacity() * std::mem::size_of::<Arc<Signal>>()
+    }
+}
+
 impl SignalPool {
     pub(crate) fn new(limit: usize) -> Self {
         Self {
@@ -130,8 +147,23 @@ impl SignalPool {
         SignalLease::pooled(signal, Arc::downgrade(&self.retired))
     }
 
+    #[cfg(test)]
     pub(crate) fn acquire_many(&self, count: usize) -> Vec<SignalLease> {
-        let mut recycled = Vec::with_capacity(count);
+        let mut signals = Vec::new();
+        self.acquire_many_into(count, &mut signals, &mut SignalCheckouts::default());
+        signals
+    }
+
+    pub(super) fn acquire_many_into(
+        &self,
+        count: usize,
+        signals: &mut Vec<SignalLease>,
+        checkouts: &mut SignalCheckouts,
+    ) {
+        assert!(signals.is_empty());
+        assert!(checkouts.entries.is_empty());
+        signals.reserve(count);
+        checkouts.entries.reserve(count);
         {
             let mut entries = self
                 .retired
@@ -142,18 +174,16 @@ impl SignalPool {
                 let Some(signal) = entries.pop() else {
                     break;
                 };
-                recycled.push(signal);
+                checkouts.entries.push(signal);
             }
         }
-        let mut signals = Vec::with_capacity(count);
-        let mut recycled = recycled.into_iter();
+        let mut returned = checkouts.entries.drain(..);
         for _ in 0..count {
-            let mut signal = recycled.next().unwrap_or_else(|| Arc::new(Signal::new()));
+            let mut signal = returned.next().unwrap_or_else(|| Arc::new(Signal::new()));
             Arc::get_mut(&mut signal)
                 .expect("retired signal is exclusive")
                 .reset();
             signals.push(SignalLease::pooled(signal, Arc::downgrade(&self.retired)));
         }
-        signals
     }
 }

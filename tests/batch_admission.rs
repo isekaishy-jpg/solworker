@@ -351,7 +351,7 @@ fn capacity_rejection_recovers_the_exact_uninvoked_suffix_and_keeps_a_live_prefi
                     spawn: SWSpawnOptions {
                         eligibility: SWCallerEligibility::CallerEligible,
                     },
-                    prerequisites: if ceiling == "edges" {
+                    prerequisites: if matches!(ceiling, "edges" | "ordinary_capacity") {
                         &prerequisites
                     } else {
                         &[]
@@ -380,9 +380,53 @@ fn capacity_rejection_recovers_the_exact_uninvoked_suffix_and_keeps_a_live_prefi
             .collect();
         assert_eq!(recovered, [3, 4, 5], "{ceiling}");
         let mut accepted = rejected.accepted;
+        if ceiling == "ordinary_capacity" {
+            assert_eq!(
+                runtime.capacity_usage().unwrap().ordinary,
+                SWCost::new(7, 5, 0, 0)
+            );
+        }
         accepted[2].1.cancel();
         assert_eq!(accepted[2].0.status(), Some(SWTaskStatus::Cancelled));
         assert_eq!(drops.load(Ordering::SeqCst), 4);
+        if ceiling == "ordinary_capacity" {
+            assert_eq!(
+                runtime.capacity_usage().unwrap().ordinary,
+                SWCost::new(6, 4, 0, 0)
+            );
+            assert!(
+                accepted[..2]
+                    .iter()
+                    .all(|(task, _)| task.status().is_none())
+            );
+            // The cancelled member refunds its own record and prerequisite
+            // edge while both same-portion siblings still await their input.
+            let mut replacement = high
+                .try_spawn_batch(
+                    SWBatchSpawnOptions {
+                        prerequisites: &prerequisites,
+                        ..Default::default()
+                    },
+                    vec![|| 17usize],
+                )
+                .unwrap();
+            assert_eq!(
+                runtime.capacity_usage().unwrap().ordinary,
+                SWCost::new(7, 5, 0, 0)
+            );
+            assert_eq!(replacement[0].0.status(), None);
+            replacement[0].1.cancel();
+            assert_eq!(replacement[0].0.try_take(), Some(SWOutcome::Cancelled));
+            assert_eq!(
+                runtime.capacity_usage().unwrap().ordinary,
+                SWCost::new(6, 4, 0, 0)
+            );
+            assert!(
+                accepted[..2]
+                    .iter()
+                    .all(|(task, _)| task.status().is_none())
+            );
+        }
         provider.complete(()).unwrap();
         drop(release);
         for (index, (task, _)) in accepted.iter_mut().enumerate() {
@@ -417,6 +461,12 @@ fn capacity_rejection_recovers_the_exact_uninvoked_suffix_and_keeps_a_live_prefi
         assert_eq!(calls.load(Ordering::SeqCst), 5);
         assert_eq!(drops.load(Ordering::SeqCst), 6);
         runtime.shutdown().unwrap();
+        if ceiling == "ordinary_capacity" {
+            assert_eq!(
+                runtime.capacity_usage().unwrap().ordinary,
+                SWCost::default()
+            );
+        }
     }
 }
 

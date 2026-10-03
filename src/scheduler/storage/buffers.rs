@@ -40,8 +40,15 @@ impl<T> BufferPool<T> {
     }
 
     /// The scheduler holds the pool's enclosing mutex once for a portion.
-    pub(crate) fn acquire_many(&mut self, count: usize, minimum: usize) -> Vec<Vec<T>> {
-        (0..count).map(|_| self.acquire(minimum)).collect()
+    pub(crate) fn acquire_many_into(
+        &mut self,
+        count: usize,
+        minimum: usize,
+        buffers: &mut Vec<Vec<T>>,
+    ) {
+        assert!(buffers.is_empty());
+        assert!(buffers.capacity() >= count);
+        buffers.extend((0..count).map(|_| self.acquire(minimum)));
     }
 
     pub(crate) fn release(&mut self, entry: Vec<T>) {

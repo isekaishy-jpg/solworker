@@ -48,6 +48,27 @@ fn retired_signal_reuses_only_after_result_and_observers_release() {
     assert_eq!(next.status(), None);
     sink.finish(SWOutcome::Success(43), false);
     assert_eq!(next.status(), Some(SWTaskStatus::Succeeded));
+    drop(next);
+    let mut portion = Vec::new();
+    let mut raw = super::SignalCheckouts::default();
+    signals.acquire_many_into(3, &mut portion, &mut raw);
+    assert!(raw.entries.is_empty());
+    assert_eq!(&*portion[0] as *const _, reusable_address);
+    let mut observers = Vec::new();
+    for (index, signal) in portion.drain(..).enumerate() {
+        let (task, sink) = SWTask::pending_with_signal(signal);
+        assert_eq!(task.status(), None);
+        sink.finish(SWOutcome::Success(index + 100), false);
+        observers.push(task);
+    }
+    for (index, mut task) in observers.into_iter().enumerate() {
+        assert_eq!(task.try_take(), Some(SWOutcome::Success(index + 100)));
+    }
+    // The old separately retained typed result is unaffected by checkout/reset.
+    assert!(matches!(&*result, SWOutcome::Success(41)));
+    signals.acquire_many_into(2, &mut portion, &mut raw);
+    assert!(raw.entries.is_empty());
+    assert_eq!(portion.len(), 2);
 }
 
 #[test]

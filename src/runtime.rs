@@ -659,6 +659,9 @@ impl SWRuntime {
             });
             backend.join();
         }
+        if let Some(owned) = &self.owned {
+            owned.retire_scratch();
+        }
         self.control.set_phase(SWRuntimeState::Stopped);
         Ok(true)
     }
