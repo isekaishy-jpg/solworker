@@ -9,8 +9,9 @@ An application normally owns one `SWRuntime` and gives subsystems reusable
 they neither create pools nor keep workers alive after the runtime is dropped.
 
 `SWRuntimeConfig::new` takes an aggregate worker budget and three
-`SWWorkerConfig` entries in **Low, Mid, High** order. Each class currently requires
-at least one worker. The sum may be below the budget but cannot exceed it.
+`SWWorkerConfig` entries in **Low, Mid, High** order. Zero disables a class;
+enabled classes have at least one worker. The sum may be below the budget but
+cannot exceed it. A zero budget is valid only when all three classes are disabled.
 Account for the main thread, renderer/provider threads and other runtimes when
 choosing this budget; the number of logical CPUs is not automatically the number
 of additional workers an application should create.
@@ -59,8 +60,14 @@ OS priorities with `SWWorkerConfig::with_priority`: `BelowNormal`, `Normal`,
 and `AboveNormal` map to Windows relative priorities -1/0/+1. Worker startup
 reports a failure if it cannot apply a requested priority. The recovered path
 does not justify adding processor affinity. Native zero-request classes create
-no workers; SW currently requires at least one per class, so that configuration
-cannot be reproduced directly.
+no workers; SW now accepts that configuration. Nonempty scoped and owned work on
+a disabled lane returns `ClassDisabled(class)` without invoking closures or
+redirecting them. Rejection returns the caller's owned inputs. Group creation is
+also rejected. Empty owned batches remain successful no-ops. Enable a class or
+explicitly perform appropriate work outside SW; zero does not select an implicit
+inline executor. Setup hooks and OS priority application run only for workers
+actually created. Runtime-owned external producers and owner delivery remain
+independent of CPU-class enablement.
 
 Set owned handoff capacities deliberately alongside worker counts. Six workers
 with one handoff slot do not provide six-way owned execution. Provider slots,
@@ -248,11 +255,16 @@ was fully admitted. Use [coherent publication](resources.md#coherent-publication
 when live-state mutation must wait for all required admissions.
 
 Batching amortizes initial admission, attachment and publication coordination in
-bounded portions. Each job still consumes its own records and prerequisite
-edges. Later asynchronous prerequisite completions activate individual members;
-common prerequisites do not imply a single shared release operation. Batching
-does not impose a fairness deadline, remove CPU costs or guarantee lower frame
-time.
+bounded portions. A portion with at least two members and exactly one common
+prerequisite shares one physical registration and a bounded release pass.
+Multiple prerequisites, including duplicate completion tokens, retain independent
+per-member registrations. Each job still consumes its own record and logical
+prerequisite edges, carries its own demand, and completes or cancels independently.
+Cancelling a member promptly detaches its interest; it does not cancel siblings.
+Backend handoff can publish several independent wrappers with one queue
+notification when handoff capacity permits. Per-job completion notifications
+remain. Batching does not impose a fairness deadline, remove CPU costs or
+guarantee lower frame time.
 
 ## Helping is explicit and restricted
 

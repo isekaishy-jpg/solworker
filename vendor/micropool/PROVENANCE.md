@@ -13,6 +13,13 @@ caller-only owner continuation that advertises its transferable worker unit
 before running the owner branch. Foreground slot capacity can be configured
 exactly despite bitset rounding. Ordinary micropool submission and execution
 semantics remain upstream.
+The private Solworker integration also prepares independent owned wrappers
+outside the task queue lock and publishes a caller-bounded portion all-or-none
+against stop. Queue growth reserves the portion's required capacity before any
+wrapper moves; accepted nonempty portions issue one normal event notification
+after unlocking. Refusal retains prepared wrappers for outside-lock disposal.
+The original checked single-task handoff still returns its typed closure on
+refusal. Event representation and wake-all semantics are unchanged.
 The event listener now re-arms its waiter flag on every wait retry. A delayed
 notifier can clear a newer listener's flag without changing that listener's
 saved version; the upstream one-time arm then repeatedly returns from the OS

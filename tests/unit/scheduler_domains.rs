@@ -541,7 +541,16 @@ fn later_portions_recover_the_suffix_after_seal_or_root_close() {
 }
 
 #[test]
-fn backend_refusal_after_one_batch_offer_retires_every_reserved_wrapper_once() {
+fn backend_refusal_of_prepared_range_retires_every_reserved_wrapper_once() {
+    check_backend_range_stop(false);
+}
+
+#[test]
+fn stop_after_accepted_range_retains_each_physical_wrapper_until_terminal_stop() {
+    check_backend_range_stop(true);
+}
+
+fn check_backend_range_stop(stop_after_acceptance: bool) {
     let mut runtime = runtime();
     let high = runtime.lane(SWExecutionClass::High);
     let group = high.group().unwrap();
@@ -566,10 +575,15 @@ fn backend_refusal_after_one_batch_offer_retires_every_reserved_wrapper_once() {
     let stop_backend = Arc::clone(&backend_pool);
     let offers = Arc::new(AtomicUsize::new(0));
     let observed = Arc::clone(&offers);
-    *scheduler.handoff_hook.lock().unwrap() = Some(Arc::new(move |_| {
-        observed.fetch_add(1, Ordering::SeqCst);
+    if stop_after_acceptance {
+        *scheduler.handoff_hook.lock().unwrap() = Some(Arc::new(move |count| {
+            observed.fetch_add(count, Ordering::SeqCst);
+            stop_backend.pool().begin_stop();
+        }));
+    } else {
         stop_backend.pool().begin_stop();
-    }));
+        drop(stop_backend);
+    }
     let drops = Arc::new(AtomicUsize::new(0));
     let calls = Arc::new(AtomicUsize::new(0));
     let operations = (0..3)
@@ -602,9 +616,13 @@ fn backend_refusal_after_one_batch_offer_retires_every_reserved_wrapper_once() {
     // retires. Perform the real terminal stop before releasing the last worker.
     runtime.abandon();
     drop(release);
-    assert_eq!(offers.load(Ordering::SeqCst), 1);
     assert_eq!(
-        physical_before_release, 2,
+        offers.load(Ordering::SeqCst),
+        if stop_after_acceptance { 3 } else { 0 }
+    );
+    assert_eq!(
+        physical_before_release,
+        if stop_after_acceptance { 4 } else { 1 },
         "running and actually offered wrappers retain their slots"
     );
     for (task, _) in accepted {

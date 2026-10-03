@@ -124,7 +124,7 @@ impl SWLane {
         F: FnOnce() -> T + Send + 'static,
         T: Send + 'static,
     {
-        let scheduler = match self.control.owned_scheduler() {
+        let scheduler = match self.control.owned_scheduler_for(self.class) {
             Ok(scheduler) => scheduler,
             Err(reason) => {
                 return Err(SWStageRejected {

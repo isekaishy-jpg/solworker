@@ -294,6 +294,7 @@ impl SWRuntimeBuilder {
             &backend,
             Arc::clone(&physical),
             self.notification_limits,
+            SWExecutionClass::ALL.map(|class| self.config.workers_for(class).worker_count() != 0),
         ));
         let owned = self.owned_limits.map(|mut limits| {
             let capacity = self.capacity_limits.map(|policy| {

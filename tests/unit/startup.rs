@@ -23,6 +23,7 @@ fn notification_control() -> (Arc<RuntimeControl>, Arc<BackendOwner>) {
             routes: 1,
             bindings: 1,
         }),
+        [true; 3],
     ));
     (control, backend)
 }

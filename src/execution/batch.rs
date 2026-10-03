@@ -60,7 +60,7 @@ impl SWBatch {
             }
             self.lane
                 .control
-                .owned_scheduler()
+                .owned_scheduler_for(self.lane.class())
                 .map_err(SWBatchError::Admission)?
                 .renew_group(group)
                 .map_err(SWBatchError::Admission)?;

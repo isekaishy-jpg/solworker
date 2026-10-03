@@ -5,7 +5,7 @@ use wait_on_address::AtomicWait;
 
 #[cfg(test)]
 #[path = "../tests/unit/event.rs"]
-mod event_tests;
+pub(crate) mod event_tests;
 
 /// A synchronization primitive for blocking threads until an event occurs.
 /// The primitive is reusable and will wake up all pending listeners each time
@@ -18,7 +18,7 @@ pub struct Event {
     /// which indicates whether threads are sleeping on this event.
     atomic: AtomicU64,
     #[cfg(test)]
-    test_hook: event_tests::Hook,
+    pub(crate) test_hook: event_tests::Hook,
 }
 
 impl Event {

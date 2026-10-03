@@ -8,6 +8,7 @@
 mod admission;
 mod bulk;
 mod demand;
+mod prerequisite_range;
 mod ready;
 pub(crate) mod reservation;
 pub(crate) mod storage;
@@ -57,6 +58,7 @@ pub(crate) struct SubmitExtras {
     capacity: Option<SWReservation>,
     priority: Option<SWPriority>,
     reserved: bool,
+    batch_member: bool,
 }
 
 type Finish = Box<dyn FnOnce() + Send>;
@@ -84,6 +86,11 @@ mod domain_tests;
 
 enum Activation {
     Prerequisite(Arc<OwnedScheduler>, JobHandle, SWTaskStatus),
+    PrerequisiteRange(
+        Arc<OwnedScheduler>,
+        Arc<prerequisite_range::PrerequisiteRange>,
+        SWTaskStatus,
+    ),
     Finalize(Arc<OwnedScheduler>, JobHandle),
 }
 
@@ -127,6 +134,9 @@ fn enqueue_activation(activation: Activation) {
         match next {
             Some(Activation::Prerequisite(scheduler, id, status)) => {
                 scheduler.activate_prerequisite(&id, status)
+            }
+            Some(Activation::PrerequisiteRange(scheduler, range, status)) => {
+                scheduler.activate_prerequisite_range(range.take_members(), status)
             }
             Some(Activation::Finalize(scheduler, id)) => scheduler.finalize_record(id),
             None => break,
@@ -203,6 +213,7 @@ struct Record {
     stage: Stage,
     eligibility: SWCallerEligibility,
     subscriptions: Vec<Subscription>,
+    prerequisite_range: Option<prerequisite_range::RangeMember>,
     attaching: bool,
     deferred_finish: Option<Finish>,
     admission: OwnedAdmission,
@@ -466,6 +477,10 @@ pub(crate) struct OwnedScheduler {
     batch_portion_hook: Mutex<Option<CountHook>>,
     #[cfg(test)]
     handoff_hook: Mutex<Option<CountHook>>,
+    #[cfg(test)]
+    range_install_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    range_delivery_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 impl OwnedScheduler {
@@ -578,6 +593,10 @@ impl OwnedScheduler {
             batch_portion_hook: Mutex::new(None),
             #[cfg(test)]
             handoff_hook: Mutex::new(None),
+            #[cfg(test)]
+            range_install_hook: Mutex::new(None),
+            #[cfg(test)]
+            range_delivery_hook: Mutex::new(None),
         })
     }
 
@@ -732,6 +751,7 @@ impl OwnedScheduler {
                 capacity,
                 priority: options.priority,
                 reserved: options.reservation.is_some(),
+                batch_member: false,
             },
             bytes,
         ))
@@ -745,6 +765,9 @@ impl OwnedScheduler {
         let admission = control.admit_owned(false).map_err(|error| match error {
             crate::execution::SWExecutionError::Closed => SWSpawnError::Closed,
             crate::execution::SWExecutionError::InvalidContext => SWSpawnError::InvalidContext,
+            crate::execution::SWExecutionError::ClassDisabled(class) => {
+                SWSpawnError::ClassDisabled(class)
+            }
         })?;
         let id = self.reserve_group_id(class)?;
         let inner = self.groups.acquire(id, class);
@@ -772,6 +795,9 @@ impl OwnedScheduler {
         let admission = control.admit_owned(false).map_err(|error| match error {
             crate::execution::SWExecutionError::Closed => SWSpawnError::Closed,
             crate::execution::SWExecutionError::InvalidContext => SWSpawnError::InvalidContext,
+            crate::execution::SWExecutionError::ClassDisabled(class) => {
+                SWSpawnError::ClassDisabled(class)
+            }
         })?;
         let id = self.reserve_group_id(group.class())?;
         if !group.try_reset(id) {
@@ -875,6 +901,9 @@ impl OwnedScheduler {
             Err(crate::execution::SWExecutionError::Closed) => reject!(SWSpawnError::Closed),
             Err(crate::execution::SWExecutionError::InvalidContext) => {
                 reject!(SWSpawnError::InvalidContext)
+            }
+            Err(crate::execution::SWExecutionError::ClassDisabled(class)) => {
+                reject!(SWSpawnError::ClassDisabled(class))
             }
         };
         let unaccounted_delivery = options
@@ -1121,7 +1150,7 @@ impl OwnedScheduler {
         run: fn(P) -> T,
         application_failed: fn(&T) -> bool,
         delivery: &mut Option<crate::owner::SWDeliveryTicket>,
-        mut extras: SubmitExtras,
+        extras: SubmitExtras,
     ) -> SWSpawnResult<T, P> {
         let SubmitRequest {
             control,
@@ -1145,7 +1174,16 @@ impl OwnedScheduler {
             Err(crate::execution::SWExecutionError::InvalidContext) => {
                 return Err(reject(SWSpawnError::InvalidContext, payload));
             }
+            Err(crate::execution::SWExecutionError::ClassDisabled(class)) => {
+                return Err(reject(SWSpawnError::ClassDisabled(class), payload));
+            }
         };
+        // Provisional capacity and work-set ownership must refund before the
+        // admission token publishes its final runtime progress notification.
+        let mut extras = extras;
+        if extras.batch_member && group.is_some_and(|group| !group.inner.is_open()) {
+            return Err(reject(SWSpawnError::InvalidGroup, payload));
+        }
         if extras.capacity.is_none()
             && let Some(capacity) = &self.capacity
         {
@@ -1195,6 +1233,13 @@ impl OwnedScheduler {
         if self.abandoned.load(Ordering::Acquire) {
             return Err(reject(SWSpawnError::Closed, payload));
         }
+        let saturated = prerequisites.is_empty()
+            && state.ready.runnable + state.attaching_runnable >= self.limits.runnable_for(class);
+        // Batch acceptance arbitrates runnable capacity before group membership,
+        // and retains that capacity while dependency attachment is in progress.
+        if extras.batch_member && saturated {
+            return Err(reject(SWSpawnError::Full, payload));
+        }
         let group_inner = if let Some(group) = group {
             if group.runtime != control.identity()
                 || group.inner.class != class
@@ -1212,8 +1257,6 @@ impl OwnedScheduler {
         } else {
             None
         };
-        let saturated = prerequisites.is_empty()
-            && state.ready.runnable + state.attaching_runnable >= self.limits.runnable_for(class);
         let inline =
             saturated && allow_inline && options.eligibility == SWCallerEligibility::CallerEligible;
         let reason = if inline
@@ -1282,6 +1325,7 @@ impl OwnedScheduler {
                 stage: Stage::Waiting,
                 eligibility: options.eligibility,
                 subscriptions,
+                prerequisite_range: None,
                 // Every accepted record is visible to abandonment before dependency
                 // and graph attachment. Closure, not a callback, ends this phase.
                 attaching: true,
@@ -1290,11 +1334,14 @@ impl OwnedScheduler {
                 work_set: extras.work_set,
                 capacity: extras.capacity,
                 resource: priority.is_some(),
-                runnable_reserved: false,
+                runnable_reserved: extras.batch_member && prerequisites.is_empty(),
                 selection: None,
                 charge,
             },
         );
+        if extras.batch_member && prerequisites.is_empty() {
+            state.attaching_runnable += 1;
+        }
         // This insertion is the acceptance point; all later failures settle the
         // accepted responsibility and never return the consumed payload.
         state.records.insert(id, job.clone());
@@ -1369,6 +1416,11 @@ impl OwnedScheduler {
                 drop(subscription);
             }
         }
+        if extras.batch_member {
+            self.publish_portion(class, std::slice::from_ref(&job));
+            self.dispatch_class(class);
+            return Ok((task, producer));
+        }
         let deferred_finish = {
             let _notification = self.wake.notification_scope();
             let mut record = job.record_lock();
@@ -1425,6 +1477,72 @@ impl OwnedScheduler {
         self.dispatch_class(job.class());
     }
 
+    fn activate_prerequisite_range(
+        self: &Arc<Self>,
+        members: prerequisite_range::Members,
+        status: SWTaskStatus,
+    ) {
+        // Recycler upgrades and weak destruction precede class coordination.
+        // A callback snapshot may race detachment, so every member still checks
+        // its current stage after its identity-safe upgrade.
+        let jobs: Vec<_> = members
+            .into_iter()
+            .flatten()
+            .filter_map(|weak| weak.upgrade())
+            .collect();
+        let Some(first) = jobs.first() else {
+            return;
+        };
+        #[cfg(feature = "diagnostics")]
+        self.trace("range.activation", first.id(), jobs.len() as u64);
+        let class = first.class();
+        let mut detached = Vec::with_capacity(jobs.len());
+        let mut suppressed = Vec::with_capacity(jobs.len());
+        let mut ready_group = None;
+        {
+            let mut state = self.class_lock(class);
+            for job in &jobs {
+                let mut guard = job.record_lock();
+                let Some(record) = guard.as_mut() else {
+                    continue;
+                };
+                if record.stage != Stage::Waiting || record.pending == 0 {
+                    continue;
+                }
+                record.pending -= 1;
+                record.failed |= !status.is_success();
+                detached.extend(record.prerequisite_range.take());
+                if record.attaching {
+                    continue;
+                }
+                if self.abandoned.load(Ordering::Acquire) {
+                    suppressed.push((job, SWTaskStatus::Abandoned));
+                } else if record.failed && record.policy == SWDependencyPolicy::SuccessOnly {
+                    suppressed.push((job, SWTaskStatus::PrerequisiteFailed));
+                } else if state.ready.runnable + state.attaching_runnable
+                    < self.limits.runnable_for(class)
+                {
+                    record.stage = Stage::Ready;
+                    self.push_ready(&mut state, job, record);
+                    ready_group = record.group.clone();
+                } else {
+                    record.stage = Stage::DeferredReady;
+                    state.deferred.push_back(job.id());
+                }
+            }
+        }
+        drop(detached);
+        if let Some(group) = ready_group {
+            group.notify_ready();
+        }
+        for (job, status) in suppressed {
+            if let Err(payload) = catch_unwind(AssertUnwindSafe(|| self.suppress(job, status))) {
+                crate::cleanup::discard_panic(payload);
+            }
+        }
+        self.dispatch_class(class);
+    }
+
     fn activate_ready(self: &Arc<Self>, job: &JobHandle, inline: bool) {
         let class = job.class();
         let (suppress, group) = {
@@ -1474,7 +1592,7 @@ impl OwnedScheduler {
 
     fn suppress(self: &Arc<Self>, job: &JobHandle, mut status: SWTaskStatus) {
         let class = job.class();
-        let promoted = {
+        let (promoted, range_member) = {
             let mut state = self.class_lock(class);
             if self.abandoned.load(Ordering::Acquire) {
                 status = SWTaskStatus::Abandoned;
@@ -1490,19 +1608,22 @@ impl OwnedScheduler {
                 Stage::Running | Stage::Finalizing => return,
             };
             record.stage = Stage::Finalizing;
+            let range_member = record.prerequisite_range.take();
             match stage {
                 Stage::Ready => state.ready.remove(job.id()),
                 Stage::DeferredReady => state.deferred.retain(|id| *id != job.id()),
                 _ => {}
             }
             drop(guard);
-            if decrement {
+            let promoted = if decrement {
                 state.ready.runnable -= 1;
                 self.promote_locked(&mut state, class)
             } else {
                 Vec::new()
-            }
+            };
+            (promoted, range_member)
         };
+        drop(range_member);
         for group in promoted {
             group.notify_ready();
         }
@@ -1696,18 +1817,31 @@ impl OwnedScheduler {
             _ => Some(self.trace_job(job)),
         };
         let _context = self.cleanup_context(job);
-        let mut subscriptions = {
+        let (subscriptions, range_member, finish) = {
             let _notification = self.wake.notification_scope();
             let mut record = job.record_lock();
             let Some(record) = record.as_mut() else {
                 return;
             };
+            let range_member = record.prerequisite_range.take();
             if record.attaching {
                 record.deferred_finish = Some(finish);
-                return;
+                (None, range_member, None)
+            } else {
+                (
+                    Some(std::mem::take(&mut record.subscriptions)),
+                    range_member,
+                    Some(finish),
+                )
             }
-            std::mem::take(&mut record.subscriptions)
         };
+        // Cancellation drops its weak slot even while attachment retains the
+        // logical record and deferred result publication responsibility.
+        drop(range_member);
+        let Some(finish) = finish else {
+            return;
+        };
+        let mut subscriptions = subscriptions.expect("closed attachment subscriptions");
         subscriptions.clear();
         self.subscriptions
             .lock()
@@ -1875,9 +2009,10 @@ impl OwnedScheduler {
                 self.abandon();
                 break;
             };
-            let mut rejected = false;
-            for (index, slot) in jobs.iter_mut().take(selected).enumerate() {
-                let job = slot.take().expect("selected handoff retains its control");
+            let rejected = if selected == 1 {
+                let job = jobs[0]
+                    .take()
+                    .expect("selected handoff retains its control");
                 let handoff = Handoff {
                     scheduler: Arc::downgrade(self),
                     class,
@@ -1886,9 +2021,35 @@ impl OwnedScheduler {
                 reserved.remaining -= 1;
                 if let Err(wrapper) = lease.pool().try_spawn_owned(move || handoff.run(job)) {
                     drop(wrapper);
-                    rejected = true;
-                    break;
+                    true
+                } else {
+                    false
                 }
+            } else {
+                let mut wrappers: [Option<_>; bulk::QUANTUM] = std::array::from_fn(|_| None);
+                for (slot, wrapper) in jobs.iter_mut().zip(&mut wrappers).take(selected) {
+                    let job = slot.take().expect("selected handoff retains its control");
+                    let handoff = Handoff {
+                        scheduler: Arc::downgrade(self),
+                        class,
+                        completed: false,
+                    };
+                    // Transfer before preparing the erased wrapper: unwinding
+                    // drops the closure's credit, while reserved owns the rest.
+                    reserved.remaining -= 1;
+                    *wrapper = Some(lease.pool().prepare_owned(move || handoff.run(job)));
+                }
+                match lease.pool().try_spawn_prepared_range(wrappers) {
+                    Ok(()) => false,
+                    Err(wrappers) => {
+                        drop(wrappers);
+                        true
+                    }
+                }
+            };
+            if !rejected {
+                #[cfg(feature = "diagnostics")]
+                self.trace("backend.portion", class.index() as u64, selected as u64);
                 #[cfg(test)]
                 {
                     let hook = self
@@ -1897,14 +2058,12 @@ impl OwnedScheduler {
                         .unwrap_or_else(|error| error.into_inner())
                         .clone();
                     if let Some(hook) = hook {
-                        hook(index + 1);
+                        hook(selected);
                     }
                 }
-                #[cfg(not(test))]
-                let _ = index;
             }
-            // Offers transfer slot ownership one at a time. Unoffered controls
-            // are suppressed by abandonment after their reserved slots return.
+            // Each wrapper owns one physical credit. A refused portion returns
+            // all its credits before abandonment suppresses logical records.
             drop(reserved);
             drop(lease);
             drop(jobs);

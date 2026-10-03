@@ -13,7 +13,11 @@ use smallvec::SmallVec;
 
 pub(crate) use self::private::JoinAll;
 use crate::util::*;
-use crate::{OwnedTask, SharedTask, TaskInner};
+use crate::{OwnedTask, PreparedOwnedTask, SharedTask, TaskInner};
+
+#[cfg(test)]
+#[path = "../tests/unit/prepared_range.rs"]
+mod prepared_range_tests;
 
 /// The global thread pool.
 static GLOBAL_POOL: spin::Once<ThreadPool> = spin::Once::new();
@@ -279,6 +283,25 @@ impl ThreadPool {
         T: Send + 'static,
     {
         OwnedTask::try_spawn(&self.state, f)
+    }
+
+    /// Prepares an owned callable without publishing or running it. Dropping
+    /// it before publication releases its capture on the dropping thread.
+    #[doc(hidden)]
+    pub fn prepare_owned(&self, f: impl FnOnce() + Send + 'static) -> PreparedOwnedTask {
+        PreparedOwnedTask::new(&self.state, f)
+    }
+
+    /// Publishes one caller-bounded portion under the checked admission lock.
+    /// Stop either precedes the entire portion or follows it. Refusal returns
+    /// every prepared wrapper untouched, for cleanup outside caller guards.
+    /// Empty portions are always successful and do not notify workers.
+    #[doc(hidden)]
+    pub fn try_spawn_prepared_range<const N: usize>(
+        &self,
+        tasks: [Option<PreparedOwnedTask>; N],
+    ) -> Result<(), [Option<PreparedOwnedTask>; N]> {
+        self.state.try_push_prepared_range(tasks)
     }
 
     /// Closes checked task admission and wakes workers. This may be called
@@ -847,6 +870,32 @@ impl ThreadPoolState {
         drop(tasks);
         self.on_change.notify();
         Ok(result)
+    }
+
+    /// Moves already-owned wrappers under the same lock as stop. Queue growth
+    /// remains explicit: reserve at most the caller's fixed portion width before
+    /// moving anything, so a reservation panic cannot expose a partial portion.
+    fn try_push_prepared_range<const N: usize>(
+        &self,
+        prepared: [Option<PreparedOwnedTask>; N],
+    ) -> Result<(), [Option<PreparedOwnedTask>; N]> {
+        let count = prepared.iter().filter(|task| task.is_some()).count();
+        if count == 0 {
+            return Ok(());
+        }
+        let mut tasks = self.tasks.lock();
+        if self.should_stop.load(Ordering::Relaxed) {
+            return Err(prepared);
+        }
+        tasks.reserve(count);
+        // The reserved capacity makes these moves infallible. No constructor,
+        // result-handle release or capture destructor runs inside this lock.
+        for task in prepared.into_iter().flatten() {
+            tasks.push_back(task.0);
+        }
+        drop(tasks);
+        self.on_change.notify();
+        Ok(())
     }
 
     fn request_stop(&self) {

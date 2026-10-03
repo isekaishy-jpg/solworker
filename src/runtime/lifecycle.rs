@@ -189,6 +189,7 @@ struct ControlState {
 /// Lanes retain admission state, but cannot keep an idle executor alive.
 pub(crate) struct RuntimeControl {
     id: u64,
+    enabled_classes: [bool; 3],
     state: Mutex<ControlState>,
     owned: OnceLock<Weak<OwnedScheduler>>,
     physical: Arc<crate::external::PhysicalRegistry>,
@@ -262,6 +263,7 @@ impl RuntimeControl {
         backend: &Arc<BackendOwner>,
         physical: Arc<crate::external::PhysicalRegistry>,
         limits: Option<crate::notification::SWNotifyLimits>,
+        enabled_classes: [bool; 3],
     ) -> Self {
         static NEXT_ID: AtomicU64 = AtomicU64::new(1);
         // IDs have no publication role; the mutex publishes runtime state.
@@ -277,6 +279,7 @@ impl RuntimeControl {
         }
         Self {
             id,
+            enabled_classes,
             state: Mutex::new(ControlState {
                 phase: SWRuntimeState::Running,
                 active: 0,
@@ -557,6 +560,19 @@ impl RuntimeControl {
         }
     }
 
+    /// Reject disabled lane work before reserving payload, group, delivery or
+    /// discovery ownership. Runtime-owned external producers remain independent.
+    pub(crate) fn owned_scheduler_for(
+        &self,
+        class: SWExecutionClass,
+    ) -> Result<Arc<OwnedScheduler>, SWSpawnError> {
+        let scheduler = self.owned_scheduler()?;
+        if !self.enabled_classes[class.index()] {
+            return Err(SWSpawnError::ClassDisabled(class));
+        }
+        Ok(scheduler)
+    }
+
     /// Commit a root or an accounted execution descendant against runtime
     /// closure. This token retains bookkeeping, never the backend queues.
     pub(crate) fn admit_owned(
@@ -642,6 +658,9 @@ impl RuntimeControl {
         self: &Arc<Self>,
         class: SWExecutionClass,
     ) -> Result<ExecutionLease, SWExecutionError> {
+        if !self.enabled_classes[class.index()] {
+            return Err(SWExecutionError::ClassDisabled(class));
+        }
         let mut state = self.lock();
         if !matches!(
             state.phase,
@@ -672,6 +691,9 @@ impl RuntimeControl {
     ) -> Result<ExecutionLease, SWExecutionError> {
         if crate::notification::invocation_active() {
             return Err(SWExecutionError::InvalidContext);
+        }
+        if !self.enabled_classes[class.index()] {
+            return Err(SWExecutionError::ClassDisabled(class));
         }
         let nested = match current() {
             Some(context) if context.runtime == self.id && context.class == class => true,

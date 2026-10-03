@@ -32,8 +32,14 @@ Bulk admission has preparation overhead and publishes ready jobs in bursts.
 It can reduce producer CPU while increasing the time before unrelated small
 jobs in the same class begin. Keep single submission for isolated jobs unless
 measurement supports changing it, and check competing consumers before migrating
-an entire frame. A common prerequisite still releases individual dependents;
-batch admission does not batch that later fan-out or guarantee lower wake cost.
+an entire frame. Singleton input uses a scalar admission path while preserving
+batch rejection and ownership rules. Portions with exactly one common
+prerequisite share registration and release coordination; multiple-prerequisite
+fan-out keeps the per-member path. Backend publication coalesces its queue
+notification only when several wrappers can be handed off together. These are
+internal operation reductions, not a guarantee of fewer total wakes: result,
+group and host notifications still have their existing contracts. Keep measuring
+total CPU, settlement and unrelated consumer latency alongside admission.
 
 Exact-group helping uses an ordered membership index. Finding the next member
 and removing a completed member each take logarithmic lookup work; an

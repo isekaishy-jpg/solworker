@@ -151,6 +151,8 @@ impl std::error::Error for SWOwnedConfigError {}
 /// Why an owned job could not be admitted. Rejected inputs remain with caller.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SWSpawnError {
+    /// This execution class has no workers. Rejected inputs remain uninvoked.
+    ClassDisabled(SWExecutionClass),
     Full,
     TooLarge,
     Closed,

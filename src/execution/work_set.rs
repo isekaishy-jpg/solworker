@@ -54,7 +54,7 @@ where
         operation,
         options,
     };
-    let scheduler = match lane.control.owned_scheduler() {
+    let scheduler = match lane.control.owned_scheduler_for(lane.class) {
         Ok(scheduler) => scheduler,
         Err(reason) => return Err(reject(reason, operation)),
     };

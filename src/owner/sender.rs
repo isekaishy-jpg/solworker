@@ -114,7 +114,8 @@ impl<O> SWOwnerSender<O> {
                 return Err(SWOwnerRejected {
                     reason: match error {
                         crate::execution::SWExecutionError::Closed => SWOwnerError::Closed,
-                        crate::execution::SWExecutionError::InvalidContext => {
+                        crate::execution::SWExecutionError::InvalidContext
+                        | crate::execution::SWExecutionError::ClassDisabled(_) => {
                             SWOwnerError::InvalidContext
                         }
                     },

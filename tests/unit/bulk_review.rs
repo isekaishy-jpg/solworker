@@ -242,6 +242,7 @@ fn provisional_rollback_refunds_accounting_before_the_final_runtime_wake() {
             stage: Stage::Waiting,
             eligibility: crate::scheduler::SWCallerEligibility::WorkerOnly,
             subscriptions: Vec::new(),
+            prerequisite_range: None,
             attaching: true,
             deferred_finish: None,
             admission,

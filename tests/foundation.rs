@@ -65,24 +65,8 @@ thread_local! {
 #[test]
 fn worker_config_validates_class_routes_and_budget_ceiling() {
     let one = SWWorkerConfig::new(1);
-    let zero = SWWorkerConfig::new(0);
     let cases = [
         (0, [one, one, one], SWConfigError::ZeroBudget),
-        (
-            3,
-            [zero, one, one],
-            SWConfigError::ZeroWorkers(SWExecutionClass::Low),
-        ),
-        (
-            3,
-            [one, zero, one],
-            SWConfigError::ZeroWorkers(SWExecutionClass::Mid),
-        ),
-        (
-            3,
-            [one, one, zero],
-            SWConfigError::ZeroWorkers(SWExecutionClass::High),
-        ),
         (
             3,
             [SWWorkerConfig::new(2), one, one],

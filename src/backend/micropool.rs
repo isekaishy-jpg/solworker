@@ -4,6 +4,8 @@ use std::thread::JoinHandle;
 
 use micropool::{ThreadPool, ThreadPoolBuilder};
 
+pub(crate) use micropool::PreparedOwnedTask;
+
 /// One independently owned worker pool. The runtime controls admission and
 /// establishes global quiescence before invoking the joining terminal path.
 pub(crate) struct MicropoolBackend {
@@ -22,6 +24,21 @@ impl MicropoolBackend {
             // and does not expose micropool's eager-helping task handle.
             drop(task);
         })
+    }
+
+    /// Prepares a wrapper outside backend queue and scheduler bookkeeping locks.
+    /// Its capture already owns the physical handoff credit before publication.
+    pub(crate) fn prepare_owned(&self, f: impl FnOnce() + Send + 'static) -> PreparedOwnedTask {
+        self.pool.prepare_owned(f)
+    }
+
+    /// Publishes a bounded portion of independent wrappers, or returns the
+    /// entire portion when stop won. Dispose refused wrappers outside guards.
+    pub(crate) fn try_spawn_prepared_range<const N: usize>(
+        &self,
+        tasks: [Option<PreparedOwnedTask>; N],
+    ) -> Result<(), [Option<PreparedOwnedTask>; N]> {
+        self.pool.try_spawn_prepared_range(tasks)
     }
 
     /// Builds workers through a launcher supplied by the runtime. A launcher

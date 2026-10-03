@@ -11,14 +11,14 @@ use std::time::{Duration, Instant};
 const DEADLINE: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Point {
+pub(crate) enum Point {
     AfterIncrement,
     BeforeWait(usize),
 }
 
 type Callback = dyn Fn(Point, u64) + Send + Sync;
 
-pub(super) struct Hook {
+pub(crate) struct Hook {
     callback: Mutex<Option<Arc<Callback>>>,
 }
 
@@ -41,7 +41,7 @@ impl Hook {
         }
     }
 
-    fn set(&self, callback: impl Fn(Point, u64) + Send + Sync + 'static) {
+    pub(crate) fn set(&self, callback: impl Fn(Point, u64) + Send + Sync + 'static) {
         *self.callback.lock().unwrap() = Some(Arc::new(callback));
     }
 

@@ -78,7 +78,7 @@ impl SWLane {
         if operations.is_empty() {
             return Ok(Vec::new());
         }
-        let scheduler = match self.control.owned_scheduler() {
+        let scheduler = match self.control.owned_scheduler_for(self.class) {
             Ok(scheduler) => scheduler,
             Err(reason) => {
                 return Err(SWBatchSpawnRejected {
@@ -102,7 +102,9 @@ impl SWLane {
     /// Creates an open retained group in this lane. Seal it before waiting for
     /// completion; dropping an observer never cancels its accepted members.
     pub fn group(&self) -> Result<SWGroup, SWSpawnError> {
-        self.control.owned_scheduler()?.group(self.class)
+        self.control
+            .owned_scheduler_for(self.class)?
+            .group(self.class)
     }
 
     /// Admits a job without waiting for capacity or executing it on this caller.
@@ -426,7 +428,7 @@ impl SWLane {
         P: Send + 'static,
         T: Send + 'static,
     {
-        let scheduler = match self.control.owned_scheduler() {
+        let scheduler = match self.control.owned_scheduler_for(self.class) {
             Ok(scheduler) => scheduler,
             Err(reason) => {
                 return Err(SWSpawnRejected {

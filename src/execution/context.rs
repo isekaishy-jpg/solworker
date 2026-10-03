@@ -10,6 +10,8 @@ use crate::runtime::config::SWExecutionClass;
 /// the submitted closures.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SWExecutionError {
+    /// This class was configured with zero workers. No closure was invoked.
+    ClassDisabled(SWExecutionClass),
     /// The runtime has closed admission for new root invocations.
     Closed,
     /// This thread is participating in another lane/runtime, or would wait on

@@ -4,6 +4,25 @@ use takecell::TakeOwnCell;
 
 use crate::ThreadPoolState;
 
+/// An independently owned callable prepared for checked range publication.
+/// This internal integration type exposes no eager execution or result handle.
+#[doc(hidden)]
+pub struct PreparedOwnedTask(
+    /// Erased callable storage; only the queue can execute it after publication.
+    pub(crate) Arc<dyn TaskInner + Sync>,
+);
+
+impl PreparedOwnedTask {
+    /// Allocates the callable before entering the pool's queue critical section.
+    pub(crate) fn new(pool: &Arc<ThreadPoolState>, f: impl FnOnce() + Send + 'static) -> Self {
+        Self(Arc::new(TypedTaskInner {
+            func: TakeOwnCell::new(Box::new(f)),
+            pool: Arc::downgrade(pool),
+            result: spin::Once::new(),
+        }))
+    }
+}
+
 /// A task whose result is exclusively owned by the caller.
 pub struct OwnedTask<T: 'static + Send>(Arc<TypedTaskInner<TakeOwnCell<T>>>);
 

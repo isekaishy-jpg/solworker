@@ -4,7 +4,8 @@ use super::{
     Accounting, AccountingLease, Activation, CompletionSink, Decision, Envelope, Finish,
     JobEnvelope, JobHandle, OwnedScheduler, Record, SWBatchSpawnOptions, SWBatchSpawnRejected,
     SWBatchSpawnResult, SWCost, SWDependencyPolicy, SWProducerControl, SWSpawnError, SWTask,
-    SWTaskStatus, Stage, enqueue_activation, finish_payload, map_reservation_error,
+    SWTaskStatus, Stage, SubmitExtras, SubmitRequest, enqueue_activation, finish_payload,
+    map_reservation_error,
 };
 use crate::runtime::{RuntimeControl, config::SWExecutionClass};
 use std::collections::VecDeque;
@@ -15,6 +16,10 @@ pub(super) const QUANTUM: usize = 64;
 #[cfg(test)]
 #[path = "../../tests/unit/bulk_review.rs"]
 mod review_tests;
+
+#[cfg(test)]
+#[path = "../../tests/unit/batch_singleton.rs"]
+mod singleton_tests;
 
 // This concrete allocation remains recoverable until class commitment. Coercing
 // its Box to JobEnvelope after validation neither allocates nor captures a lock.
@@ -138,7 +143,7 @@ impl OwnedScheduler {
         control: &Arc<RuntimeControl>,
         class: SWExecutionClass,
         options: SWBatchSpawnOptions<'a>,
-        operations: Vec<P>,
+        mut operations: Vec<P>,
         run: fn(P) -> T,
         application_failed: fn(&T) -> bool,
     ) -> SWBatchSpawnResult<'a, T, P> {
@@ -169,6 +174,38 @@ impl OwnedScheduler {
         if options.prerequisites.len() > self.limits.edges {
             return Err(reject(SWSpawnError::TooLarge, Vec::new(), operations));
         }
+        if operations.len() == 1 {
+            let notification = self.wake.notification_scope();
+            let operation = operations.pop().expect("singleton input exists");
+            let result = self.submit_payload_accounted(
+                SubmitRequest {
+                    control,
+                    class,
+                    group: options.group,
+                    options: options.spawn,
+                    prerequisites: options.prerequisites,
+                    policy: options.dependency_policy,
+                    allow_inline: false,
+                },
+                operation,
+                run,
+                application_failed,
+                &mut None,
+                SubmitExtras {
+                    batch_member: true,
+                    ..SubmitExtras::default()
+                },
+            );
+            let result = match result {
+                Ok(receipt) => Ok(vec![receipt]),
+                Err(rejected) => {
+                    operations.push(rejected.operation);
+                    Err(reject(rejected.reason, Vec::new(), operations))
+                }
+            };
+            drop(notification);
+            return result;
+        }
         let mut remaining: VecDeque<P> = operations.into();
         let mut accepted = Vec::with_capacity(remaining.len());
         while !remaining.is_empty() {
@@ -186,6 +223,9 @@ impl OwnedScheduler {
                             crate::execution::SWExecutionError::Closed => SWSpawnError::Closed,
                             crate::execution::SWExecutionError::InvalidContext => {
                                 SWSpawnError::InvalidContext
+                            }
+                            crate::execution::SWExecutionError::ClassDisabled(class) => {
+                                SWSpawnError::ClassDisabled(class)
                             }
                         },
                         accepted,
@@ -241,11 +281,19 @@ impl OwnedScheduler {
                 .collect();
             let jobs = self.jobs.prepare_many(&ids, Arc::downgrade(self));
             let signals = self.signals.acquire_many(count);
+            let range_release = count >= 2 && options.prerequisites.len() == 1;
             let subscriptions = self
                 .subscriptions
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
-                .acquire_many(count, options.prerequisites.len());
+                .acquire_many(
+                    count,
+                    if range_release {
+                        0
+                    } else {
+                        options.prerequisites.len()
+                    },
+                );
             let group = options.group.map(|group| Arc::clone(&group.inner));
             let mut prepared = Vec::with_capacity(count);
             for ((((job, signal), subscriptions), admission), (capacity, charge)) in jobs
@@ -284,6 +332,7 @@ impl OwnedScheduler {
                         stage: Stage::Waiting,
                         eligibility: options.spawn.eligibility,
                         subscriptions,
+                        prerequisite_range: None,
                         attaching: true,
                         deferred_finish: None,
                         admission,
@@ -376,6 +425,24 @@ impl OwnedScheduler {
                 }
                 self.demand_pending.store(true, Ordering::Release);
             }
+            let range = range_release
+                .then(|| super::prerequisite_range::PrerequisiteRange::new(self, &portion));
+            if let Some(range) = &range {
+                for (slot, job) in portion.iter().enumerate() {
+                    let token = range.member(slot);
+                    let unused = {
+                        let mut guard = job.record_lock();
+                        let record = guard.as_mut().expect("attachment retains accepted record");
+                        if record.stage == Stage::Finalizing {
+                            Some(token)
+                        } else {
+                            record.prerequisite_range = Some(token);
+                            None
+                        }
+                    };
+                    drop(unused);
+                }
+            }
             for job in &portion {
                 #[cfg(test)]
                 {
@@ -387,6 +454,9 @@ impl OwnedScheduler {
                     if let Some(hook) = hook {
                         hook(job.clone());
                     }
+                }
+                if range.is_some() {
+                    continue;
                 }
                 for prerequisite in options.prerequisites {
                     let weak = Arc::downgrade(self);
@@ -402,6 +472,9 @@ impl OwnedScheduler {
                         .subscriptions
                         .push(subscription);
                 }
+            }
+            if let Some(range) = &range {
+                range.subscribe(&options.prerequisites[0]);
             }
             self.publish_portion(class, &portion);
             self.dispatch_class(class);
@@ -422,7 +495,7 @@ impl OwnedScheduler {
         Ok(accepted)
     }
 
-    fn publish_portion(self: &Arc<Self>, class: SWExecutionClass, jobs: &[JobHandle]) {
+    pub(super) fn publish_portion(self: &Arc<Self>, class: SWExecutionClass, jobs: &[JobHandle]) {
         let mut finishes = Vec::with_capacity(jobs.len());
         let mut suppressed = Vec::with_capacity(jobs.len());
         let mut ready_group = None;
@@ -468,10 +541,18 @@ impl OwnedScheduler {
             group.notify_ready();
         }
         for (job, finish) in finishes {
-            self.finish_record(job, finish);
+            if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.finish_record(job, finish)
+            })) {
+                crate::cleanup::discard_panic(payload);
+            }
         }
         for (job, status) in suppressed {
-            self.suppress(job, status);
+            if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.suppress(job, status)
+            })) {
+                crate::cleanup::discard_panic(payload);
+            }
         }
     }
 }
