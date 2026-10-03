@@ -21,6 +21,27 @@ decode scratch or recording contexts is still a domain responsibility. Retained
 observers may prevent metadata reuse. Do not promise allocation-free execution
 merely because a batch object itself is reused.
 
+Use `try_spawn_batch` to pass an already formed owned wave through bounded bulk
+admission. Keep the useful operations and chunk widths fixed when comparing it
+with single submission. Measure admission CPU and consumer latency separately
+from GPU/frame cadence. Singleton input, shared-prerequisite release and small
+same-class work competing with a large wave need separate checks; fewer class
+acquisitions alone do not establish a useful speedup.
+
+Bulk admission has preparation overhead and publishes ready jobs in bursts.
+It can reduce producer CPU while increasing the time before unrelated small
+jobs in the same class begin. Keep single submission for isolated jobs unless
+measurement supports changing it, and check competing consumers before migrating
+an entire frame. A common prerequisite still releases individual dependents;
+batch admission does not batch that later fan-out or guarantee lower wake cost.
+
+Exact-group helping uses an ordered membership index. Finding the next member
+and removing a completed member each take logarithmic lookup work; an
+unsuccessful pass over a large waiting group can still take O(n log n) work.
+The membership lock is released before claiming or executing a job. Avoid
+treating a larger batch as free helping, and measure large retained groups at
+their actual consumer boundary.
+
 Launch independent work before serial preparation that does not depend on it.
 Admit downstream work behind completion tokens early where ownership allows.
 Keep caller helping selective and give helpers valid scratch. Avoid a large

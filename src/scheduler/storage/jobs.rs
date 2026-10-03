@@ -212,6 +212,30 @@ impl JobPool {
         self.acquire_slot(id, scheduler, None)
     }
 
+    pub(in crate::scheduler) fn prepare_many(
+        &self,
+        ids: &[u64],
+        scheduler: Weak<OwnedScheduler>,
+    ) -> Vec<JobHandle> {
+        let mut returned = Vec::with_capacity(ids.len());
+        {
+            let mut recycled = self
+                .recycled
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            for _ in ids {
+                let Some(job) = recycled.free.pop() else {
+                    break;
+                };
+                returned.push(job);
+            }
+        }
+        let mut returned = returned.into_iter();
+        ids.iter()
+            .map(|&id| self.prepare_slot(returned.next(), id, scheduler.clone(), None))
+            .collect()
+    }
+
     fn acquire_slot(
         &self,
         id: u64,
@@ -225,6 +249,16 @@ impl JobPool {
                 .free
                 .pop()
         };
+        self.prepare_slot(recycled, id, scheduler, envelope)
+    }
+
+    fn prepare_slot(
+        &self,
+        recycled: Option<Arc<Job>>,
+        id: u64,
+        scheduler: Weak<OwnedScheduler>,
+        envelope: Option<Envelope>,
+    ) -> JobHandle {
         let mut job = recycled.unwrap_or_else(|| {
             Arc::new(Job {
                 id: 0,

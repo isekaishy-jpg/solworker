@@ -39,6 +39,11 @@ impl<T> BufferPool<T> {
         Vec::with_capacity(1_usize << index)
     }
 
+    /// The scheduler holds the pool's enclosing mutex once for a portion.
+    pub(crate) fn acquire_many(&mut self, count: usize, minimum: usize) -> Vec<Vec<T>> {
+        (0..count).map(|_| self.acquire(minimum)).collect()
+    }
+
     pub(crate) fn release(&mut self, entry: Vec<T>) {
         assert!(
             entry.is_empty(),

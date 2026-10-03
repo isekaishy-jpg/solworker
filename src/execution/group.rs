@@ -1,5 +1,7 @@
 //! Retained, classed batches and exact-group helping.
 
+use std::collections::BTreeMap;
+use std::ops::Bound::{Excluded, Unbounded};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 
@@ -13,6 +15,10 @@ use crate::task::{SWCompletion, SWTaskStatus};
 #[path = "../../tests/unit/group.rs"]
 mod tests;
 
+#[cfg(test)]
+#[path = "../../tests/unit/group_membership.rs"]
+mod membership_tests;
+
 pub(crate) struct GroupInner {
     pub(crate) id: u64,
     pub(crate) class: SWExecutionClass,
@@ -21,7 +27,7 @@ pub(crate) struct GroupInner {
     completion: SWCompletion,
     public_handles: AtomicUsize,
     retirement: Weak<crate::scheduler::storage::GroupRetirement>,
-    members: Mutex<Vec<crate::scheduler::storage::JobWeak>>,
+    members: Mutex<BTreeMap<u64, crate::scheduler::storage::JobWeak>>,
 }
 
 struct GroupState {
@@ -54,7 +60,7 @@ impl GroupInner {
             completion: SWCompletion::pending(),
             public_handles: AtomicUsize::new(1),
             retirement: Weak::new(),
-            members: Mutex::new(Vec::new()),
+            members: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -104,13 +110,26 @@ impl GroupInner {
     }
 
     pub(crate) fn add(&self) -> bool {
+        self.add_many(1)
+    }
+
+    pub(crate) fn is_open(&self) -> bool {
+        !self
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .sealed
+    }
+
+    /// Sealing accepts the selected portion or rejects all of it at one cut.
+    pub(crate) fn add_many(&self, count: usize) -> bool {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         if state.sealed {
             return false;
         }
         state.pending = state
             .pending
-            .checked_add(1)
+            .checked_add(count)
             .expect("group member count exhausted");
         state.generation = state.generation.wrapping_add(1);
         self.changed.notify_all();
@@ -118,17 +137,34 @@ impl GroupInner {
     }
 
     pub(crate) fn register_member(&self, job: crate::scheduler::storage::JobWeak) {
-        self.members
+        let previous = self
+            .members
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .push(job);
+            .insert(job.id(), job);
+        debug_assert!(previous.is_none(), "group member identities are unique");
+    }
+
+    pub(crate) fn register_members(&self, jobs: Vec<crate::scheduler::storage::JobWeak>) {
+        let mut members = self
+            .members
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        for job in jobs {
+            let previous = members.insert(job.id(), job);
+            debug_assert!(previous.is_none(), "group member identities are unique");
+        }
     }
 
     pub(crate) fn retire_member(&self, id: u64) {
-        self.members
+        // Release the association after the membership guard; its recycler
+        // ownership never becomes a lock-held cleanup boundary.
+        let removed = self
+            .members
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .retain(|job| job.id() != id);
+            .remove(&id);
+        drop(removed);
     }
 
     pub(crate) fn member_after(&self, after: u64) -> Option<crate::scheduler::storage::JobHandle> {
@@ -136,17 +172,13 @@ impl GroupInner {
             .members
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        let mut after = after;
-        loop {
-            let job = members
-                .iter()
-                .filter(|job| job.id() > after)
-                .min_by_key(|job| job.id())?;
-            after = job.id();
-            if let Some(job) = job.upgrade() {
-                return Some(job);
-            }
-        }
+        // The cursor starts at its stable ID in logarithmic time. Expired weak
+        // associations are skipped in one ordered pass, never by rescanning
+        // the full live group for each next member. The returned control leaves
+        // this guard before the scheduler claims or invokes anything.
+        members
+            .range((Excluded(after), Unbounded))
+            .find_map(|(_, job)| job.upgrade())
     }
 
     pub(crate) fn finish(&self, status: Option<SWTaskStatus>) {

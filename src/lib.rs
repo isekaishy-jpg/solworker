@@ -61,10 +61,11 @@ pub use runtime::config::{
 };
 pub use runtime::{SWBuildError, SWRuntime, SWRuntimeBuilder, SWRuntimeState, SWShutdownError};
 pub use scheduler::{
-    SWByteLease, SWCallerEligibility, SWCapacityUsage, SWCost, SWDemand, SWDemandError,
-    SWDemandSnapshot, SWDependencyPolicy, SWDiscoveryError, SWDiscoveryPermit, SWLimitError,
-    SWLimits, SWOwnedConfigError, SWOwnedLimits, SWPriority, SWReservation, SWReservationError,
-    SWSpawnError, SWSpawnOptions, SWSpawnRejected, SWSpawnResult, SWWorkSet, SWWorkSetProgress,
+    SWBatchSpawnOptions, SWBatchSpawnRejected, SWBatchSpawnResult, SWByteLease,
+    SWCallerEligibility, SWCapacityUsage, SWCost, SWDemand, SWDemandError, SWDemandSnapshot,
+    SWDependencyPolicy, SWDiscoveryError, SWDiscoveryPermit, SWLimitError, SWLimits,
+    SWOwnedConfigError, SWOwnedLimits, SWPriority, SWReservation, SWReservationError, SWSpawnError,
+    SWSpawnOptions, SWSpawnRejected, SWSpawnResult, SWWorkSet, SWWorkSetProgress,
 };
 pub use task::{
     SWCompletion, SWOutcome, SWOutcomeRef, SWProducerControl, SWRetained, SWShared, SWTask,

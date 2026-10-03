@@ -2,7 +2,7 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use solworker::{
-    SWDependencyPolicy, SWExecutionClass, SWExternalOptions, SWOwnedLimits, SWPriority, SWRuntime,
+    SWBatchSpawnOptions, SWExecutionClass, SWExternalOptions, SWOwnedLimits, SWPriority, SWRuntime,
     SWRuntimeConfig, SWSpawnOptions, SWStageOptions, SWTaskStatus, SWWorkerConfig,
 };
 
@@ -262,14 +262,22 @@ fn settling_ordinary_dependency_releases_provider_demand_without_another_pump() 
             ..Default::default()
         })
         .unwrap();
-    let (ordinary, cancel) = lane
-        .try_spawn_after(
-            SWSpawnOptions::default(),
-            &[parent.completion()],
-            SWDependencyPolicy::SuccessOnly,
-            || panic!("cancelled dependency must not execute"),
+    let mut members = lane
+        .try_spawn_batch(
+            SWBatchSpawnOptions {
+                prerequisites: &[parent.completion()],
+                ..Default::default()
+            },
+            (0..2)
+                .map(|index| {
+                    move || {
+                        assert_ne!(index, 0, "cancelled dependency must not execute");
+                    }
+                })
+                .collect(),
         )
         .unwrap();
+    let (ordinary, cancel) = members.remove(0);
     let prerequisites = [ordinary.completion()];
     let (resource, _) = lane
         .try_spawn_stage(
@@ -314,5 +322,9 @@ fn settling_ordinary_dependency_releases_provider_demand_without_another_pump() 
     }
     assert_eq!(parent.status(), None);
     producer.complete(()).unwrap();
+    assert_eq!(
+        members[0].0.completion().wait_timeout(TIMEOUT).unwrap(),
+        Some(SWTaskStatus::Succeeded)
+    );
     runtime.shutdown().unwrap();
 }

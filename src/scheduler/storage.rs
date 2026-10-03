@@ -129,4 +129,31 @@ impl SignalPool {
             .reset();
         SignalLease::pooled(signal, Arc::downgrade(&self.retired))
     }
+
+    pub(crate) fn acquire_many(&self, count: usize) -> Vec<SignalLease> {
+        let mut recycled = Vec::with_capacity(count);
+        {
+            let mut entries = self
+                .retired
+                .entries
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            for _ in 0..count {
+                let Some(signal) = entries.pop() else {
+                    break;
+                };
+                recycled.push(signal);
+            }
+        }
+        let mut signals = Vec::with_capacity(count);
+        let mut recycled = recycled.into_iter();
+        for _ in 0..count {
+            let mut signal = recycled.next().unwrap_or_else(|| Arc::new(Signal::new()));
+            Arc::get_mut(&mut signal)
+                .expect("retired signal is exclusive")
+                .reset();
+            signals.push(SignalLease::pooled(signal, Arc::downgrade(&self.retired)));
+        }
+        signals
+    }
 }

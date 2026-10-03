@@ -583,6 +583,43 @@ impl RuntimeControl {
         })
     }
 
+    /// Linearizes one bounded portion against root closure. Every returned
+    /// token retires its own responsibility, independently of its siblings.
+    pub(crate) fn admit_owned_many(
+        self: &Arc<Self>,
+        accounted: bool,
+        count: usize,
+    ) -> Result<Vec<OwnedAdmission>, SWExecutionError> {
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        if crate::notification::invocation_active() {
+            return Err(SWExecutionError::InvalidContext);
+        }
+        // Allocate before the closure cut. The caller limits this to the
+        // current portion, never the entire uncommitted input suffix.
+        let mut admissions = Vec::with_capacity(count);
+        let descendant = current().is_some_and(|context| context.runtime == self.id);
+        let mut state = self.lock();
+        if state.phase != SWRuntimeState::Running
+            && !(state.phase == SWRuntimeState::Closing && (descendant || accounted))
+        {
+            return Err(SWExecutionError::Closed);
+        }
+        state.active = state
+            .active
+            .checked_add(count)
+            .expect("owned admission count overflow");
+        for _ in 0..count {
+            admissions.push(OwnedAdmission {
+                control: Arc::clone(self),
+            });
+        }
+        state.mark_progress();
+        drop(state);
+        Ok(admissions)
+    }
+
     /// Temporary backend ownership for an accepted handoff or execution.
     /// Ready successors remain dispatchable during graceful closure. The
     /// scheduler must acquire this before claiming user work, not retain it

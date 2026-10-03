@@ -6,6 +6,7 @@
 //! User code, destructors, provider hooks, and backend calls run outside locks.
 
 mod admission;
+mod bulk;
 mod demand;
 mod ready;
 pub(crate) mod reservation;
@@ -31,8 +32,9 @@ use crate::task::{
 };
 
 pub use admission::{
-    SWCallerEligibility, SWDependencyPolicy, SWOwnedConfigError, SWOwnedLimits, SWSpawnError,
-    SWSpawnOptions, SWSpawnRejected, SWSpawnResult,
+    SWBatchSpawnOptions, SWBatchSpawnRejected, SWBatchSpawnResult, SWCallerEligibility,
+    SWDependencyPolicy, SWOwnedConfigError, SWOwnedLimits, SWSpawnError, SWSpawnOptions,
+    SWSpawnRejected, SWSpawnResult,
 };
 use demand::DemandState;
 pub use demand::{SWDemand, SWDemandError, SWDemandSnapshot, SWPriority};
@@ -58,10 +60,23 @@ pub(crate) struct SubmitExtras {
 }
 
 type Finish = Box<dyn FnOnce() + Send>;
-type Envelope = Box<dyn FnOnce(Decision) -> Finish + Send>;
+type Envelope = Box<dyn JobEnvelope>;
+
+trait JobEnvelope: Send {
+    fn settle(self: Box<Self>, decision: Decision) -> Finish;
+}
+
+impl<F: FnOnce(Decision) -> Finish + Send> JobEnvelope for F {
+    fn settle(self: Box<Self>, decision: Decision) -> Finish {
+        self(decision)
+    }
+}
 
 #[cfg(test)]
 type AttachmentHook = Arc<dyn Fn(JobHandle) + Send + Sync>;
+
+#[cfg(test)]
+type CountHook = Arc<dyn Fn(usize) + Send + Sync>;
 
 #[cfg(test)]
 #[path = "../tests/unit/scheduler_domains.rs"]
@@ -153,6 +168,22 @@ impl Drop for Handoff {
     }
 }
 
+/// Owns physical slots selected but not yet transferred into backend wrappers.
+/// Failure returns every unoffered slot once, independently of logical jobs.
+struct ReservedHandoffs<'a> {
+    scheduler: &'a OwnedScheduler,
+    class: SWExecutionClass,
+    remaining: usize,
+}
+
+impl Drop for ReservedHandoffs<'_> {
+    fn drop(&mut self) {
+        if self.remaining != 0 {
+            self.scheduler.class_lock(self.class).ready.handed_off -= self.remaining;
+        }
+    }
+}
+
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum Stage {
     Waiting,
@@ -178,6 +209,7 @@ struct Record {
     work_set: Option<WorkSetLease>,
     capacity: Option<SWReservation>,
     resource: bool,
+    runnable_reserved: bool,
     selection: Option<demand::DemandSelection>,
     charge: AccountingLease,
 }
@@ -263,6 +295,7 @@ struct ClassState {
     records: HashMap<u64, JobHandle>,
     ready: ReadyQueue,
     deferred: VecDeque<u64>,
+    attaching_runnable: usize,
 }
 
 struct DemandDomain {
@@ -429,6 +462,10 @@ pub(crate) struct OwnedScheduler {
     wake: Arc<crate::progress::SWWake>,
     #[cfg(test)]
     attachment_hook: Mutex<Option<AttachmentHook>>,
+    #[cfg(test)]
+    batch_portion_hook: Mutex<Option<CountHook>>,
+    #[cfg(test)]
+    handoff_hook: Mutex<Option<CountHook>>,
 }
 
 impl OwnedScheduler {
@@ -509,6 +546,7 @@ impl OwnedScheduler {
                     records: HashMap::new(),
                     ready: ReadyQueue::with_priorities(&priorities),
                     deferred: VecDeque::new(),
+                    attaching_runnable: 0,
                 })
             }),
             external: Mutex::new(HashMap::new()),
@@ -536,6 +574,10 @@ impl OwnedScheduler {
             groups: GroupPool::new(limits.records),
             #[cfg(test)]
             attachment_hook: Mutex::new(None),
+            #[cfg(test)]
+            batch_portion_hook: Mutex::new(None),
+            #[cfg(test)]
+            handoff_hook: Mutex::new(None),
         })
     }
 
@@ -594,7 +636,8 @@ impl OwnedScheduler {
                 .unwrap_or_else(|e| e.into_inner());
             let index = class.index();
             snapshot.handoff_wrappers[index] = state.ready.handed_off;
-            snapshot.runnable_full[index] = state.ready.runnable >= self.limits.runnable[index];
+            snapshot.runnable_full[index] =
+                state.ready.runnable + state.attaching_runnable >= self.limits.runnable[index];
             snapshot.handoff_full[index] = state.ready.handed_off >= self.limits.handoff[index];
             for job in state.records.values() {
                 if let Some(record) = job.record_lock().as_ref() {
@@ -1169,8 +1212,8 @@ impl OwnedScheduler {
         } else {
             None
         };
-        let saturated =
-            prerequisites.is_empty() && state.ready.runnable >= self.limits.runnable_for(class);
+        let saturated = prerequisites.is_empty()
+            && state.ready.runnable + state.attaching_runnable >= self.limits.runnable_for(class);
         let inline =
             saturated && allow_inline && options.eligibility == SWCallerEligibility::CallerEligible;
         let reason = if inline
@@ -1247,6 +1290,7 @@ impl OwnedScheduler {
                 work_set: extras.work_set,
                 capacity: extras.capacity,
                 resource: priority.is_some(),
+                runnable_reserved: false,
                 selection: None,
                 charge,
             },
@@ -1372,6 +1416,10 @@ impl OwnedScheduler {
             }
             record.pending -= 1;
             record.failed |= !status.is_success();
+            // Attachment closure owns activation until every subscription is installed.
+            if record.attaching {
+                return;
+            }
         }
         self.activate_ready(job, false);
         self.dispatch_class(job.class());
@@ -1392,7 +1440,9 @@ impl OwnedScheduler {
                 (Some(SWTaskStatus::Abandoned), None)
             } else if record.failed && record.policy == SWDependencyPolicy::SuccessOnly {
                 (Some(SWTaskStatus::PrerequisiteFailed), None)
-            } else if inline || state.ready.runnable < self.limits.runnable_for(class) {
+            } else if inline
+                || state.ready.runnable + state.attaching_runnable < self.limits.runnable_for(class)
+            {
                 record.stage = Stage::Ready;
                 self.push_ready(&mut state, job, record);
                 (None, record.group.clone())
@@ -1533,7 +1583,7 @@ impl OwnedScheduler {
             pending.append(&mut state.deferred);
             state.deferred = pending;
         }
-        while state.ready.runnable < self.limits.runnable_for(class) {
+        while state.ready.runnable + state.attaching_runnable < self.limits.runnable_for(class) {
             let ordinary = state.deferred.iter().enumerate().find_map(|(index, id)| {
                 let record = state.records.get(id)?.record_lock();
                 (!record.as_ref()?.resource).then_some((index, *id))
@@ -1619,7 +1669,7 @@ impl OwnedScheduler {
             job.id(),
             0,
         );
-        let finish = match catch_unwind(AssertUnwindSafe(|| envelope(decision))) {
+        let finish = match catch_unwind(AssertUnwindSafe(|| envelope.settle(decision))) {
             Ok(finish) => finish,
             Err(payload) => {
                 crate::cleanup::discard_panic(payload);
@@ -1773,58 +1823,92 @@ impl OwnedScheduler {
             return;
         };
         loop {
-            let (job, promoted) = {
+            let mut jobs: [Option<JobHandle>; bulk::QUANTUM] = std::array::from_fn(|_| None);
+            let mut selected = 0;
+            let promoted = {
                 let mut state = self.class_lock(class);
                 if self.abandoned.load(Ordering::Acquire) {
                     break;
                 }
                 let promoted = self.promote_locked(&mut state, class);
-                if state.ready.handed_off >= self.limits.handoff_for(class) {
-                    drop(state);
-                    for group in promoted {
-                        group.notify_ready();
+                let available = bulk::QUANTUM.min(
+                    self.limits
+                        .handoff_for(class)
+                        .saturating_sub(state.ready.handed_off),
+                );
+                for _ in 0..available {
+                    let Some(id) = state.ready.pop() else {
+                        break;
+                    };
+                    let job = state
+                        .records
+                        .get(&id)
+                        .expect("ready record remains indexed");
+                    {
+                        let mut record = job.record_lock();
+                        let record = record.as_mut().expect("ready record is live");
+                        debug_assert!(record.stage == Stage::Ready);
+                        record.stage = Stage::Handed;
                     }
-                    break;
+                    #[cfg(feature = "diagnostics")]
+                    self.trace("job.handed", id, job.group_id().unwrap_or(0));
+                    jobs[selected] = Some(job.clone());
+                    selected += 1;
+                    state.ready.handed_off += 1;
                 }
-                let Some(id) = state.ready.pop() else {
-                    drop(state);
-                    for group in promoted {
-                        group.notify_ready();
-                    }
-                    break;
-                };
-                let job = state
-                    .records
-                    .get(&id)
-                    .expect("ready record remains indexed");
-                {
-                    let mut record = job.record_lock();
-                    let record = record.as_mut().expect("ready record is live");
-                    debug_assert!(record.stage == Stage::Ready);
-                    record.stage = Stage::Handed;
-                }
-                #[cfg(feature = "diagnostics")]
-                self.trace("job.handed", id, job.group_id().unwrap_or(0));
-                let job = job.clone();
-                state.ready.handed_off += 1;
-                (job, promoted)
+                promoted
             };
             for group in promoted {
                 group.notify_ready();
             }
-            let handoff = Handoff {
-                scheduler: Arc::downgrade(self),
+            if selected == 0 {
+                break;
+            }
+            let mut reserved = ReservedHandoffs {
+                scheduler: self,
                 class,
-                completed: false,
+                remaining: selected,
             };
             let Ok(lease) = control.acquire_handoff(class) else {
-                drop(handoff);
+                drop(reserved);
+                drop(jobs);
                 self.abandon();
                 break;
             };
-            let offered = lease.pool().try_spawn_owned(move || handoff.run(job));
-            if let Err(wrapper) = offered {
-                drop(wrapper);
+            let mut rejected = false;
+            for (index, slot) in jobs.iter_mut().take(selected).enumerate() {
+                let job = slot.take().expect("selected handoff retains its control");
+                let handoff = Handoff {
+                    scheduler: Arc::downgrade(self),
+                    class,
+                    completed: false,
+                };
+                reserved.remaining -= 1;
+                if let Err(wrapper) = lease.pool().try_spawn_owned(move || handoff.run(job)) {
+                    drop(wrapper);
+                    rejected = true;
+                    break;
+                }
+                #[cfg(test)]
+                {
+                    let hook = self
+                        .handoff_hook
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .clone();
+                    if let Some(hook) = hook {
+                        hook(index + 1);
+                    }
+                }
+                #[cfg(not(test))]
+                let _ = index;
+            }
+            // Offers transfer slot ownership one at a time. Unoffered controls
+            // are suppressed by abandonment after their reserved slots return.
+            drop(reserved);
+            drop(lease);
+            drop(jobs);
+            if rejected {
                 self.abandon();
                 break;
             }
@@ -2041,33 +2125,43 @@ where
     P: Send + 'static,
     T: Send + 'static,
 {
-    Box::new(move |decision| {
-        let (outcome, failed) = match decision {
-            Decision::Run => match catch_unwind(AssertUnwindSafe(|| run(payload))) {
-                Ok(value) => {
-                    let failed = application_failed(&value);
-                    (SWOutcome::Success(value), failed)
-                }
-                Err(panic) => {
-                    crate::cleanup::discard_panic(panic);
-                    (SWOutcome::Panicked, false)
-                }
-            },
-            Decision::Suppress(status) => {
-                drop(payload);
-                (
-                    match status {
-                        SWTaskStatus::Cancelled => SWOutcome::Cancelled,
-                        SWTaskStatus::PrerequisiteFailed | SWTaskStatus::ApplicationFailed => {
-                            SWOutcome::PrerequisiteFailed
-                        }
-                        SWTaskStatus::Panicked => SWOutcome::Panicked,
-                        SWTaskStatus::Abandoned | SWTaskStatus::Succeeded => SWOutcome::Abandoned,
-                    },
-                    false,
-                )
-            }
-        };
-        Box::new(move || sink.finish(outcome, failed))
+    Box::new(move |decision| -> Finish {
+        finish_payload(payload, run, application_failed, sink, decision)
     })
+}
+
+fn finish_payload<P: Send + 'static, T: Send + 'static>(
+    payload: P,
+    run: fn(P) -> T,
+    application_failed: fn(&T) -> bool,
+    sink: CompletionSink<T>,
+    decision: Decision,
+) -> Finish {
+    let (outcome, failed) = match decision {
+        Decision::Run => match catch_unwind(AssertUnwindSafe(|| run(payload))) {
+            Ok(value) => {
+                let failed = application_failed(&value);
+                (SWOutcome::Success(value), failed)
+            }
+            Err(panic) => {
+                crate::cleanup::discard_panic(panic);
+                (SWOutcome::Panicked, false)
+            }
+        },
+        Decision::Suppress(status) => {
+            drop(payload);
+            (
+                match status {
+                    SWTaskStatus::Cancelled => SWOutcome::Cancelled,
+                    SWTaskStatus::PrerequisiteFailed | SWTaskStatus::ApplicationFailed => {
+                        SWOutcome::PrerequisiteFailed
+                    }
+                    SWTaskStatus::Panicked => SWOutcome::Panicked,
+                    SWTaskStatus::Abandoned | SWTaskStatus::Succeeded => SWOutcome::Abandoned,
+                },
+                false,
+            )
+        }
+    };
+    Box::new(move || sink.finish(outcome, failed))
 }

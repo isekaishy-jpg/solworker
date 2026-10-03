@@ -40,7 +40,6 @@ fn diagnostic_timeline_preserves_settlement_and_can_be_drained() {
         .unwrap();
     group.seal();
     group.wait_helping().unwrap();
-    assert!(route.changed_since(stamp).unwrap());
     let first_identity = match task.try_take() {
         Some(SWOutcome::Success((identity, value))) => {
             assert_eq!(value, 42);
@@ -49,6 +48,9 @@ fn diagnostic_timeline_preserves_settlement_and_can_be_drained() {
         other => panic!("unexpected first outcome: {other:?}"),
     };
     runtime.shutdown().unwrap();
+    // Completion visibility precedes notification publication. Joined shutdown
+    // also settles the publisher, so the route epoch is now safe to inspect.
+    assert!(route.changed_since(stamp).unwrap());
     let mut second =
         SWRuntime::builder(SWRuntimeConfig::new(3, [SWWorkerConfig::new(1); 3]).unwrap())
             .with_owned_limits(solworker::SWOwnedLimits::new(32, 32, [32; 3], [1; 3]).unwrap())

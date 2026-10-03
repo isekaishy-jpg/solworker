@@ -2,8 +2,9 @@
 
 use super::{SWGroup, SWLane};
 use crate::scheduler::{
-    SWDependencyPolicy, SWSpawnError, SWSpawnOptions, SWSpawnRejected, SWSpawnResult,
-    SubmitRequest, call_once, never_fail, result_is_err,
+    SWBatchSpawnOptions, SWBatchSpawnRejected, SWBatchSpawnResult, SWDependencyPolicy,
+    SWSpawnError, SWSpawnOptions, SWSpawnRejected, SWSpawnResult, SubmitRequest, call_once,
+    never_fail, result_is_err,
 };
 use crate::task::SWCompletion;
 
@@ -28,6 +29,76 @@ impl OwnedRoute<'_> {
 }
 
 impl SWLane {
+    /// Admits a finite owned wave in bounded portions, preserving input order.
+    /// Rejection returns accepted handles and every untouched suffix operation.
+    /// Workers may begin before return; this method never runs jobs inline as a
+    /// saturation fallback and never seals the supplied group. Empty input is a
+    /// no-op, including on closed or owned-disabled runtimes.
+    pub fn try_spawn_batch<'a, F, T>(
+        &self,
+        options: SWBatchSpawnOptions<'a>,
+        operations: Vec<F>,
+    ) -> SWBatchSpawnResult<'a, T, F>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        self.submit_batch(options, operations, call_once::<F, T>, never_fail::<T>)
+    }
+
+    /// Admits an owned wave with typed application failures. Returned `Err`
+    /// values mark failure for success-only dependents without losing the typed
+    /// result. Admission, suffix recovery and caller eligibility match
+    /// [`Self::try_spawn_batch`].
+    pub fn try_spawn_batch_fallible<'a, F, T, E>(
+        &self,
+        options: SWBatchSpawnOptions<'a>,
+        operations: Vec<F>,
+    ) -> SWBatchSpawnResult<'a, Result<T, E>, F>
+    where
+        F: FnOnce() -> Result<T, E> + Send + 'static,
+        T: Send + 'static,
+        E: Send + 'static,
+    {
+        self.submit_batch(
+            options,
+            operations,
+            call_once::<F, Result<T, E>>,
+            result_is_err::<T, E>,
+        )
+    }
+
+    fn submit_batch<'a, P: Send + 'static, T: Send + 'static>(
+        &self,
+        options: SWBatchSpawnOptions<'a>,
+        operations: Vec<P>,
+        run: fn(P) -> T,
+        application_failed: fn(&T) -> bool,
+    ) -> SWBatchSpawnResult<'a, T, P> {
+        if operations.is_empty() {
+            return Ok(Vec::new());
+        }
+        let scheduler = match self.control.owned_scheduler() {
+            Ok(scheduler) => scheduler,
+            Err(reason) => {
+                return Err(SWBatchSpawnRejected {
+                    reason,
+                    accepted: Vec::new(),
+                    remaining: operations,
+                    options,
+                });
+            }
+        };
+        scheduler.submit_batch(
+            &self.control,
+            self.class,
+            options,
+            operations,
+            run,
+            application_failed,
+        )
+    }
+
     /// Creates an open retained group in this lane. Seal it before waiting for
     /// completion; dropping an observer never cancels its accepted members.
     pub fn group(&self) -> Result<SWGroup, SWSpawnError> {

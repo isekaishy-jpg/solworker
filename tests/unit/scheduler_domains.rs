@@ -34,48 +34,64 @@ impl Drop for CountDrop {
 
 #[test]
 fn held_low_class_guard_does_not_block_high_claim_or_retirement() {
-    let mut runtime = runtime();
-    let high = runtime.lane(SWExecutionClass::High);
-    let seed = high.group().unwrap();
-    let scheduler = seed.scheduler.upgrade().unwrap();
-    seed.seal();
-    drop(seed);
-    let low_guard = scheduler.class_lock(SWExecutionClass::Low);
-    let retiring = Arc::clone(&scheduler);
-    let (done_send, done_recv) = mpsc::channel();
-    let executor = thread::spawn(move || {
-        let group = high.group().unwrap();
-        let (task, _) = high
-            .try_spawn_in(&group, SWSpawnOptions::default(), || 41usize)
-            .unwrap();
-        group.seal();
-        assert_eq!(
-            task.completion().wait_timeout(TIMEOUT).unwrap(),
-            Some(SWTaskStatus::Succeeded)
-        );
-        assert_eq!(
-            group.completion().wait_timeout(TIMEOUT).unwrap(),
-            Some(SWTaskStatus::Succeeded)
-        );
-        let deadline = Instant::now() + TIMEOUT;
-        loop {
-            let class = retiring.class_lock(SWExecutionClass::High);
-            let retired = class.records.is_empty() && class.ready.handed_off == 0;
-            drop(class);
-            if retired {
-                break;
+    for bulk in [false, true] {
+        let mut runtime = runtime();
+        let high = runtime.lane(SWExecutionClass::High);
+        let seed = high.group().unwrap();
+        let scheduler = seed.scheduler.upgrade().unwrap();
+        seed.seal();
+        drop(seed);
+        let low_guard = scheduler.class_lock(SWExecutionClass::Low);
+        let retiring = Arc::clone(&scheduler);
+        let (done_send, done_recv) = mpsc::channel();
+        let executor = thread::spawn(move || {
+            let group = high.group().unwrap();
+            let members = if bulk {
+                high.try_spawn_batch(
+                    SWBatchSpawnOptions {
+                        group: Some(&group),
+                        ..Default::default()
+                    },
+                    (0..8).map(|index| move || 41usize + index).collect(),
+                )
+                .unwrap()
+            } else {
+                vec![
+                    high.try_spawn_in(&group, SWSpawnOptions::default(), || 41usize)
+                        .unwrap(),
+                ]
+            };
+            group.seal();
+            for (task, _) in members {
+                assert_eq!(
+                    task.completion().wait_timeout(TIMEOUT).unwrap(),
+                    Some(SWTaskStatus::Succeeded)
+                );
             }
-            assert!(Instant::now() < deadline, "High wrapper did not retire");
-            thread::yield_now();
-        }
-        done_send.send(()).unwrap();
-    });
-    // Always release the actual Low guard before joining or reporting failure.
-    let isolated = done_recv.recv_timeout(TIMEOUT);
-    drop(low_guard);
-    executor.join().unwrap();
-    assert!(isolated.is_ok(), "High work waited for the held Low guard");
-    runtime.shutdown().unwrap();
+            assert_eq!(
+                group.completion().wait_timeout(TIMEOUT).unwrap(),
+                Some(SWTaskStatus::Succeeded)
+            );
+            let deadline = Instant::now() + TIMEOUT;
+            loop {
+                let class = retiring.class_lock(SWExecutionClass::High);
+                let retired = class.records.is_empty() && class.ready.handed_off == 0;
+                drop(class);
+                if retired {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "High wrapper did not retire");
+                thread::yield_now();
+            }
+            done_send.send(()).unwrap();
+        });
+        // Always release the actual Low guard before joining or reporting failure.
+        let isolated = done_recv.recv_timeout(TIMEOUT);
+        drop(low_guard);
+        executor.join().unwrap();
+        assert!(isolated.is_ok(), "High work waited for the held Low guard");
+        runtime.shutdown().unwrap();
+    }
 }
 
 #[test]
@@ -150,11 +166,18 @@ fn pending_low_demand_does_not_block_ordinary_high_claim_or_retirement() {
         let retiring = Arc::clone(&scheduler);
         let (done_send, done_recv) = mpsc::channel();
         let executor = thread::spawn(move || {
-            let (task, _) = high.try_spawn(SWSpawnOptions::default(), || ()).unwrap();
-            assert_eq!(
-                task.completion().wait_timeout(TIMEOUT).unwrap(),
-                Some(SWTaskStatus::Succeeded)
-            );
+            let members = high
+                .try_spawn_batch(
+                    SWBatchSpawnOptions::default(),
+                    (0..8).map(|_| || ()).collect(),
+                )
+                .unwrap();
+            for (task, _) in members {
+                assert_eq!(
+                    task.completion().wait_timeout(TIMEOUT).unwrap(),
+                    Some(SWTaskStatus::Succeeded)
+                );
+            }
             let deadline = Instant::now() + TIMEOUT;
             loop {
                 let class = retiring.class_lock(SWExecutionClass::High);
@@ -264,128 +287,353 @@ enum AttachmentExit {
 
 #[test]
 fn completion_and_suppression_during_attachment_settle_one_accepted_record() {
-    for exit in [
-        AttachmentExit::Success,
-        AttachmentExit::Failure,
-        AttachmentExit::Cancel,
-        AttachmentExit::Abandon,
-    ] {
-        let mut runtime = runtime();
-        let high = runtime.lane(SWExecutionClass::High);
-        let seed = high.group().unwrap();
-        let scheduler = seed.scheduler.upgrade().unwrap();
-        seed.seal();
-        drop(seed);
-        let (producer, predecessor, _) = runtime
-            .external::<()>(SWExternalOptions::default())
-            .unwrap();
-        let prerequisite = predecessor.completion();
-        let group = high.group().unwrap();
-        let group_submission = group.clone();
-        let drops = Arc::new(AtomicUsize::new(0));
-        let calls = Arc::new(AtomicUsize::new(0));
-        let capture = CountDrop(Arc::clone(&drops));
-        let invoked = Arc::clone(&calls);
-        let (attached_send, attached_recv) = mpsc::channel();
-        let (release_send, release_recv) = mpsc::channel();
-        let release = Release(release_send);
-        let release_recv = Mutex::new(release_recv);
-        *scheduler.attachment_hook.lock().unwrap() = Some(Arc::new(move |job| {
-            attached_send.send(job).unwrap();
-            release_recv.lock().unwrap().recv_timeout(TIMEOUT).unwrap();
-        }));
-        let submitter = thread::spawn(move || {
-            high.try_spawn_after_in(
-                &group_submission,
-                SWSpawnOptions::default(),
-                &[prerequisite],
-                SWDependencyPolicy::SuccessOnly,
-                move || {
-                    let _capture = capture;
-                    invoked.fetch_add(1, Ordering::SeqCst);
-                },
-            )
-        });
-        let attaching = attached_recv.recv_timeout(TIMEOUT);
-        let attaching_completion = attaching.as_ref().ok().and_then(|job| {
-            job.record_lock()
-                .as_ref()
-                .and_then(|record| record.completion.clone())
-        });
-        group.seal();
-        let mut expected = SWTaskStatus::Succeeded;
-        if let Ok(job) = attaching.as_ref() {
-            match exit {
-                AttachmentExit::Success => producer.complete(()).unwrap(),
-                AttachmentExit::Failure => {
-                    producer.cancel();
-                    expected = SWTaskStatus::PrerequisiteFailed;
+    for member_count in [1, 3] {
+        for exit in [
+            AttachmentExit::Success,
+            AttachmentExit::Failure,
+            AttachmentExit::Cancel,
+            AttachmentExit::Abandon,
+        ] {
+            let mut runtime = runtime();
+            let high = runtime.lane(SWExecutionClass::High);
+            let seed = high.group().unwrap();
+            let scheduler = seed.scheduler.upgrade().unwrap();
+            seed.seal();
+            drop(seed);
+            let (producer, predecessor, _) = runtime
+                .external::<()>(SWExternalOptions::default())
+                .unwrap();
+            let prerequisite = predecessor.completion();
+            let group = high.group().unwrap();
+            let group_submission = group.clone();
+            let drops = Arc::new(AtomicUsize::new(0));
+            let calls = Arc::new(AtomicUsize::new(0));
+            let mut operations: Vec<_> = (0..member_count)
+                .map(|_| {
+                    let capture = CountDrop(Arc::clone(&drops));
+                    let invoked = Arc::clone(&calls);
+                    move || {
+                        let _capture = capture;
+                        invoked.fetch_add(1, Ordering::SeqCst);
+                    }
+                })
+                .collect();
+            let (attached_send, attached_recv) = mpsc::channel();
+            let (release_send, release_recv) = mpsc::channel();
+            let release = Release(release_send);
+            let release_recv = Mutex::new(release_recv);
+            let first_attachment = std::sync::atomic::AtomicBool::new(true);
+            *scheduler.attachment_hook.lock().unwrap() = Some(Arc::new(move |job| {
+                if first_attachment.swap(false, Ordering::SeqCst) {
+                    attached_send.send(job).unwrap();
+                    release_recv.lock().unwrap().recv_timeout(TIMEOUT).unwrap();
                 }
-                AttachmentExit::Cancel => {
-                    scheduler.suppress(job, SWTaskStatus::Cancelled);
-                    expected = SWTaskStatus::Cancelled;
+            }));
+            let submitter = thread::spawn(move || {
+                if member_count == 1 {
+                    high.try_spawn_after_in(
+                        &group_submission,
+                        SWSpawnOptions::default(),
+                        &[prerequisite],
+                        SWDependencyPolicy::SuccessOnly,
+                        operations.pop().unwrap(),
+                    )
+                    .map(|pair| vec![pair])
+                    .map_err(|rejected| rejected.reason)
+                } else {
+                    high.try_spawn_batch(
+                        SWBatchSpawnOptions {
+                            group: Some(&group_submission),
+                            prerequisites: &[prerequisite],
+                            ..Default::default()
+                        },
+                        operations,
+                    )
+                    .map_err(|rejected| rejected.reason)
                 }
-                AttachmentExit::Abandon => {
-                    runtime.abandon();
-                    expected = SWTaskStatus::Abandoned;
+            });
+            let attaching = attached_recv.recv_timeout(TIMEOUT);
+            let attaching_completion = attaching.as_ref().ok().and_then(|job| {
+                job.record_lock()
+                    .as_ref()
+                    .and_then(|record| record.completion.clone())
+            });
+            group.seal();
+            let mut expected = SWTaskStatus::Succeeded;
+            if let Ok(job) = attaching.as_ref() {
+                match exit {
+                    AttachmentExit::Success => producer.complete(()).unwrap(),
+                    AttachmentExit::Failure => {
+                        producer.cancel();
+                        expected = SWTaskStatus::PrerequisiteFailed;
+                    }
+                    AttachmentExit::Cancel => {
+                        scheduler.suppress(job, SWTaskStatus::Cancelled);
+                        producer.complete(()).unwrap();
+                        expected = SWTaskStatus::Cancelled;
+                    }
+                    AttachmentExit::Abandon => {
+                        runtime.abandon();
+                        expected = SWTaskStatus::Abandoned;
+                    }
                 }
             }
-        }
-        let drops_while_attaching = drops.load(Ordering::SeqCst);
-        let group_while_attaching = group.completion().status();
-        let task_while_attaching = attaching_completion.as_ref().map(SWCompletion::status);
-        let retained_while_attaching = runtime.progress().active_leases;
-        // Release and join even when the acceptance hook was never reached.
-        drop(release);
-        let submitted = submitter.join().unwrap();
-        *scheduler.attachment_hook.lock().unwrap() = None;
-        assert!(
-            attaching.is_ok(),
-            "attachment hook was not reached: {exit:?}"
-        );
-        assert!(drops_while_attaching <= 1, "{exit:?}");
-        assert_eq!(group_while_attaching, None, "{exit:?}");
-        assert_eq!(task_while_attaching, Some(None), "{exit:?}");
-        assert!(retained_while_attaching > 0, "{exit:?}");
-        drop(attaching);
-        let (task, _) = submitted.unwrap();
-        assert_eq!(
-            task.completion().wait_timeout(TIMEOUT).unwrap(),
-            Some(expected),
-            "{exit:?}"
-        );
-        assert_eq!(
-            group.completion().wait_timeout(TIMEOUT).unwrap(),
-            Some(if matches!(exit, AttachmentExit::Success) {
-                SWTaskStatus::Succeeded
-            } else {
-                SWTaskStatus::PrerequisiteFailed
-            }),
-            "{exit:?}"
-        );
-        assert_eq!(drops.load(Ordering::SeqCst), 1, "{exit:?}");
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            usize::from(matches!(exit, AttachmentExit::Success)),
-            "{exit:?}"
-        );
-        if matches!(exit, AttachmentExit::Cancel) {
-            producer.complete(()).unwrap();
-        }
-        let deadline = Instant::now() + TIMEOUT;
-        loop {
-            let progress = runtime.progress();
-            if progress.active_leases == 0 && progress.scheduler.handoff_wrappers == [0; 3] {
-                break;
-            }
+            let drops_while_attaching = drops.load(Ordering::SeqCst);
+            let group_while_attaching = group.completion().status();
+            let task_while_attaching = attaching_completion.as_ref().map(SWCompletion::status);
+            let retained_while_attaching = runtime.progress().active_leases;
+            // Release and join even when the acceptance hook was never reached.
+            drop(release);
+            let submitted = submitter.join().unwrap();
+            *scheduler.attachment_hook.lock().unwrap() = None;
             assert!(
-                Instant::now() < deadline,
-                "attachment did not retire: {exit:?}: {progress:?}"
+                attaching.is_ok(),
+                "attachment hook was not reached: {exit:?}"
             );
-            progress.wait_for_change(deadline).unwrap();
-        }
-        if !matches!(exit, AttachmentExit::Abandon) {
-            runtime.shutdown().unwrap();
+            assert!(drops_while_attaching <= member_count, "{exit:?}");
+            assert_eq!(group_while_attaching, None, "{exit:?}");
+            assert_eq!(task_while_attaching, Some(None), "{exit:?}");
+            assert!(retained_while_attaching >= member_count, "{exit:?}");
+            drop(attaching);
+            let members = submitted.unwrap();
+            assert_eq!(members.len(), member_count);
+            for (index, (task, _)) in members.into_iter().enumerate() {
+                let expected = if matches!(exit, AttachmentExit::Cancel) && index > 0 {
+                    SWTaskStatus::Succeeded
+                } else {
+                    expected
+                };
+                assert_eq!(
+                    task.completion().wait_timeout(TIMEOUT).unwrap(),
+                    Some(expected),
+                    "{member_count}: {exit:?}: {index}"
+                );
+            }
+            assert_eq!(
+                group.completion().wait_timeout(TIMEOUT).unwrap(),
+                Some(if matches!(exit, AttachmentExit::Success) {
+                    SWTaskStatus::Succeeded
+                } else {
+                    SWTaskStatus::PrerequisiteFailed
+                }),
+                "{exit:?}"
+            );
+            assert_eq!(drops.load(Ordering::SeqCst), member_count, "{exit:?}");
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                if matches!(exit, AttachmentExit::Success) {
+                    member_count
+                } else if matches!(exit, AttachmentExit::Cancel) {
+                    member_count - 1
+                } else {
+                    0
+                },
+                "{exit:?}"
+            );
+            let deadline = Instant::now() + TIMEOUT;
+            loop {
+                let progress = runtime.progress();
+                if progress.active_leases == 0 && progress.scheduler.handoff_wrappers == [0; 3] {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "attachment did not retire: {exit:?}: {progress:?}"
+                );
+                progress.wait_for_change(deadline).unwrap();
+            }
+            if !matches!(exit, AttachmentExit::Abandon) {
+                runtime.shutdown().unwrap();
+            }
         }
     }
+}
+
+#[test]
+fn later_portions_recover_the_suffix_after_seal_or_root_close() {
+    for close_roots in [false, true] {
+        let config = SWRuntimeConfig::new(3, [SWWorkerConfig::new(1); 3]).unwrap();
+        let runtime = Arc::new(
+            SWRuntime::builder(config)
+                .with_owned_limits(SWOwnedLimits::new(256, 0, [128; 3], [4; 3]).unwrap())
+                .build()
+                .unwrap(),
+        );
+        let high = runtime.lane(SWExecutionClass::High);
+        let group = high.group().unwrap();
+        let old_completion = group.completion();
+        let scheduler = group.scheduler.upgrade().unwrap();
+        let hook_scheduler = Arc::downgrade(&scheduler);
+        let hook_runtime = Arc::clone(&runtime);
+        let hook_group = group.clone();
+        let committed = Arc::new(AtomicUsize::new(0));
+        let hook_committed = Arc::clone(&committed);
+        *scheduler.batch_portion_hook.lock().unwrap() = Some(Arc::new(move |count| {
+            let scheduler = hook_scheduler.upgrade().unwrap();
+            let deadline = Instant::now() + TIMEOUT;
+            while scheduler.accounting.records.load(Ordering::Acquire) != 0 {
+                assert!(
+                    Instant::now() < deadline,
+                    "the earlier portion did not settle"
+                );
+                thread::yield_now();
+            }
+            hook_committed.store(count, Ordering::SeqCst);
+            if close_roots {
+                hook_runtime.begin_shutdown();
+            } else {
+                hook_group.seal();
+            }
+        }));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let operations = (0..65)
+            .map(|index| {
+                let capture = CountDrop(Arc::clone(&drops));
+                move || {
+                    let _capture = capture;
+                    index
+                }
+            })
+            .collect();
+        let rejected = high
+            .try_spawn_batch(
+                SWBatchSpawnOptions {
+                    group: Some(&group),
+                    ..Default::default()
+                },
+                operations,
+            )
+            .err()
+            .unwrap();
+        *scheduler.batch_portion_hook.lock().unwrap() = None;
+        let count = committed.load(Ordering::SeqCst);
+        assert!(count > 0 && count < 65);
+        assert_eq!(
+            rejected.reason,
+            if close_roots {
+                SWSpawnError::Closed
+            } else {
+                SWSpawnError::InvalidGroup
+            }
+        );
+        assert_eq!(rejected.accepted.len(), count);
+        assert_eq!(rejected.remaining.len(), 65 - count);
+        assert_eq!(drops.load(Ordering::SeqCst), count);
+        for (index, (mut task, _)) in rejected.accepted.into_iter().enumerate() {
+            assert_eq!(task.try_take(), Some(SWOutcome::Success(index)));
+        }
+        assert_eq!(
+            rejected
+                .remaining
+                .into_iter()
+                .map(|operation| operation())
+                .collect::<Vec<_>>(),
+            (count..65).collect::<Vec<_>>()
+        );
+        assert_eq!(drops.load(Ordering::SeqCst), 65);
+        group.seal();
+        assert_eq!(old_completion.status(), Some(SWTaskStatus::Succeeded));
+        drop(group);
+        let mut runtime =
+            Arc::try_unwrap(runtime).unwrap_or_else(|_| panic!("portion hook retained runtime"));
+        runtime.shutdown().unwrap();
+    }
+}
+
+#[test]
+fn backend_refusal_after_one_batch_offer_retires_every_reserved_wrapper_once() {
+    let mut runtime = runtime();
+    let high = runtime.lane(SWExecutionClass::High);
+    let group = high.group().unwrap();
+    let scheduler = group.scheduler.upgrade().unwrap();
+    let (entered_send, entered_recv) = mpsc::channel();
+    let (release_send, release_recv) = mpsc::channel();
+    let release = Release(release_send);
+    let (blocker, _) = high
+        .try_spawn(SWSpawnOptions::default(), move || {
+            entered_send.send(()).unwrap();
+            release_recv.recv_timeout(TIMEOUT).unwrap();
+        })
+        .unwrap();
+    entered_recv.recv_timeout(TIMEOUT).unwrap();
+    let backend = scheduler
+        .control
+        .upgrade()
+        .unwrap()
+        .acquire_handoff(SWExecutionClass::High)
+        .unwrap();
+    let backend_pool = Arc::new(backend);
+    let stop_backend = Arc::clone(&backend_pool);
+    let offers = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&offers);
+    *scheduler.handoff_hook.lock().unwrap() = Some(Arc::new(move |_| {
+        observed.fetch_add(1, Ordering::SeqCst);
+        stop_backend.pool().begin_stop();
+    }));
+    let drops = Arc::new(AtomicUsize::new(0));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let operations = (0..3)
+        .map(|_| {
+            let capture = CountDrop(Arc::clone(&drops));
+            let invoked = Arc::clone(&calls);
+            move || {
+                let _capture = capture;
+                invoked.fetch_add(1, Ordering::SeqCst);
+            }
+        })
+        .collect();
+    let accepted = high
+        .try_spawn_batch(
+            SWBatchSpawnOptions {
+                group: Some(&group),
+                ..Default::default()
+            },
+            operations,
+        )
+        .unwrap();
+    *scheduler.handoff_hook.lock().unwrap() = None;
+    group.seal();
+    let physical_before_release = scheduler
+        .class_lock(SWExecutionClass::High)
+        .ready
+        .handed_off;
+    drop(backend_pool);
+    // A stopped backend still owns its queued wrapper until its runtime owner
+    // retires. Perform the real terminal stop before releasing the last worker.
+    runtime.abandon();
+    drop(release);
+    assert_eq!(offers.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        physical_before_release, 2,
+        "running and actually offered wrappers retain their slots"
+    );
+    for (task, _) in accepted {
+        assert_eq!(
+            task.completion().wait_timeout(TIMEOUT).unwrap(),
+            Some(SWTaskStatus::Abandoned)
+        );
+    }
+    assert_eq!(
+        blocker.completion().wait_timeout(TIMEOUT).unwrap(),
+        Some(SWTaskStatus::Succeeded)
+    );
+    assert_eq!(
+        group.completion().wait_timeout(TIMEOUT).unwrap(),
+        Some(SWTaskStatus::PrerequisiteFailed)
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert_eq!(drops.load(Ordering::SeqCst), 3);
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        let progress = runtime.progress();
+        if progress.active_leases == 0 && progress.scheduler.handoff_wrappers == [0; 3] {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "refused wrappers did not retire: {progress:?}"
+        );
+        progress.wait_for_change(deadline).unwrap();
+    }
+    runtime.shutdown().unwrap();
 }

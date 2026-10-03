@@ -33,6 +33,15 @@ impl SWCost {
         ))
     }
 
+    fn checked_mul(self, count: usize) -> Option<Self> {
+        Some(Self::new(
+            self.records.checked_mul(count)?,
+            self.edges.checked_mul(count)?,
+            self.deliveries.checked_mul(count)?,
+            self.bytes.checked_mul(count)?,
+        ))
+    }
+
     fn fits(self, limit: Self) -> bool {
         self.records <= limit.records
             && self.edges <= limit.edges
@@ -225,6 +234,25 @@ impl SWReservationPool {
         self.reserve(cost, Kind::Ordinary)
     }
 
+    /// Claims the available prefix under one ledger lock. Each returned member
+    /// owns a separate pipeline so settling it releases its global charge.
+    pub(crate) fn try_reserve_ordinary_many(
+        &self,
+        cost: SWCost,
+        count: usize,
+    ) -> Result<Vec<SWReservation>, SWReservationError> {
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        let mut reservations = Vec::with_capacity(count);
+        let accepted = self.ledger.claim_ordinary_many(cost, count)?;
+        for _ in 0..accepted {
+            reservations.push(self.reservation(cost, Kind::Ordinary));
+        }
+        self.ledger.notify();
+        Ok(reservations)
+    }
+
     /// Reserves one required pipeline and its simultaneous stage/window peak.
     pub(crate) fn try_reserve_required(
         &self,
@@ -235,12 +263,16 @@ impl SWReservationPool {
 
     fn reserve(&self, cost: SWCost, kind: Kind) -> Result<SWReservation, SWReservationError> {
         self.ledger.claim(cost, kind, true)?;
+        Ok(self.reservation(cost, kind))
+    }
+
+    fn reservation(&self, cost: SWCost, kind: Kind) -> SWReservation {
         let pipeline = Arc::new(Pipeline {
             ledger: Arc::clone(&self.ledger),
             kind,
             total: Mutex::new(cost),
         });
-        Ok(SWReservation {
+        SWReservation {
             pipeline,
             credits: Arc::new(CreditBank {
                 state: Mutex::new(CreditState {
@@ -249,7 +281,7 @@ impl SWReservationPool {
                 }),
                 parent: None,
             }),
-        })
+        }
     }
 
     pub(crate) fn snapshot(&self) -> SWCapacityUsage {
@@ -275,6 +307,72 @@ impl Ledger {
         if let Some(wake) = self.wake.get() {
             wake.notify();
         }
+    }
+
+    fn claim_ordinary_many(
+        &self,
+        cost: SWCost,
+        maximum: usize,
+    ) -> Result<usize, SWReservationError> {
+        let limits = self.limits;
+        let mut usage = self.usage.lock().unwrap_or_else(|error| error.into_inner());
+        if usage.closed {
+            return Err(SWReservationError::Closed);
+        }
+        if !cost.fits(limits.ordinary_target)
+            || limits
+                .hard_byte_ceiling
+                .is_some_and(|ceiling| cost.bytes > ceiling)
+        {
+            return Err(SWReservationError::TooLarge);
+        }
+        let mut count = maximum;
+        for (per_member, used, limit) in [
+            (
+                cost.records,
+                usage.ordinary.records,
+                limits.ordinary_target.records,
+            ),
+            (
+                cost.edges,
+                usage.ordinary.edges,
+                limits.ordinary_target.edges,
+            ),
+            (
+                cost.deliveries,
+                usage.ordinary.deliveries,
+                limits.ordinary_target.deliveries,
+            ),
+            (
+                cost.bytes,
+                usage.ordinary.bytes,
+                limits.ordinary_target.bytes,
+            ),
+        ] {
+            if let Some(available) = limit.saturating_sub(used).checked_div(per_member) {
+                count = count.min(available);
+            }
+        }
+        let total_bytes = usage
+            .ordinary
+            .bytes
+            .checked_add(usage.required.bytes)
+            .ok_or(SWReservationError::Full)?;
+        let ceiling = limits.hard_byte_ceiling.unwrap_or(usize::MAX);
+        if let Some(available) = ceiling.saturating_sub(total_bytes).checked_div(cost.bytes) {
+            count = count.min(available);
+        }
+        if count == 0 {
+            return Err(SWReservationError::Full);
+        }
+        // The dimension quotients bound aggregate products. Keep the explicit
+        // checks so no later policy change can wrap a claim into free capacity.
+        let aggregate = cost.checked_mul(count).ok_or(SWReservationError::Full)?;
+        usage.ordinary = usage
+            .ordinary
+            .checked_add(aggregate)
+            .ok_or(SWReservationError::Full)?;
+        Ok(count)
     }
     fn claim(
         &self,
@@ -569,3 +667,7 @@ impl Drop for SWByteLease {
 #[cfg(test)]
 #[path = "../../tests/unit/reservation.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "../../tests/unit/batch_foundation.rs"]
+mod batch_tests;

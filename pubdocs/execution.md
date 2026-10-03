@@ -79,6 +79,7 @@ paths in Forever 1.60.1.69913; they do not establish every native configuration.
 | Disjoint borrowed slices | `for_each_chunk` | All mutable chunks settle before return. |
 | Shared read-only input | `for_each_read_chunk` | All read-only chunks settle before return. |
 | Work outliving the submitting call | `try_spawn` and related methods | Accepted operation and output are `Send + 'static`; explicit outcome observation. |
+| Many owned jobs with common options | `try_spawn_batch`, `try_spawn_batch_fallible` | Ordered accepted prefix and recoverable suffix; independent outcomes and cancellation. |
 | A retained wave | `group`, `try_spawn_in`, `SWGroup` | Membership is sealed, then accepted members settle. |
 | Successive retained waves | `batch`, `SWBatch::begin` | Previous wave must be sealed and complete before renewal. |
 | Prerequisite-gated successor | `try_spawn_after`, `try_spawn_after_in` | No worker is occupied while waiting for prerequisite readiness. |
@@ -200,6 +201,58 @@ but retained handles keep observing their original wave. It neither returns
 mutable job inputs nor resets domain buffers for you.
 
 Sources: [groups](../src/execution/group.rs), [batches](../src/execution/batch.rs).
+
+## Submit an owned wave together
+
+`SWLane::try_spawn_batch` accepts a `Vec<F>` and `SWBatchSpawnOptions` containing
+the ordinary spawn options, optional group, common prerequisites and dependency
+policy. Each closure can capture a different descriptor. Every accepted member
+returns its own task and producer control. `try_spawn_batch_fallible` additionally
+marks a returned application `Err` as failure for success-only dependencies;
+ordinary `try_spawn_batch` treats that same value as successful execution.
+
+This is the direct route for a caller-formed pose, culling or draw wave with owned
+inputs. Keep the existing class assignment, useful chunk sizes and consumer
+boundary. Use scoped APIs for borrowed work and the existing stage APIs for
+resource ranks, delivery tickets, work sets or required reservations. Those
+options are not provided by this batch API.
+
+On success, the returned vector follows input order. On rejection,
+`SWBatchSpawnRejected` contains `reason`, ordered `accepted` task/control pairs,
+untouched `remaining` operations and the original options. Always preserve both
+parts. Earlier accepted jobs may already have run when the method rejects a
+later member. Retrying the original vector would duplicate work. Retry only the
+remaining suffix after arranging progress, or report the phase failure and
+settle the accepted work. The [owned wave example](../examples/owned_wave.rs)
+demonstrates rejection without silently discarding accepted handles.
+
+`Full` is temporary capacity pressure; `TooLarge` means the next member cannot
+fit configured policy. The whole vector need not fit at once. An empty vector
+is a successful no-op even on a closed or owned-disabled runtime. Nonempty calls
+validate common group/context rules before admission, but sealing, shutdown or
+capacity can stop a later bounded portion. No particular partial-prefix length
+is guaranteed under concurrency.
+
+Neither method runs a submitted operation inline as a saturation fallback.
+`CallerEligible` allows explicit helping after acceptance; workers may start
+before submission returns. Dropping handles or a rejection receipt does not
+cancel accepted jobs. Cancellation is per member and does not cancel siblings.
+Input order describes admission and returned handles, not execution or completion
+order.
+
+`SWBatch` remains the retained group owner: call `begin`, submit one or more
+vectors with its group, and seal at the actual producer boundary, including on
+error. The new methods do not seal or renew it. A rejected suffix is not group
+membership, so a successful accepted group does not prove the requested phase
+was fully admitted. Use [coherent publication](resources.md#coherent-publication-is-an-application-composition)
+when live-state mutation must wait for all required admissions.
+
+Batching amortizes initial admission, attachment and publication coordination in
+bounded portions. Each job still consumes its own records and prerequisite
+edges. Later asynchronous prerequisite completions activate individual members;
+common prerequisites do not imply a single shared release operation. Batching
+does not impose a fairness deadline, remove CPU costs or guarantee lower frame
+time.
 
 ## Helping is explicit and restricted
 

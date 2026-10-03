@@ -1,16 +1,78 @@
 //! Bounded owned metadata and runnable admission.
 
+use crate::execution::SWGroup;
 use crate::runtime::config::SWExecutionClass;
-use crate::task::{SWProducerControl, SWTask};
+use crate::task::{SWCompletion, SWProducerControl, SWTask};
 
 /// An accepted task and explicit cancellation authority, or the untouched
 /// operation with its admission failure.
 pub type SWSpawnResult<T, F> = Result<(SWTask<T>, SWProducerControl), SWSpawnRejected<F>>;
 
+/// Common execution and dependency constraints for an owned admission batch.
+/// A supplied group stays open until its caller seals it.
+#[derive(Clone, Copy)]
+pub struct SWBatchSpawnOptions<'a> {
+    pub spawn: SWSpawnOptions,
+    pub group: Option<&'a SWGroup>,
+    pub prerequisites: &'a [SWCompletion],
+    pub dependency_policy: SWDependencyPolicy,
+}
+
+impl Default for SWBatchSpawnOptions<'_> {
+    fn default() -> Self {
+        Self {
+            spawn: SWSpawnOptions::default(),
+            group: None,
+            prerequisites: &[],
+            dependency_policy: SWDependencyPolicy::SuccessOnly,
+        }
+    }
+}
+
+impl std::fmt::Debug for SWBatchSpawnOptions<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SWBatchSpawnOptions")
+            .field("spawn", &self.spawn)
+            .field("group", &self.group.as_ref().map(|group| group.class()))
+            .field("prerequisites", &self.prerequisites.len())
+            .field("dependency_policy", &self.dependency_policy)
+            .finish()
+    }
+}
+
+/// Ordered accepted handles, or an accepted prefix and untouched input suffix.
+pub type SWBatchSpawnResult<'a, T, F> =
+    Result<Vec<(SWTask<T>, SWProducerControl)>, SWBatchSpawnRejected<'a, T, F>>;
+
+/// Admission stopped at the first member in `remaining`. Earlier accepted work
+/// may already be executing; retry only the returned suffix. Dropping this
+/// receipt does not cancel accepted work.
+#[must_use]
+pub struct SWBatchSpawnRejected<'a, T: Send + 'static, F> {
+    pub reason: SWSpawnError,
+    pub accepted: Vec<(SWTask<T>, SWProducerControl)>,
+    pub remaining: Vec<F>,
+    pub options: SWBatchSpawnOptions<'a>,
+}
+
+impl<T: Send + 'static, F> std::fmt::Debug for SWBatchSpawnRejected<'_, T, F> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SWBatchSpawnRejected")
+            .field("reason", &self.reason)
+            .field("accepted", &self.accepted.len())
+            .field("remaining", &self.remaining.len())
+            .field("options", &self.options)
+            .finish()
+    }
+}
+
 /// Independent owned-work capacities. Array entries are Low, Mid, High.
 /// `records` counts waiting, ready, handed, running, and finalizing jobs;
 /// `edges` counts registered prerequisites through terminal detachment.
-/// `runnable` counts ready and handed jobs, excluding running jobs.
+/// `runnable` counts ready and handed jobs, excluding running jobs, and reserves
+/// slots for accepted immediate batch members while their attachment closes.
 /// `handoff` counts wrappers offered to the backend until they return,
 /// including a wrapper whose job is running. Zero edges disables dependent
 /// submissions. Saturated caller execution can exceed only the runnable

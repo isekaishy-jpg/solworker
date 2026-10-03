@@ -91,8 +91,10 @@ This guide distinguishes available mechanisms from integration choices:
   [notification routes](notifications.md) to completion, owner and runtime
   progress sources. The host still services the work those changes require.
 
-`SWBatch` already supports successive group generations. It does not provide a
-typed mutable-job store, atomic bulk submission or a reusable compiled graph.
+`SWBatch` supports successive group generations. The separate
+[`try_spawn_batch` API](execution.md#submit-an-owned-wave-together) accepts owned
+operations together with explicit partial rejection. Neither supplies a typed
+mutable-job store, atomic whole-wave admission or a reusable compiled graph.
 Those distinctions matter when adapting an existing engine. A host may need a
 small adapter for retained job state and coherent publication; it should reuse
 Solworker's scheduler rather than maintain another runnable queue.

@@ -228,7 +228,9 @@ for the complete provider-to-device boundary checklist and Stock/Forever evidenc
 
 Some phases must admit every required job before any job mutates live domain
 state. Reserving declared credits does not make a sequence of individual
-submissions an atomic bulk operation.
+submissions an atomic bulk operation. `try_spawn_batch` likewise permits partial
+acceptance and execution before the call returns. Its returned accepted prefix
+must be settled even when the remaining suffix is rejected.
 
 One possible composition uses an external logical result as a publication gate:
 

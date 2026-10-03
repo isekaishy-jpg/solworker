@@ -4,9 +4,9 @@ use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 use solworker::{
-    SWBatchError, SWDeliveryStatus, SWDependencyPolicy, SWExecutionClass, SWOutcome, SWOwnedLimits,
-    SWPhase, SWPumpBudget, SWRuntime, SWRuntimeConfig, SWSpawnError, SWSpawnOptions, SWTaskStatus,
-    SWWorkerConfig,
+    SWBatchError, SWBatchSpawnOptions, SWDeliveryStatus, SWDependencyPolicy, SWExecutionClass,
+    SWOutcome, SWOwnedLimits, SWPhase, SWPumpBudget, SWRuntime, SWRuntimeConfig, SWSpawnError,
+    SWSpawnOptions, SWTaskStatus, SWWorkerConfig,
 };
 
 const TIMEOUT: Duration = Duration::from_secs(5);
@@ -31,16 +31,24 @@ fn reusable_batch_resets_failure_and_exposes_each_wave_to_other_clients() {
 
     let first = batch.begin().unwrap().clone();
     let first_done = first.completion();
-    let (failed, _) = low
-        .try_spawn_fallible_in(&first, SWSpawnOptions::default(), || {
-            Err::<(), _>("first wave failed")
-        })
+    let failed = low
+        .try_spawn_batch_fallible(
+            SWBatchSpawnOptions {
+                group: Some(&first),
+                ..Default::default()
+            },
+            (0..2)
+                .map(|_| || Err::<(), _>("first wave failed"))
+                .collect(),
+        )
         .unwrap();
     assert_eq!(batch.begin().err(), Some(SWBatchError::Busy));
     assert_eq!(batch.current().unwrap().completion().status(), None);
     first.seal();
     first.wait_helping().unwrap();
-    assert_eq!(failed.status(), Some(SWTaskStatus::ApplicationFailed));
+    for (task, _) in failed {
+        assert_eq!(task.status(), Some(SWTaskStatus::ApplicationFailed));
+    }
     assert_eq!(first_done.status(), Some(SWTaskStatus::PrerequisiteFailed));
 
     let second = batch.begin().unwrap().clone();
@@ -78,15 +86,23 @@ fn reusable_batch_resets_failure_and_exposes_each_wave_to_other_clients() {
             || 31usize,
         )
         .unwrap();
-    let (member, _) = low
-        .try_spawn_in(&second, SWSpawnOptions::default(), || 29usize)
+    let members = low
+        .try_spawn_batch(
+            SWBatchSpawnOptions {
+                group: Some(&second),
+                ..Default::default()
+            },
+            (29..31).map(|value| move || value).collect(),
+        )
         .unwrap();
     assert_eq!(batch.begin().err(), Some(SWBatchError::Busy));
     second.seal();
     second.wait_helping().unwrap();
     assert_eq!(second_done.status(), Some(SWTaskStatus::Succeeded));
     assert_eq!(first_done.status(), Some(SWTaskStatus::PrerequisiteFailed));
-    assert_eq!(member.status(), Some(SWTaskStatus::Succeeded));
+    for (task, _) in members {
+        assert_eq!(task.status(), Some(SWTaskStatus::Succeeded));
+    }
     // Group completion precedes downstream activation; owner delivery has its
     // own completion boundary and may need a later pump.
     let deadline = Instant::now() + TIMEOUT;

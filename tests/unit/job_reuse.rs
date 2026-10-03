@@ -4,15 +4,14 @@ use crate::task::SWTaskStatus;
 use std::sync::{Arc, Barrier, Weak};
 
 fn empty_envelope() -> Envelope {
-    Box::new(|_| Box::new(|| {}))
+    Box::new(|_| -> crate::scheduler::Finish { Box::new(|| {}) })
 }
 
 fn settle(job: &super::JobHandle) {
     let finish = job
         .take_envelope()
-        .expect("accepted job retains its envelope")(Decision::Suppress(
-        SWTaskStatus::Cancelled,
-    ));
+        .expect("accepted job retains its envelope")
+        .settle(Decision::Suppress(SWTaskStatus::Cancelled));
     finish();
 }
 
